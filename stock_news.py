@@ -25,8 +25,7 @@ def fetch_news(query, lang, count=15):
 
 def analyze(articles, category):
     titles = "\n".join([f"- {a['title']}" for a in articles])
-    prompt = "以下是今日" + category + "新聞標題，請用繁體中文：\n1. 翻譯每則標題\n2. 分析整體趨勢\n3. 說明可能影響哪些產業或股票\n4. 給投資人一句重點提醒\n\n新聞：\n" + titles
-
+    prompt = "以下是今日" + category + "新聞標題，請用繁體中文回應：\n1. 逐則翻譯標題\n2. 分析整體趨勢\n3. 說明可能影響哪些產業或股票\n4. 給投資人一句重點提醒\n\n新聞：\n" + titles
     res = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -41,20 +40,88 @@ def analyze(articles, category):
         }
     )
     result = res.json()
-    print("API:", result)
     if "content" in result:
         return result["content"][0]["text"]
     else:
-        error_msg = result.get("error", {}).get("message", "unknown error")
-        return "AI分析暫時無法使用：" + error_msg
+        return "AI分析暫時無法使用"
 
-def send_email(subject, body):
+def news_to_html(articles):
+    html = ""
+    for a in articles:
+        title = a.get("title", "")
+        url = a.get("url", "#")
+        source = a.get("source", {}).get("name", "")
+        html += f'<div style="margin-bottom:12px;padding:10px;background:#f9f9f9;border-left:3px solid #e94560;border-radius:4px">'
+        html += f'<a href="{url}" style="color:#1a1a2e;font-weight:bold;text-decoration:none">{title}</a>'
+        html += f'<div style="font-size:12px;color:#888;margin-top:4px">{source} &nbsp;|&nbsp; <a href="{url}" style="color:#e94560">閱讀原文</a></div>'
+        html += '</div>'
+    return html
+
+def analysis_to_html(text):
+    lines = text.strip().split("\n")
+    html = ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            html += "<br>"
+        elif line.startswith("##"):
+            html += f'<h3 style="color:#1a1a2e;margin:16px 0 8px">{line.replace("##","").strip()}</h3>'
+        elif line.startswith("#"):
+            html += f'<h2 style="color:#e94560;margin:20px 0 10px">{line.replace("#","").strip()}</h2>'
+        elif line.startswith("-") or line.startswith("*"):
+            html += f'<li style="margin-bottom:6px">{line[1:].strip()}</li>'
+        else:
+            html += f'<p style="margin:6px 0;line-height:1.8">{line}</p>'
+    return html
+
+def build_html(today, tw_articles, us_articles, global_articles, tw_analysis, us_analysis, global_analysis):
+    return f"""
+<html>
+<body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px;color:#333">
+
+<div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px;margin-bottom:24px">
+  <h1 style="margin:0;font-size:24px">📈 股市日報</h1>
+  <p style="margin:6px 0 0;opacity:0.7">{today}</p>
+</div>
+
+<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
+  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🇹🇼 台股新聞</h2>
+  {news_to_html(tw_articles)}
+  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
+    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
+    {analysis_to_html(tw_analysis)}
+  </div>
+</div>
+
+<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
+  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🇺🇸 美股新聞</h2>
+  {news_to_html(us_articles)}
+  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
+    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
+    {analysis_to_html(us_analysis)}
+  </div>
+</div>
+
+<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
+  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🌍 全球局勢</h2>
+  {news_to_html(global_articles)}
+  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
+    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
+    {analysis_to_html(global_analysis)}
+  </div>
+</div>
+
+<p style="color:#aaa;font-size:12px;text-align:center">此報告由 AI 自動生成，僅供參考，不構成投資建議。</p>
+</body>
+</html>
+"""
+
+def send_email(subject, html_body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
-    html = "<html><body style='font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px'><h1 style='color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:10px'>📈 股市日報</h1><pre style='white-space:pre-wrap;font-size:14px;line-height:1.8'>" + body + "</pre><hr><p style='color:#888;font-size:12px'>此報告由 AI 自動生成，僅供參考，不構成投資建議。</p></body></html>"
-    msg.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
@@ -75,8 +142,8 @@ tw_analysis = analyze(tw_articles, "台股")
 us_analysis = analyze(us_articles, "美股")
 global_analysis = analyze(global_articles, "全球局勢")
 
-report = today + " 股市日報\n" + "="*50 + "\n\n台股分析\n" + "-"*30 + "\n" + tw_analysis + "\n\n美股分析\n" + "-"*30 + "\n" + us_analysis + "\n\n全球局勢影響\n" + "-"*30 + "\n" + global_analysis + "\n\n" + "="*50 + "\n此報告由 AI 自動生成，僅供參考，不構成投資建議。"
+html = build_html(today, tw_articles, us_articles, global_articles, tw_analysis, us_analysis, global_analysis)
 
-save_file(report, "daily")
-send_email("📈 " + today + " 股市日報", report)
+save_file(tw_analysis + us_analysis + global_analysis, "daily")
+send_email("📈 " + today + " 股市日報", html)
 print("完成！")
