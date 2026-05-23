@@ -2,7 +2,9 @@ name: 每日股市新聞
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 0 * * *'   # 台灣時間早上 8:00
+    - cron: '0 6 * * *'   # 台灣時間下午 14:00
+    - cron: '0 14 * * *'  # 台灣時間晚上 22:00
   workflow_dispatch:
 
 jobs:
