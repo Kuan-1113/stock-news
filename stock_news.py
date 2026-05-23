@@ -1,14 +1,20 @@
 import requests
 import os
 import smtplib
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import date
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
 NEWS_API_KEY = os.environ["NEWS_API_KEY"]
 EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"]
 EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+def clean_url(url):
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
 def fetch_news(query, lang, count=15):
     url = "https://newsapi.org/v2/everything"
@@ -21,11 +27,55 @@ def fetch_news(query, lang, count=15):
     }
     res = requests.get(url, params=params)
     articles = res.json().get("articles", [])
-    return articles
+    return [a for a in articles if a.get("title") and "[Removed]" not in a.get("title","")]
+
+def fetch_market_data():
+    symbols = {
+        "台灣加權": "^TWII",
+        "道瓊": "^DJI",
+        "納斯達克": "^IXIC",
+        "S&P500": "^GSPC",
+        "黃金": "GC=F",
+        "原油": "CL=F",
+        "美債20年(TLT)": "TLT",
+        "美元指數": "DX-Y.NYB"
+    }
+    results = {}
+    for name, symbol in symbols.items():
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2d"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=10)
+            data = r.json()
+            closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if len(closes) >= 2:
+                prev, curr = closes[-2], closes[-1]
+                change = curr - prev
+                pct = (change / prev) * 100
+                arrow = "🔴" if change < 0 else "🟢"
+                results[name] = f"{arrow} {curr:,.2f} ({pct:+.2f}%)"
+            else:
+                results[name] = "數據不足"
+        except:
+            results[name] = "無法取得"
+    return results
 
 def analyze(articles, category):
-    titles = "\n".join([f"- {a['title']}" for a in articles])
-    prompt = "以下是今日" + category + "新聞標題，請用繁體中文回應：\n1. 逐則翻譯標題\n2. 分析整體趨勢\n3. 說明可能影響哪些產業或股票\n4. 給投資人一句重點提醒\n\n新聞：\n" + titles
+    if not articles:
+        return "今日暫無相關新聞。"
+    titles_with_source = "\n".join([
+        f"{i+1}. {a['title']} ({a.get('source',{}).get('name','')})"
+        for i, a in enumerate(articles)
+    ])
+    prompt = (
+        "以下是今日" + category + "的新聞標題列表，請用繁體中文完整回應以下四點：\n\n"
+        "【一、逐則中文翻譯】\n請將每一則標題翻譯成繁體中文（編號對應）\n\n"
+        "【二、整體趨勢分析】\n分析這些新聞反映的整體市場趨勢\n\n"
+        "【三、受影響產業與股票】\n說明可能受到影響的產業、類股或個股\n\n"
+        "【四、投資人重點提醒】\n給投資人一句最重要的操作提醒\n\n"
+        "新聞列表：\n" + titles_with_source
+    )
     res = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -43,107 +93,72 @@ def analyze(articles, category):
     if "content" in result:
         return result["content"][0]["text"]
     else:
-        return "AI分析暫時無法使用"
+        return "AI分析暫時無法使用：" + str(result.get("error", {}).get("message", ""))
 
 def news_to_html(articles):
+    if not articles:
+        return "<p style='color:#aaa'>今日暫無相關新聞</p>"
     html = ""
     for a in articles:
         title = a.get("title", "")
-        url = a.get("url", "#")
+        url = clean_url(a.get("url", "#"))
         source = a.get("source", {}).get("name", "")
-        html += f'<div style="margin-bottom:12px;padding:10px;background:#f9f9f9;border-left:3px solid #e94560;border-radius:4px">'
-        html += f'<a href="{url}" style="color:#1a1a2e;font-weight:bold;text-decoration:none">{title}</a>'
-        html += f'<div style="font-size:12px;color:#888;margin-top:4px">{source} &nbsp;|&nbsp; <a href="{url}" style="color:#e94560">閱讀原文</a></div>'
-        html += '</div>'
+        html += (
+            '<div style="margin-bottom:10px;padding:10px;background:#f9f9f9;'
+            'border-left:3px solid #e94560;border-radius:4px">'
+            f'<a href="{url}" style="color:#1a1a2e;font-weight:bold;text-decoration:none">{title}</a>'
+            f'<div style="font-size:12px;color:#888;margin-top:4px">{source}'
+            f' &nbsp;|&nbsp; <a href="{url}" style="color:#e94560">閱讀原文 →</a></div>'
+            '</div>'
+        )
     return html
 
 def analysis_to_html(text):
+    text = re.sub(r'\n{3,}', '\n\n', text)
     lines = text.strip().split("\n")
-    html = ""
+    html = "<ul style='padding-left:20px;margin:8px 0'>" if False else ""
+    in_list = False
     for line in lines:
         line = line.strip()
         if not line:
+            if in_list:
+                html += "</ul>"
+                in_list = False
             html += "<br>"
-        elif line.startswith("##"):
-            html += f'<h3 style="color:#1a1a2e;margin:16px 0 8px">{line.replace("##","").strip()}</h3>'
-        elif line.startswith("#"):
-            html += f'<h2 style="color:#e94560;margin:20px 0 10px">{line.replace("#","").strip()}</h2>'
-        elif line.startswith("-") or line.startswith("*"):
-            html += f'<li style="margin-bottom:6px">{line[1:].strip()}</li>'
+        elif line.startswith("【") or line.startswith("##"):
+            if in_list:
+                html += "</ul>"
+                in_list = False
+            clean = re.sub(r'[#【】]', '', line).strip()
+            html += f'<h3 style="color:#1a1a2e;margin:16px 0 8px;font-size:15px">▍{clean}</h3>'
+        elif re.match(r'^[\-\*\•]', line):
+            if not in_list:
+                html += '<ul style="padding-left:20px;margin:6px 0">'
+                in_list = True
+            clean = re.sub(r'^[\-\*\•]\s*', '', line)
+            html += f'<li style="margin-bottom:5px;line-height:1.7">{clean}</li>'
+        elif re.match(r'^\d+\.', line):
+            if in_list:
+                html += "</ul>"
+                in_list = False
+            html += f'<p style="margin:5px 0;line-height:1.8">{line}</p>'
         else:
-            html += f'<p style="margin:6px 0;line-height:1.8">{line}</p>'
+            if in_list:
+                html += "</ul>"
+                in_list = False
+            html += f'<p style="margin:5px 0;line-height:1.8">{line}</p>'
+    if in_list:
+        html += "</ul>"
     return html
 
-def build_html(today, tw_articles, us_articles, global_articles, tw_analysis, us_analysis, global_analysis):
-    return f"""
-<html>
-<body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px;color:#333">
-
-<div style="background:#1a1a2e;color:white;padding:20px;border-radius:8px;margin-bottom:24px">
-  <h1 style="margin:0;font-size:24px">📈 股市日報</h1>
-  <p style="margin:6px 0 0;opacity:0.7">{today}</p>
-</div>
-
-<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
-  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🇹🇼 台股新聞</h2>
-  {news_to_html(tw_articles)}
-  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
-    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
-    {analysis_to_html(tw_analysis)}
-  </div>
-</div>
-
-<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
-  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🇺🇸 美股新聞</h2>
-  {news_to_html(us_articles)}
-  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
-    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
-    {analysis_to_html(us_analysis)}
-  </div>
-</div>
-
-<div style="background:white;border:1px solid #eee;border-radius:8px;padding:20px;margin-bottom:20px">
-  <h2 style="color:#e94560;border-bottom:2px solid #e94560;padding-bottom:8px">🌍 全球局勢</h2>
-  {news_to_html(global_articles)}
-  <div style="background:#f0f4ff;padding:16px;border-radius:6px;margin-top:16px">
-    <h3 style="margin:0 0 10px;color:#1a1a2e">🤖 AI 分析</h3>
-    {analysis_to_html(global_analysis)}
-  </div>
-</div>
-
-<p style="color:#aaa;font-size:12px;text-align:center">此報告由 AI 自動生成，僅供參考，不構成投資建議。</p>
-</body>
-</html>
-"""
-
-def send_email(subject, html_body):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = EMAIL_ADDRESS
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.send_message(msg)
-
-def save_file(content, label):
-    today = date.today().strftime("%Y-%m-%d")
-    os.makedirs("reports", exist_ok=True)
-    with open("reports/" + today + "-" + label + ".txt", "w", encoding="utf-8") as f:
-        f.write(content)
-
-today = date.today().strftime("%Y-%m-%d")
-
-tw_articles = fetch_news("Taiwan stock market economy", "zh", 15)
-us_articles = fetch_news("US stock market Wall Street", "en", 15)
-global_articles = fetch_news("war economy geopolitics oil energy", "en", 15)
-
-tw_analysis = analyze(tw_articles, "台股")
-us_analysis = analyze(us_articles, "美股")
-global_analysis = analyze(global_articles, "全球局勢")
-
-html = build_html(today, tw_articles, us_articles, global_articles, tw_analysis, us_analysis, global_analysis)
-
-save_file(tw_analysis + us_analysis + global_analysis, "daily")
-send_email("📈 " + today + " 股市日報", html)
-print("完成！")
+def market_to_html(data):
+    html = '<table style="width:100%;border-collapse:collapse">'
+    items = list(data.items())
+    for i in range(0, len(items), 2):
+        html += '<tr>'
+        for j in range(2):
+            if i + j < len(items):
+                name, val = items[i+j]
+                html += (
+                    '<td style="padding:8px;border-bottom:1px solid #eee;width:50%">'
+                    f'<span style="color
