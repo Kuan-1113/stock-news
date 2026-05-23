@@ -1,6 +1,6 @@
 import requests
 import os
-import re
+import time
 from datetime import date
 
 NEWS_API_KEY = os.environ["NEWS_API_KEY"]
@@ -17,8 +17,7 @@ def fetch_yahoo(symbol):
         if len(closes) >= 2:
             prev, curr = closes[-2], closes[-1]
             pct = (curr - prev) / prev * 100
-            arrow = "down" if pct < 0 else "up"
-            emoji = "🔴" if pct < 0 else "🟢"
+            emoji = "\U0001f534" if pct < 0 else "\U0001f7e2"
             return emoji + " " + "{:,.2f}".format(curr) + " (" + "{:+.2f}".format(pct) + "%)"
         return "數據不足"
     except Exception:
@@ -31,7 +30,7 @@ def fetch_crypto(symbol):
         data = r.json()
         price = float(data["lastPrice"])
         pct = float(data["priceChangePercent"])
-        emoji = "🔴" if pct < 0 else "🟢"
+        emoji = "\U0001f534" if pct < 0 else "\U0001f7e2"
         return emoji + " $" + "{:,.2f}".format(price) + " (" + "{:+.2f}".format(pct) + "%)"
     except Exception:
         return "無法取得"
@@ -47,7 +46,7 @@ def fetch_twse_flows():
         def fmt(val):
             try:
                 v = int(str(val).replace(",", ""))
-                emoji = "🔴" if v < 0 else "🟢"
+                emoji = "\U0001f534" if v < 0 else "\U0001f7e2"
                 return emoji + " " + "{:+,.0f}".format(v) + " 萬元"
             except Exception:
                 return "無法解析"
@@ -59,7 +58,7 @@ def fetch_twse_flows():
     except Exception:
         return None
 
-def fetch_news(query, lang, count=10):
+def fetch_news(query, lang, count=5):
     try:
         url = "https://newsapi.org/v2/everything"
         params = {
@@ -75,17 +74,12 @@ def fetch_news(query, lang, count=10):
     except Exception:
         return []
 
-def analyze(articles, category, max_words=150):
+def analyze(articles, category):
     if not articles:
         return "今日暫無相關新聞。"
-    titles = "\n".join([
-        str(i+1) + ". " + a["title"]
-        for i, a in enumerate(articles)
-    ])
+    titles = "\n".join([str(i+1) + ". " + a["title"] for i, a in enumerate(articles)])
     prompt = (
-        "以下是今日" + category + "新聞標題，請用繁體中文回應，"
-        "不超過" + str(max_words) + "字，格式為2-3個重點bullet points，"
-        "不要使用###或markdown標題，直接用•開頭列點：\n\n" + titles
+        "以下是今日" + category + "新聞，請用繁體中文寫2-3個重點，每點用•開頭，總字數不超過120字，不要用###標題：\n\n" + titles
     )
     try:
         res = requests.post(
@@ -97,28 +91,22 @@ def analyze(articles, category, max_words=150):
             },
             json={
                 "model": "claude-sonnet-4-5",
-                "max_tokens": 500,
+                "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
         )
         result = res.json()
         if "content" in result:
-            return result["content"][0]["text"].strip()
+            return result["content"][0]["text"].strip()[:800]
         return "AI分析暫時無法使用"
     except Exception:
         return "AI分析暫時無法使用"
 
 def analyze_global(vix, us10y, dxy, btc, eth, sol):
     prompt = (
-        "請用繁體中文一句話（不超過80字）分析以下指標對今日市場情緒的影響：\n"
-        "VIX恐慌指數：" + vix + "\n"
-        "美國10年期公債殖利率：" + us10y + "\n"
-        "美元指數DXY：" + dxy + "\n"
-        "BTC：" + btc + "\n"
-        "ETH：" + eth + "\n"
-        "SOL：" + sol + "\n"
-        "請直接給出分析句子，不要加任何標題或bullet point。"
+        "請用繁體中文一句話（不超過60字）分析以下指標對今日市場情緒的影響，不要標題：\n"
+        "VIX:" + vix + " 美債:" + us10y + " DXY:" + dxy + " BTC:" + btc + " ETH:" + eth + " SOL:" + sol
     )
     try:
         res = requests.post(
@@ -130,14 +118,14 @@ def analyze_global(vix, us10y, dxy, btc, eth, sol):
             },
             json={
                 "model": "claude-sonnet-4-5",
-                "max_tokens": 200,
+                "max_tokens": 150,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
         )
         result = res.json()
         if "content" in result:
-            return result["content"][0]["text"].strip()
+            return result["content"][0]["text"].strip()[:300]
         return "AI分析暫時無法使用"
     except Exception:
         return "AI分析暫時無法使用"
@@ -146,22 +134,22 @@ def make_news_links(articles):
     if not articles:
         return "暫無新聞連結"
     lines = []
-    for i, a in enumerate(articles[:8]):
-        title = a.get("title", "")[:40] + "..."
+    for i, a in enumerate(articles[:5]):
+        title = a.get("title", "")[:35] + "..."
         url = a.get("url", "#")
         lines.append(str(i+1) + ". [" + title + "](" + url + ")")
     return "\n".join(lines)
 
-def send_discord(embeds):
-    payload = {"embeds": embeds}
+def send_embed(embed):
     try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        res = requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=15)
         if res.status_code in [200, 204]:
-            print("Discord 發送成功")
+            print("發送成功：" + embed.get("title", ""))
         else:
-            print("Discord 發送失敗：" + str(res.status_code) + " " + res.text)
+            print("發送失敗：" + str(res.status_code) + " " + res.text[:200])
     except Exception as e:
-        print("Discord 發送錯誤：" + str(e))
+        print("發送錯誤：" + str(e))
+    time.sleep(1)
 
 today = date.today().strftime("%Y-%m-%d")
 print("開始執行...")
@@ -186,9 +174,9 @@ print("抓取台股籌碼...")
 flows = fetch_twse_flows()
 
 print("抓取新聞...")
-tw_articles = fetch_news("Taiwan stock market TWSE economy", "zh", 10)
-us_articles = fetch_news("US stock market Wall Street NYSE NASDAQ", "en", 10)
-global_articles = fetch_news("war economy geopolitics oil Fed interest rate", "en", 10)
+tw_articles = fetch_news("Taiwan stock market TWSE economy", "zh", 5)
+us_articles = fetch_news("US stock market Wall Street NYSE NASDAQ", "en", 5)
+global_articles = fetch_news("war economy geopolitics oil Fed interest rate", "en", 5)
 
 print("AI 分析中...")
 tw_analysis = analyze(tw_articles, "台股")
@@ -196,102 +184,41 @@ us_analysis = analyze(us_articles, "美股")
 global_insight = analyze_global(vix, us10y, dxy, btc, eth, sol)
 
 if flows:
-    flows_text = (
-        "外資：" + flows["外資"] + "\n"
-        "投信：" + flows["投信"] + "\n"
-        "自營商：" + flows["自營商"]
-    )
+    flows_text = "外資：" + flows["外資"] + "\n投信：" + flows["投信"] + "\n自營商：" + flows["自營商"]
 else:
     flows_text = "今日籌碼資料暫無法取得"
 
-embeds = [
-    {
-        "title": "📈 " + today + " 股市日報",
-        "color": 1971994,
-        "description": "每日自動生成・僅供參考・不構成投資建議",
-        "fields": [
-            {
-                "name": "📊 大盤概覽",
-                "value": (
-                    "台灣加權：" + twii + "\n"
-                    "道瓊：" + dji + "\n"
-                    "納斯達克：" + ixic + "\n"
-                    "S&P500：" + gspc + "\n"
-                    "黃金：" + gold + "\n"
-                    "原油：" + oil
-                ),
-                "inline": False
-            }
-        ]
-    },
-    {
-        "title": "🇹🇼 台股市場",
-        "color": 3066993,
-        "fields": [
-            {
-                "name": "法人籌碼",
-                "value": flows_text,
-                "inline": False
-            },
-            {
-                "name": "AI 分析重點",
-                "value": tw_analysis,
-                "inline": False
-            },
-            {
-                "name": "參考新聞",
-                "value": make_news_links(tw_articles),
-                "inline": False
-            }
-        ]
-    },
-    {
-        "title": "🇺🇸 美股市場",
-        "color": 3447003,
-        "fields": [
-            {
-                "name": "AI 分析重點",
-                "value": us_analysis,
-                "inline": False
-            },
-            {
-                "name": "參考新聞",
-                "value": make_news_links(us_articles),
-                "inline": False
-            }
-        ]
-    },
-    {
-        "title": "🌐 全球市場溫度計",
-        "color": 10181046,
-        "fields": [
-            {
-                "name": "總體指標",
-                "value": (
-                    "VIX 恐慌指數：" + vix + "\n"
-                    "美國10年期公債：" + us10y + "\n"
-                    "美元指數 DXY：" + dxy
-                ),
-                "inline": True
-            },
-            {
-                "name": "加密貨幣",
-                "value": (
-                    "BTC：" + btc + "\n"
-                    "ETH：" + eth + "\n"
-                    "SOL：" + sol
-                ),
-                "inline": True
-            },
-            {
-                "name": "AI 市場情緒分析",
-                "value": global_insight,
-                "inline": False
-            }
-        ]
-    }
-]
-
 print("發送到 Discord...")
-send_discord(embeds)
+
+send_embed({
+    "title": "\U0001f1f9\U0001f1fc 台股市場 | " + today,
+    "color": 3066993,
+    "fields": [
+        {"name": "\U0001f4ca 大盤", "value": "台灣加權：" + twii, "inline": False},
+        {"name": "\U0001f3e6 法人籌碼", "value": flows_text, "inline": False},
+        {"name": "\U0001f916 AI 分析", "value": tw_analysis, "inline": False},
+        {"name": "\U0001f4f0 新聞連結", "value": make_news_links(tw_articles), "inline": False}
+    ]
+})
+
+send_embed({
+    "title": "\U0001f1fa\U0001f1f8 美股市場 | " + today,
+    "color": 3447003,
+    "fields": [
+        {"name": "\U0001f4ca 大盤", "value": "道瓊：" + dji + "\n納斯達克：" + ixic + "\nS&P500：" + gspc, "inline": False},
+        {"name": "\U0001f916 AI 分析", "value": us_analysis, "inline": False},
+        {"name": "\U0001f4f0 新聞連結", "value": make_news_links(us_articles), "inline": False}
+    ]
+})
+
+send_embed({
+    "title": "\U0001f310 全球市場溫度計 | " + today,
+    "color": 10181046,
+    "fields": [
+        {"name": "\U0001f4c9 總體指標", "value": "VIX：" + vix + "\n美債10Y：" + us10y + "\nDXY：" + dxy + "\n黃金：" + gold + "\n原油：" + oil, "inline": True},
+        {"name": "\U0001fa99 加密貨幣", "value": "BTC：" + btc + "\nETH：" + eth + "\nSOL：" + sol, "inline": True},
+        {"name": "\U0001f916 AI 情緒分析", "value": global_insight, "inline": False}
+    ]
+})
+
 print("完成！")
