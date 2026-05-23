@@ -42,7 +42,7 @@ def analyze(articles, category):
             "content-type": "application/json"
         },
         json={
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-5",
             "max_tokens": 2000,
             "messages": [{"role": "user", "content": prompt}]
         }
@@ -85,33 +85,4 @@ def save_file(content, label):
 # 主流程
 today = date.today().strftime("%Y-%m-%d")
 
-tw_articles = fetch_news("台股 股市 台灣經濟", "zh")
-us_articles = fetch_news("US stock market Wall Street", "en")
-global_articles = fetch_news("war economy geopolitics oil energy", "en")
-
-tw_analysis = analyze(tw_articles, "台股")
-us_analysis = analyze(us_articles, "美股")
-global_analysis = analyze(global_articles, "全球局勢")
-
-report = f"""📅 {today} 股市日報
-{'='*50}
-
-🇹🇼 台股分析
-{'-'*30}
-{tw_analysis}
-
-🇺🇸 美股分析
-{'-'*30}
-{us_analysis}
-
-🌍 全球局勢影響
-{'-'*30}
-{global_analysis}
-
-{'='*50}
-⚠️ 本報告由 AI 自動生成，僅供參考，不構成投資建議。
-"""
-
-save_file(report, "daily")
-send_email(f"📈 {today} 股市日報", report)
-print("完成！")
+tw_articles = fetch_news("台股 股市 台灣經濟
