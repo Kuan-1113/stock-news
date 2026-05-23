@@ -33,7 +33,7 @@ def analyze(articles, category):
 
 新聞：
 {titles}"""
-    
+
     res = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -47,14 +47,20 @@ def analyze(articles, category):
             "messages": [{"role": "user", "content": prompt}]
         }
     )
-    return res.json()["content"][0]["text"]
+    result = res.json()
+    print("API回應：", result)
+    if "content" in result:
+        return result["content"][0]["text"]
+    else:
+        error_msg = result.get("error", {}).get("message", "未知錯誤")
+        return f"AI分析暫時無法使用：{error_msg}"
 
 def send_email(subject, body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
-    
+
     html = f"""
     <html><body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px">
     <h1 style="color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:10px">
@@ -65,7 +71,7 @@ def send_email(subject, body):
     </body></html>
     """
     msg.attach(MIMEText(html, "html", "utf-8"))
-    
+
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
