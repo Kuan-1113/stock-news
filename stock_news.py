@@ -7,8 +7,6 @@ NEWS_API_KEY = os.environ["NEWS_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
-# ─── 大盤數據 ───────────────────────────────────────────
-
 def fetch_yahoo(symbol):
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=2d"
@@ -19,8 +17,9 @@ def fetch_yahoo(symbol):
         if len(closes) >= 2:
             prev, curr = closes[-2], closes[-1]
             pct = (curr - prev) / prev * 100
-            arrow = "🔴" if pct < 0 else "🟢"
-            return arrow + " " + "{:,.2f}".format(curr) + " (" + "{:+.2f}".format(pct) + "%)"
+            arrow = "down" if pct < 0 else "up"
+            emoji = "🔴" if pct < 0 else "🟢"
+            return emoji + " " + "{:,.2f}".format(curr) + " (" + "{:+.2f}".format(pct) + "%)"
         return "數據不足"
     except Exception:
         return "無法取得"
@@ -32,8 +31,8 @@ def fetch_crypto(symbol):
         data = r.json()
         price = float(data["lastPrice"])
         pct = float(data["priceChangePercent"])
-        arrow = "🔴" if pct < 0 else "🟢"
-        return arrow + " $" + "{:,.2f}".format(price) + " (" + "{:+.2f}".format(pct) + "%)"
+        emoji = "🔴" if pct < 0 else "🟢"
+        return emoji + " $" + "{:,.2f}".format(price) + " (" + "{:+.2f}".format(pct) + "%)"
     except Exception:
         return "無法取得"
 
@@ -45,21 +44,20 @@ def fetch_twse_flows():
         if not data:
             return None
         row = data[0]
-        foreign = int(row.get("Foreign_Investor_Net_Buy_Sell", "0").replace(",", ""))
-        trust = int(row.get("Investment_Trust_Net_Buy_Sell", "0").replace(",", ""))
-        dealer = int(row.get("Dealer_Net_Buy_Sell", "0").replace(",", ""))
         def fmt(val):
-            arrow = "🔴" if val < 0 else "🟢"
-            return arrow + " " + "{:+,.0f}".format(val) + " 萬元"
+            try:
+                v = int(str(val).replace(",", ""))
+                emoji = "🔴" if v < 0 else "🟢"
+                return emoji + " " + "{:+,.0f}".format(v) + " 萬元"
+            except Exception:
+                return "無法解析"
         return {
-            "外資": fmt(foreign),
-            "投信": fmt(trust),
-            "自營商": fmt(dealer)
+            "外資": fmt(row.get("Foreign_Investor_Net_Buy_Sell", "0")),
+            "投信": fmt(row.get("Investment_Trust_Net_Buy_Sell", "0")),
+            "自營商": fmt(row.get("Dealer_Net_Buy_Sell", "0"))
         }
     except Exception:
         return None
-
-# ─── 新聞 ────────────────────────────────────────────────
 
 def fetch_news(query, lang, count=10):
     try:
@@ -76,7 +74,6 @@ def fetch_news(query, lang, count=10):
         return [a for a in articles if a.get("title") and "[Removed]" not in a.get("title", "")]
     except Exception:
         return []
-        # ─── AI 分析 ─────────────────────────────────────────────
 
 def analyze(articles, category, max_words=150):
     if not articles:
@@ -145,8 +142,6 @@ def analyze_global(vix, us10y, dxy, btc, eth, sol):
     except Exception:
         return "AI分析暫時無法使用"
 
-# ─── Discord 發送 ────────────────────────────────────────
-
 def make_news_links(articles):
     if not articles:
         return "暫無新聞連結"
@@ -165,12 +160,12 @@ def send_discord(embeds):
             print("Discord 發送成功")
         else:
             print("Discord 發送失敗：" + str(res.status_code) + " " + res.text)
-            # ─── 主流程 ─────────────────────────────────────────────
+    except Exception as e:
+        print("Discord 發送錯誤：" + str(e))
 
 today = date.today().strftime("%Y-%m-%d")
 print("開始執行...")
 
-# 抓大盤數據
 print("抓取大盤數據...")
 twii = fetch_yahoo("^TWII")
 dji = fetch_yahoo("^DJI")
@@ -182,29 +177,24 @@ dxy = fetch_yahoo("DX-Y.NYB")
 gold = fetch_yahoo("GC=F")
 oil = fetch_yahoo("CL=F")
 
-# 抓加密貨幣
 print("抓取加密貨幣...")
 btc = fetch_crypto("BTCUSDT")
 eth = fetch_crypto("ETHUSDT")
 sol = fetch_crypto("SOLUSDT")
 
-# 抓台股籌碼
 print("抓取台股籌碼...")
 flows = fetch_twse_flows()
 
-# 抓新聞
 print("抓取新聞...")
 tw_articles = fetch_news("Taiwan stock market TWSE economy", "zh", 10)
 us_articles = fetch_news("US stock market Wall Street NYSE NASDAQ", "en", 10)
 global_articles = fetch_news("war economy geopolitics oil Fed interest rate", "en", 10)
 
-# AI 分析
 print("AI 分析中...")
 tw_analysis = analyze(tw_articles, "台股")
 us_analysis = analyze(us_articles, "美股")
 global_insight = analyze_global(vix, us10y, dxy, btc, eth, sol)
 
-# 台股籌碼格式
 if flows:
     flows_text = (
         "外資：" + flows["外資"] + "\n"
@@ -214,7 +204,6 @@ if flows:
 else:
     flows_text = "今日籌碼資料暫無法取得"
 
-# 建立 Discord Embeds
 embeds = [
     {
         "title": "📈 " + today + " 股市日報",
