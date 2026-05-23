@@ -25,14 +25,7 @@ def fetch_news(query, lang, count=15):
 
 def analyze(articles, category):
     titles = "\n".join([f"- {a['title']}" for a in articles])
-    prompt = f"""以下是今日{category}新聞標題，請用繁體中文：
-1. 翻譯每則標題
-2. 分析整體趨勢
-3. 說明可能影響哪些產業或股票
-4. 給投資人一句重點提醒
-
-新聞：
-{titles}"""
+    prompt = "以下是今日" + category + "新聞標題，請用繁體中文：\n1. 翻譯每則標題\n2. 分析整體趨勢\n3. 說明可能影響哪些產業或股票\n4. 給投資人一句重點提醒\n\n新聞：\n" + titles
 
     res = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -48,30 +41,20 @@ def analyze(articles, category):
         }
     )
     result = res.json()
-    print("API回應：", result)
+    print("API:", result)
     if "content" in result:
         return result["content"][0]["text"]
     else:
-        error_msg = result.get("error", {}).get("message", "未知錯誤")
-        return f"AI分析暫時無法使用：{error_msg}"
+        error_msg = result.get("error", {}).get("message", "unknown error")
+        return "AI分析暫時無法使用：" + error_msg
 
 def send_email(subject, body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
-
-    html = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px">
-    <h1 style="color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:10px">
-    📈 股市日報</h1>
-    <pre style="white-space:pre-wrap;font-size:14px;line-height:1.8">{body}</pre>
-    <hr style="margin-top:30px">
-    <p style="color:#888;font-size:12px">此報告由 AI 自動生成，僅供參考，不構成投資建議。</p>
-    </body></html>
-    """
+    html = "<html><body style='font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:20px'><h1 style='color:#1a1a2e;border-bottom:3px solid #e94560;padding-bottom:10px'>📈 股市日報</h1><pre style='white-space:pre-wrap;font-size:14px;line-height:1.8'>" + body + "</pre><hr><p style='color:#888;font-size:12px'>此報告由 AI 自動生成，僅供參考，不構成投資建議。</p></body></html>"
     msg.attach(MIMEText(html, "html", "utf-8"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.send_message(msg)
@@ -79,10 +62,21 @@ def send_email(subject, body):
 def save_file(content, label):
     today = date.today().strftime("%Y-%m-%d")
     os.makedirs("reports", exist_ok=True)
-    with open(f"reports/{today}-{label}.txt", "w", encoding="utf-8") as f:
+    with open("reports/" + today + "-" + label + ".txt", "w", encoding="utf-8") as f:
         f.write(content)
 
-# 主流程
 today = date.today().strftime("%Y-%m-%d")
 
-tw_articles = fetch_news("台股 股市 台灣經濟
+tw_articles = fetch_news("Taiwan stock market economy", "zh", 15)
+us_articles = fetch_news("US stock market Wall Street", "en", 15)
+global_articles = fetch_news("war economy geopolitics oil energy", "en", 15)
+
+tw_analysis = analyze(tw_articles, "台股")
+us_analysis = analyze(us_articles, "美股")
+global_analysis = analyze(global_articles, "全球局勢")
+
+report = today + " 股市日報\n" + "="*50 + "\n\n台股分析\n" + "-"*30 + "\n" + tw_analysis + "\n\n美股分析\n" + "-"*30 + "\n" + us_analysis + "\n\n全球局勢影響\n" + "-"*30 + "\n" + global_analysis + "\n\n" + "="*50 + "\n此報告由 AI 自動生成，僅供參考，不構成投資建議。"
+
+save_file(report, "daily")
+send_email("📈 " + today + " 股市日報", report)
+print("完成！")
