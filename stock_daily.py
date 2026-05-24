@@ -8,6 +8,8 @@ stock_daily.py
   14:00 → 整理當天 08:00 ~ 14:00 的新聞
   22:00 → 整理當天 14:00 ~ 22:00 的新聞
 
+週六日：新聞照常整理，指標數據若無更新則標註「未更新（上次交易日數據）」
+
 使用方式：
   1. 設定環境變數 ANTHROPIC_API_KEY
   2. python stock_daily.py          ← 立即執行一次（測試用）
@@ -20,7 +22,6 @@ import re
 import time
 import datetime
 import warnings
-import textwrap
 import feedparser
 import requests
 import schedule
@@ -39,10 +40,21 @@ warnings.filterwarnings("ignore")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 DISCORD_TW     = "https://discord.com/api/webhooks/1507952802662449152/8iumIv-Bs5PTRVlMpFXbE7wH_uzHJlLtmybTHaj1zUDxksQBZwRAOs7v69tvSOezmWnW"
-DISCORD_US     = "https://discord.com/api/webhooks/1507952945130635307/3Rd1BBhGElvH4N7RZeQaOHNp5FqiCGBO4d9UZwK29dY1wksN70CWYh4MJ19tRfUuSOVX"
+DISCORD_US     = "https://discord.com/api/webhooks/1507952945130635307/3Rd1BBhGElvH4N7RZeQaOHNp5FqiCGBO4d9UZwK29dY1wksN70CWYH4MJ19tRfUuSOVX"
 DISCORD_GLOBAL = "https://discord.com/api/webhooks/1507953174512668902/QsKOUt5afzwQYfbQQeGi8Tza2-gkLKUJaP-B03lWEyX9C5ops59NuGHLJCK7a8UC9N5-"
+DISCORD_WATCHLIST = "https://discord.com/api/webhooks/1508115009924894744/rlYl9lqindxWlauA4Ie4UJsWbneXM2nQZbuCa8_0XWKLvF3gpku5LONetISQ-MHzJhl1"
 
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+# 自選股清單
+WATCHLIST = [
+    {"symbol": "2330.TW", "name": "台積電"},
+    {"symbol": "2454.TW", "name": "聯發科"},
+    {"symbol": "NVDA",    "name": "輝達"},
+    {"symbol": "AAPL",    "name": "蘋果"},
+    {"symbol": "TSLA",    "name": "特斯拉"},
+    {"symbol": "^TWII",   "name": "加權指數"},
+]
 
 # ─────────────────────────────────────────────────────────────
 # 時段判斷
@@ -74,6 +86,10 @@ def get_session_info() -> dict:
             "start_h": 14,
             "end_h": 22,
         }
+
+def is_weekend() -> bool:
+    """判斷今天是否為週六日"""
+    return datetime.datetime.now(TW_TZ).weekday() >= 5  # 5=Saturday, 6=Sunday
 
 def now_tw() -> datetime.datetime:
     return datetime.datetime.now(TW_TZ)
@@ -119,13 +135,25 @@ def fetch_yahoo(symbol: str, name: str = "") -> dict:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=5d"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         if r.status_code != 200:
-            return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪"}
+            return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪", "stale": False}
         data = r.json()
         result = data["chart"]["result"][0]
         closes = result["indicators"]["quote"][0]["close"]
+        timestamps = result.get("timestamp", [])
         closes = [c for c in closes if c is not None]
         meta = result.get("meta", {})
         currency = meta.get("currency", "")
+
+        # 判斷數據是否為舊數據（週末）
+        stale = False
+        if timestamps and is_weekend():
+            last_ts = timestamps[-1]
+            last_dt = datetime.datetime.fromtimestamp(last_ts, tz=TW_TZ)
+            if last_dt.weekday() >= 5:
+                stale = True
+            elif (now_tw() - last_dt).days >= 1:
+                stale = True
+
         if len(closes) >= 2:
             prev, curr = closes[-2], closes[-1]
             chg = curr - prev
@@ -138,14 +166,16 @@ def fetch_yahoo(symbol: str, name: str = "") -> dict:
                 "pct": f"{pct:+.2f}%",
                 "emoji": emoji,
                 "currency": currency,
+                "stale": stale,
             }
-        return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪"}
+        return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪", "stale": False}
     except Exception as e:
         print(f"Yahoo 錯誤 {symbol}：{e}")
-        return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪"}
+        return {"name": name or symbol, "price": "N/A", "change": "N/A", "pct": "N/A", "emoji": "⚪", "stale": False}
 
 def fmt_quote(q: dict) -> str:
-    return f"{q['emoji']} {q['price']} ({q['pct']})"
+    stale_tag = " ⚠️未更新（上次交易日）" if q.get("stale") else ""
+    return f"{q['emoji']} {q['price']} ({q['pct']}){stale_tag}"
 
 # ─────────────────────────────────────────────────────────────
 # 加密貨幣（CoinGecko 免費 API）
@@ -177,41 +207,27 @@ def fetch_crypto() -> dict:
 # ─────────────────────────────────────────────────────────────
 RSS_FEEDS = {
     "tw": [
-        # 鉅亨網台股
         "https://news.cnyes.com/rss/cat/tw_stock",
-        # Yahoo 台灣財經
         "https://tw.stock.yahoo.com/rss",
-        # Google News 台股
         "https://news.google.com/rss/search?q=台股+股市&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-        # Google News 台灣財經
         "https://news.google.com/rss/search?q=台灣+財經+科技股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-        # MoneyDJ 台股
         "https://www.moneydj.com/rss/news.aspx?svc=NW&cat=MB",
     ],
     "us": [
-        # Google News 美股
         "https://news.google.com/rss/search?q=US+stock+market+Wall+Street&hl=en-US&gl=US&ceid=US:en",
-        # Google News 納斯達克
         "https://news.google.com/rss/search?q=NASDAQ+S%26P500+Fed+earnings&hl=en-US&gl=US&ceid=US:en",
-        # Yahoo Finance RSS
         "https://finance.yahoo.com/rss/topstories",
-        # MarketWatch
         "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     ],
     "global": [
-        # Google News 全球財經
         "https://news.google.com/rss/search?q=global+economy+Fed+inflation+oil&hl=en-US&gl=US&ceid=US:en",
-        # Google News 地緣政治
         "https://news.google.com/rss/search?q=geopolitics+trade+war+OPEC&hl=en-US&gl=US&ceid=US:en",
-        # Reuters Business
         "https://feeds.reuters.com/reuters/businessNews",
-        # BBC Business
         "https://feeds.bbci.co.uk/news/business/rss.xml",
     ],
 }
 
 def parse_rss_date(entry) -> datetime.datetime | None:
-    """解析 RSS 條目的發布時間"""
     for attr in ["published_parsed", "updated_parsed"]:
         t = getattr(entry, attr, None)
         if t:
@@ -223,20 +239,17 @@ def parse_rss_date(entry) -> datetime.datetime | None:
     return None
 
 def fetch_rss(url: str, limit: int = 10) -> list:
-    """抓取單一 RSS feed，回傳新聞列表"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         }
-        # feedparser 直接抓取
         feed = feedparser.parse(url, request_headers=headers)
         articles = []
         for entry in feed.entries[:limit]:
             title = getattr(entry, "title", "").strip()
             link = getattr(entry, "link", "#").strip()
             summary = getattr(entry, "summary", "").strip()
-            # 清除 HTML 標籤
             summary = re.sub(r"<[^>]+>", "", summary)[:200]
             pub_dt = parse_rss_date(entry)
             if title and len(title) > 5:
@@ -252,7 +265,6 @@ def fetch_rss(url: str, limit: int = 10) -> list:
         return []
 
 def fetch_all_news(category: str, session_info: dict) -> list:
-    """抓取指定類別的所有 RSS 新聞，並依時段過濾"""
     feeds = RSS_FEEDS.get(category, [])
     all_articles = []
     seen_titles = set()
@@ -261,7 +273,6 @@ def fetch_all_news(category: str, session_info: dict) -> list:
         articles = fetch_rss(url, limit=15)
         for a in articles:
             title = a["title"]
-            # 去重
             title_key = re.sub(r"\s+", "", title.lower())[:30]
             if title_key in seen_titles:
                 continue
@@ -269,23 +280,18 @@ def fetch_all_news(category: str, session_info: dict) -> list:
             all_articles.append(a)
         time.sleep(0.3)
 
-    # 依時段過濾（若有時間資訊）
     now = now_tw()
     start_h = session_info["start_h"]
     end_h = session_info["end_h"]
 
-    # 計算時段的起始與結束 datetime
     if start_h < end_h:
-        # 同一天
         start_dt = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
         end_dt = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
     else:
-        # 跨天（22:00 前天 ~ 08:00 今天）
         yesterday = now - datetime.timedelta(days=1)
         start_dt = yesterday.replace(hour=start_h, minute=0, second=0, microsecond=0)
         end_dt = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
 
-    # 過濾有時間的文章，保留無時間的文章（視為最新）
     filtered = []
     no_time = []
     for a in all_articles:
@@ -294,9 +300,7 @@ def fetch_all_news(category: str, session_info: dict) -> list:
         elif start_dt <= a["pub_dt"] <= end_dt:
             filtered.append(a)
 
-    # 優先用有時間且在時段內的，不足則補無時間的
     result = filtered + no_time
-    # 依時間排序（新的在前）
     result.sort(key=lambda x: x["pub_dt"] or datetime.datetime.min.replace(tzinfo=TW_TZ), reverse=True)
     return result[:15]
 
@@ -304,7 +308,6 @@ def fetch_all_news(category: str, session_info: dict) -> list:
 # Claude 分析
 # ─────────────────────────────────────────────────────────────
 def build_news_text(articles: list, limit: int = 12) -> str:
-    """將新聞列表轉為文字供 Claude 分析"""
     lines = []
     for i, a in enumerate(articles[:limit], 1):
         title = a["title"]
@@ -317,10 +320,10 @@ def build_news_text(articles: list, limit: int = 12) -> str:
     return "\n".join(lines) if lines else "（本時段暫無新聞）"
 
 def analyze_tw_news(articles: list, session_info: dict, market_data: dict) -> str:
-    """Claude 分析台股新聞"""
     news_text = build_news_text(articles)
     twii = market_data.get("twii", {})
-    prompt = f"""你是一位資深台股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
+    weekend_note = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
+    prompt = f"""你是一位資深台股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{weekend_note}
 
 【台灣加權指數】{fmt_quote(twii) if twii else 'N/A'}
 
@@ -345,12 +348,12 @@ def analyze_tw_news(articles: list, session_info: dict, market_data: dict) -> st
     return claude_call(prompt, max_tokens=1800)
 
 def analyze_us_news(articles: list, session_info: dict, market_data: dict) -> str:
-    """Claude 分析美股新聞"""
     news_text = build_news_text(articles)
     dji = market_data.get("dji", {})
     ixic = market_data.get("ixic", {})
     gspc = market_data.get("gspc", {})
-    prompt = f"""你是一位資深美股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
+    weekend_note = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
+    prompt = f"""你是一位資深美股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{weekend_note}
 
 【美股大盤】
 - 道瓊：{fmt_quote(dji) if dji else 'N/A'}
@@ -378,7 +381,6 @@ def analyze_us_news(articles: list, session_info: dict, market_data: dict) -> st
     return claude_call(prompt, max_tokens=1800)
 
 def analyze_global_news(articles: list, session_info: dict, market_data: dict) -> str:
-    """Claude 分析國際新聞"""
     news_text = build_news_text(articles)
     vix = market_data.get("vix", {})
     gold = market_data.get("gold", {})
@@ -388,8 +390,9 @@ def analyze_global_news(articles: list, session_info: dict, market_data: dict) -
     crypto = market_data.get("crypto", {})
     btc = crypto.get("BTC", {})
     eth = crypto.get("ETH", {})
+    weekend_note = "\n⚠️ 今日為週末，部分指標數據為上次交易日數值，已標註「未更新」。" if is_weekend() else ""
 
-    prompt = f"""你是一位資深國際財經分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
+    prompt = f"""你是一位資深國際財經分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{weekend_note}
 
 【全球關鍵指標】
 - VIX 恐慌指數：{fmt_quote(vix) if vix else 'N/A'}
@@ -421,6 +424,98 @@ def analyze_global_news(articles: list, session_info: dict, market_data: dict) -
     return claude_call(prompt, max_tokens=1800)
 
 # ─────────────────────────────────────────────────────────────
+# 自選股分析
+# ─────────────────────────────────────────────────────────────
+def analyze_single_stock(symbol: str, name: str, quote: dict, news_context: str = "") -> str:
+    """Claude 分析單一股票"""
+    stale_note = "⚠️ 注意：今日為週末，以下為上次交易日收盤數據。\n" if quote.get("stale") else ""
+    prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析與預測。
+
+{stale_note}
+【股票資訊】
+- 名稱：{name}（{symbol}）
+- 最新價格：{quote.get('price', 'N/A')}
+- 漲跌幅：{quote.get('pct', 'N/A')}
+- 漲跌點：{quote.get('change', 'N/A')}
+
+【相關新聞背景】
+{news_context if news_context else '（暫無相關新聞）'}
+
+請以繁體中文撰寫分析報告，格式如下：
+
+1. **近期走勢分析**（2-3句，說明目前價格位置與趨勢）
+
+2. **技術面觀察**（提及均線、支撐壓力位、RSI/MACD 等技術指標的可能狀態）
+
+3. **基本面亮點**（2-3個重點，結合近期新聞或產業動態）
+
+4. **短期預測**（未來 1-2 週的可能走向，給出目標價區間）
+
+5. **操作建議**
+   - 多方策略：...
+   - 空方策略：...
+   - 風險提示：...
+
+請保持專業、客觀，並明確標示這是 AI 分析，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1200)
+
+def fetch_stock_news(symbol: str, name: str) -> str:
+    """抓取特定股票的相關新聞"""
+    query = f"{name} {symbol} stock"
+    if ".TW" in symbol:
+        query = f"{name} 台股 股票"
+    try:
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+        titles = [e.title for e in feed.entries[:5] if hasattr(e, "title")]
+        return "\n".join(titles) if titles else ""
+    except Exception:
+        return ""
+
+def run_watchlist_report():
+    """執行自選股日報（每日結算後）"""
+    print("\n📈 執行自選股分析...")
+    session_info = get_session_info()
+    ts = now_str()
+    weekend_banner = "（週末版 — 數據為上次交易日）" if is_weekend() else ""
+
+    # 發送標題訊息
+    send_embed(DISCORD_WATCHLIST, {
+        "title": f"📊 自選股日報 {session_info['emoji']} {session_info['label']} {weekend_banner}| {ts}",
+        "description": f"**時段：** {session_info['period']}\n以下為自選股最新分析，由 Claude AI 生成，不構成投資建議。",
+        "color": 0xF39C12,
+        "footer": {"text": "資料來源：Yahoo Finance + Claude AI"},
+    })
+    time.sleep(1.2)
+
+    for stock in WATCHLIST:
+        symbol = stock["symbol"]
+        name = stock["name"]
+        print(f"  分析 {name}（{symbol}）...")
+
+        # 抓取報價
+        quote = fetch_yahoo(symbol, name)
+        print(f"    價格：{fmt_quote(quote)}")
+
+        # 抓取相關新聞
+        news_ctx = fetch_stock_news(symbol, name)
+        time.sleep(0.5)
+
+        # Claude 分析
+        analysis = analyze_single_stock(symbol, name, quote, news_ctx)
+        time.sleep(1)
+
+        # 發送到 Discord
+        stale_tag = " ⚠️未更新" if quote.get("stale") else ""
+        send_discord_message(
+            DISCORD_WATCHLIST,
+            f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — {quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}\n\n{analysis}"
+        )
+        time.sleep(1.5)
+
+    print("  ✅ 自選股分析完成")
+
+# ─────────────────────────────────────────────────────────────
 # Discord 傳送
 # ─────────────────────────────────────────────────────────────
 MAX_EMBED_FIELD = 1024
@@ -435,10 +530,8 @@ def truncate(text: str, limit: int = MAX_EMBED_FIELD) -> str:
     return text
 
 def send_discord_message(webhook_url: str, content: str) -> bool:
-    """傳送純文字訊息（自動分段）"""
     if not content or not content.strip():
         return False
-    # 分段（Discord 單則訊息上限 2000 字）
     chunks = []
     lines = content.split("\n")
     current = ""
@@ -468,8 +561,6 @@ def send_discord_message(webhook_url: str, content: str) -> bool:
     return success
 
 def send_embed(webhook_url: str, embed: dict) -> bool:
-    """傳送 Discord Embed 訊息"""
-    # 確保每個 field value 不超過 1024 字
     for field in embed.get("fields", []):
         v = field.get("value", "")
         field["value"] = truncate(v, MAX_EMBED_FIELD)
@@ -486,7 +577,6 @@ def send_embed(webhook_url: str, embed: dict) -> bool:
         return False
 
 def build_news_links(articles: list, limit: int = 8) -> str:
-    """組合新聞連結列表"""
     if not articles:
         return "暫無新聞"
     lines = []
@@ -499,7 +589,6 @@ def build_news_links(articles: list, limit: int = 8) -> str:
     return "\n".join(lines)
 
 def build_market_table(market_data: dict) -> str:
-    """組合大盤數據表格（Discord Markdown）"""
     rows = []
     mapping = [
         ("twii",  "🇹🇼 台灣加權"),
@@ -515,7 +604,8 @@ def build_market_table(market_data: dict) -> str:
     for key, label in mapping:
         q = market_data.get(key, {})
         if q and q.get("price") != "N/A":
-            rows.append(f"{label}: {q['emoji']} **{q['price']}** ({q['pct']})")
+            stale = " ⚠️未更新" if q.get("stale") else ""
+            rows.append(f"{label}: {q['emoji']} **{q['price']}** ({q['pct']}){stale}")
     return "\n".join(rows) if rows else "暫無數據"
 
 # ─────────────────────────────────────────────────────────────
@@ -525,7 +615,8 @@ def run_report():
     """執行一次完整的日報生成與發送"""
     print("=" * 65)
     session_info = get_session_info()
-    print(f"🚀 股市日報啟動 — {now_str()}")
+    weekend_note = "（週末版）" if is_weekend() else ""
+    print(f"🚀 股市日報啟動 — {now_str()} {weekend_note}")
     print(f"📅 本次時段：{session_info['emoji']} {session_info['label']} ({session_info['period']})")
     print("=" * 65)
 
@@ -545,7 +636,8 @@ def run_report():
     }
     for key, (sym, name) in symbols.items():
         market_data[key] = fetch_yahoo(sym, name)
-        print(f"  {name}: {fmt_quote(market_data[key])}")
+        stale_tag = " ⚠️未更新" if market_data[key].get("stale") else ""
+        print(f"  {name}: {fmt_quote(market_data[key])}{stale_tag}")
         time.sleep(0.2)
 
     # ── 2. 抓取加密貨幣 ──────────────────────────────────────
@@ -574,19 +666,17 @@ def run_report():
     global_analysis = analyze_global_news(global_news, session_info, market_data)
 
     # ── 5. 組合訊息 ──────────────────────────────────────────
-    session_tag = f"{session_info['emoji']} {session_info['label']} | {session_info['period']}"
+    weekend_banner = "（週末版）" if is_weekend() else ""
+    session_tag = f"{session_info['emoji']} {session_info['label']} {weekend_banner}| {session_info['period']}"
     ts = now_str()
 
-    # 大盤數據表格
     market_table = build_market_table(market_data)
 
-    # 加密貨幣文字
     crypto_text = "\n".join([
         f"{d['emoji']} **{sym}**：{d['price']} ({d['pct']})"
         for sym, d in crypto.items()
     ]) if crypto else "暫無數據"
 
-    # 新聞連結
     tw_links     = build_news_links(tw_news)
     us_links     = build_news_links(us_news)
     global_links = build_news_links(global_news)
@@ -595,28 +685,21 @@ def run_report():
     print("\n📤 發送到 Discord...")
 
     # ── 台股頻道 ──────────────────────────────────────────────
-    # 訊息 1：台股大盤 + 籌碼
     send_embed(DISCORD_TW, {
-        "title": f"🇹🇼 台股{session_info['label']} | {ts}",
+        "title": f"🇹🇼 台股{session_info['label']} {weekend_banner}| {ts}",
         "description": f"**時段：** {session_info['period']}",
         "color": 0x2ECC71,
         "fields": [
-            {
-                "name": "📊 大盤指數",
-                "value": truncate(market_table),
-                "inline": False,
-            },
+            {"name": "📊 大盤指數", "value": truncate(market_table), "inline": False},
         ],
-        "footer": {"text": "資料來源：Yahoo Finance"},
+        "footer": {"text": "資料來源：Yahoo Finance" + ("｜⚠️ 週末數據為上次交易日" if is_weekend() else "")},
     })
     time.sleep(1.2)
 
-    # 訊息 2：台股 AI 分析（分段傳送，因為分析內容較長）
     header = f"## 🤖 Claude AI 台股分析 — {session_tag}\n\n"
     send_discord_message(DISCORD_TW, header + tw_analysis)
     time.sleep(1.2)
 
-    # 訊息 3：台股新聞連結
     send_embed(DISCORD_TW, {
         "title": f"📰 台股新聞連結 | {ts}",
         "color": 0x27AE60,
@@ -629,19 +712,19 @@ def run_report():
 
     # ── 美股頻道 ──────────────────────────────────────────────
     us_market_text = "\n".join([
-        f"{market_data['dji']['emoji']} **道瓊**：{market_data['dji']['price']} ({market_data['dji']['pct']})",
-        f"{market_data['ixic']['emoji']} **納斯達克**：{market_data['ixic']['price']} ({market_data['ixic']['pct']})",
-        f"{market_data['gspc']['emoji']} **S&P 500**：{market_data['gspc']['price']} ({market_data['gspc']['pct']})",
+        f"{market_data['dji']['emoji']} **道瓊**：{market_data['dji']['price']} ({market_data['dji']['pct']})" + (" ⚠️未更新" if market_data['dji'].get('stale') else ""),
+        f"{market_data['ixic']['emoji']} **納斯達克**：{market_data['ixic']['price']} ({market_data['ixic']['pct']})" + (" ⚠️未更新" if market_data['ixic'].get('stale') else ""),
+        f"{market_data['gspc']['emoji']} **S&P 500**：{market_data['gspc']['price']} ({market_data['gspc']['pct']})" + (" ⚠️未更新" if market_data['gspc'].get('stale') else ""),
     ])
 
     send_embed(DISCORD_US, {
-        "title": f"🇺🇸 美股{session_info['label']} | {ts}",
+        "title": f"🇺🇸 美股{session_info['label']} {weekend_banner}| {ts}",
         "description": f"**時段：** {session_info['period']}",
         "color": 0x3498DB,
         "fields": [
             {"name": "📊 三大指數", "value": truncate(us_market_text), "inline": False},
         ],
-        "footer": {"text": "資料來源：Yahoo Finance"},
+        "footer": {"text": "資料來源：Yahoo Finance" + ("｜⚠️ 週末數據為上次交易日" if is_weekend() else "")},
     })
     time.sleep(1.2)
 
@@ -661,22 +744,22 @@ def run_report():
 
     # ── 國際頻道 ──────────────────────────────────────────────
     global_market_text = "\n".join([
-        f"{market_data['vix']['emoji']} **VIX**：{market_data['vix']['price']} ({market_data['vix']['pct']})",
-        f"{market_data['us10y']['emoji']} **美債10Y**：{market_data['us10y']['price']} ({market_data['us10y']['pct']})",
-        f"{market_data['dxy']['emoji']} **美元指數**：{market_data['dxy']['price']} ({market_data['dxy']['pct']})",
-        f"{market_data['gold']['emoji']} **黃金**：{market_data['gold']['price']} ({market_data['gold']['pct']})",
-        f"{market_data['oil']['emoji']} **原油(WTI)**：{market_data['oil']['price']} ({market_data['oil']['pct']})",
+        f"{market_data['vix']['emoji']} **VIX**：{market_data['vix']['price']} ({market_data['vix']['pct']})" + (" ⚠️未更新" if market_data['vix'].get('stale') else ""),
+        f"{market_data['us10y']['emoji']} **美債10Y**：{market_data['us10y']['price']} ({market_data['us10y']['pct']})" + (" ⚠️未更新" if market_data['us10y'].get('stale') else ""),
+        f"{market_data['dxy']['emoji']} **美元指數**：{market_data['dxy']['price']} ({market_data['dxy']['pct']})" + (" ⚠️未更新" if market_data['dxy'].get('stale') else ""),
+        f"{market_data['gold']['emoji']} **黃金**：{market_data['gold']['price']} ({market_data['gold']['pct']})" + (" ⚠️未更新" if market_data['gold'].get('stale') else ""),
+        f"{market_data['oil']['emoji']} **原油(WTI)**：{market_data['oil']['price']} ({market_data['oil']['pct']})" + (" ⚠️未更新" if market_data['oil'].get('stale') else ""),
     ])
 
     send_embed(DISCORD_GLOBAL, {
-        "title": f"🌍 國際市場{session_info['label']} | {ts}",
+        "title": f"🌍 國際市場{session_info['label']} {weekend_banner}| {ts}",
         "description": f"**時段：** {session_info['period']}",
         "color": 0x9B59B6,
         "fields": [
             {"name": "📉 總體指標", "value": truncate(global_market_text), "inline": True},
             {"name": "🪙 加密貨幣", "value": truncate(crypto_text), "inline": True},
         ],
-        "footer": {"text": "資料來源：Yahoo Finance / CoinGecko"},
+        "footer": {"text": "資料來源：Yahoo Finance / CoinGecko" + ("｜⚠️ 週末數據為上次交易日" if is_weekend() else "")},
     })
     time.sleep(1.2)
 
@@ -693,18 +776,24 @@ def run_report():
         "footer": {"text": "資料來源：Reuters / BBC / Google News"},
     })
 
+    # ── 7. 自選股分析（每日 22:00 盤後執行）──────────────────
+    if session_info["label"] == "盤後晚報":
+        time.sleep(2)
+        run_watchlist_report()
+
     print("\n" + "=" * 65)
     print(f"✅ 日報完成！— {now_str()}")
     print("=" * 65)
 
 # ─────────────────────────────────────────────────────────────
-# 排程設定
+# 排程設定（每天，含週六日）
 # ─────────────────────────────────────────────────────────────
 def run_schedule():
-    """啟動排程模式（每日 08:00 / 14:00 / 22:00 台灣時間）"""
+    """啟動排程模式（每日 08:00 / 14:00 / 22:00 台灣時間，含週六日）"""
     print("=" * 65)
     print("⏰ 排程模式啟動")
     print("   每日 08:00 / 14:00 / 22:00（台灣時間）自動執行")
+    print("   週六日照常執行，指標數據標註「未更新」")
     print("   按 Ctrl+C 停止")
     print("=" * 65)
 
@@ -712,7 +801,6 @@ def run_schedule():
     schedule.every().day.at("14:00").do(run_report)
     schedule.every().day.at("22:00").do(run_report)
 
-    # 顯示下次執行時間
     next_run = schedule.next_run()
     print(f"⏭️  下次執行：{next_run}")
 
