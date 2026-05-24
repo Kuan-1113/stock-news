@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虛擬環境
+venv/
+env/
+.venv/
+
+# 環境變數
+.env
+*.env
+
+# 日誌與輸出
+daily_out.txt
+daily_err.txt
+*.log
+
+# 日報 Markdown（每次自動生成）
+daily_report.md
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# VS Code
+.vscode/
