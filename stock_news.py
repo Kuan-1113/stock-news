@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlunparse
 
-# 環境變數
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 NEWS_API_KEY = os.environ["NEWS_API_KEY"]
 GNEWS_API_KEY = os.environ["GNEWS_API_KEY"]
@@ -33,39 +32,42 @@ def safe_val(text, limit=1000):
     if not text or str(text).strip() == "":
         return "暫無資料"
     t = str(text).strip()
+    t = re.sub(r'#{1,6}\s*', '', t)
+    t = re.sub(r'\*\*(.+?)\*\*', r'\1', t)
     return t[:limit] if len(t) > limit else t
 
-# 金十 MCP（支援 SSE 格式）
+# 金十 MCP
 jin10_session_id = None
 
-def jin10_parse_response(r):
-    text = r.text.strip()
-    if not text:
+def jin10_parse(raw):
+    if not raw:
         return None
-    # SSE 格式解析 - 取最後一個有效 JSON
-    if "data:" in text:
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    if "data:" in raw:
         candidates = []
-        for line in text.split("\n"):
+        for line in raw.split("\n"):
             line = line.strip()
             if line.startswith("data:"):
-                data = line[5:].strip()
-                if data and data != "[DONE]" and data.startswith("{"):
-                    try:
-                        parsed = json.loads(data)
-                        candidates.append(parsed)
-                    except Exception:
-                        pass
+                chunk = line[5:].strip()
+                if not chunk or chunk == "[DONE]":
+                    continue
+                idx = chunk.find("{")
+                if idx >= 0:
+                    chunk = chunk[idx:]
+                try:
+                    parsed = json.loads(chunk)
+                    candidates.append(parsed)
+                except Exception:
+                    pass
         if candidates:
-            # 優先取有 result 的
             for c in reversed(candidates):
-                if "result" in c or "id" in c:
+                if "result" in c:
                     return c
             return candidates[-1]
-    # 直接 JSON
-    try:
-        return r.json()
-    except Exception:
-        return None
+    return None
 
 def jin10_post(payload):
     global jin10_session_id
@@ -80,7 +82,11 @@ def jin10_post(payload):
         r = requests.post("https://mcp.jin10.com/mcp", headers=headers, json=payload, timeout=20)
         if "Mcp-Session-Id" in r.headers:
             jin10_session_id = r.headers["Mcp-Session-Id"]
-        return jin10_parse_response(r)
+        try:
+            raw = r.content.decode('utf-8').strip()
+        except Exception:
+            raw = r.text.strip()
+        return jin10_parse(raw)
     except Exception as e:
         print("金十請求錯誤：" + str(e))
         return None
@@ -99,7 +105,7 @@ def jin10_initialize():
         print("金十初始化成功")
         jin10_post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         return True
-    print("金十初始化失敗：" + str(result)[:200])
+    print("金十初始化失敗：" + str(result)[:100])
     return False
 
 def jin10_call(tool, args=None):
@@ -111,7 +117,7 @@ def jin10_call(tool, args=None):
     if not result:
         return None
     if result.get("result", {}).get("isError"):
-        print("金十工具錯誤：" + str(result)[:200])
+        print("金十工具錯誤：" + str(result)[:100])
         return None
     return result.get("result", {}).get("structuredContent", {})
 
@@ -120,8 +126,7 @@ def fetch_jin10_flash():
         sc = jin10_call("list_flash")
         if not sc:
             return []
-        items = sc.get("data", {}).get("items", [])
-        return items[:8]
+        return sc.get("data", {}).get("items", [])[:8]
     except Exception as e:
         print("金十快訊錯誤：" + str(e))
         return []
@@ -131,7 +136,7 @@ def fetch_jin10_search(keyword):
         sc = jin10_call("search_flash", {"keyword": keyword})
         if not sc:
             return []
-        return sc.get("data", {}).get("items", [])[:5]
+        return sc.get("data", {}).get("items", [])[:4]
     except Exception:
         return []
 
@@ -238,11 +243,7 @@ def fetch_crypto():
 # 台股籌碼
 def fetch_twse_flows():
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    endpoints = [
-        "https://openapi.twse.com.tw/v1/fund/T86W",
-        "https://openapi.twse.com.tw/v1/fund/MI_INDEX",
-    ]
-    for endpoint in endpoints:
+    for endpoint in ["https://openapi.twse.com.tw/v1/fund/T86W"]:
         try:
             r = requests.get(endpoint, timeout=10, headers=headers)
             if r.status_code != 200 or not r.text.strip():
@@ -258,19 +259,12 @@ def fetch_twse_flows():
                     return emoji + " " + "{:+,.0f}".format(v) + " 萬元"
                 except Exception:
                     return "無法解析"
-            foreign = row.get("Foreign_Investor_Net_Buy_Sell") or row.get("FOREIGN_NET_BUY_SELL", "0")
-            trust   = row.get("Investment_Trust_Net_Buy_Sell") or row.get("TRUST_NET_BUY_SELL", "0")
-            dealer  = row.get("Dealer_Net_Buy_Sell") or row.get("DEALER_NET_BUY_SELL", "0")
-            if foreign == "0" and trust == "0":
-                continue
-            return {
-                "外資": fmt(foreign),
-                "投信": fmt(trust),
-                "自營商": fmt(dealer)
-            }
+            foreign = row.get("Foreign_Investor_Net_Buy_Sell", "0")
+            trust = row.get("Investment_Trust_Net_Buy_Sell", "0")
+            dealer = row.get("Dealer_Net_Buy_Sell", "0")
+            return {"外資": fmt(foreign), "投信": fmt(trust), "自營商": fmt(dealer)}
         except Exception as e:
-            print("TWSE錯誤(" + endpoint[-20:] + ")：" + str(e))
-            continue
+            print("TWSE錯誤：" + str(e))
     return None
 
 # 新聞
@@ -356,8 +350,7 @@ def make_flash_text(items):
     for item in items[:6]:
         t = item.get("title","") or item.get("content","")
         if t:
-            t = re.sub(r'#{1,6}\s*','',str(t))
-            lines.append("\u2022 " + t[:70])
+            lines.append("\u2022 " + str(t)[:70])
     return "\n".join(lines) if lines else "暫無快訊"
 
 def make_calendar_text(items):
@@ -384,14 +377,10 @@ def send_embed(webhook_url, embed):
         if res.status_code in [200, 204]:
             print("發送成功：" + embed.get("title",""))
         else:
-            print("發送失敗：" + str(res.status_code) + " " + res.text[:300])
+            print("發送失敗：" + str(res.status_code) + " " + res.text[:200])
     except Exception as e:
         print("發送錯誤：" + str(e))
     time.sleep(1)
-
-def send_two_embeds(webhook_url, embed1, embed2):
-    send_embed(webhook_url, embed1)
-    send_embed(webhook_url, embed2)
 
 # 主流程
 print("開始執行...")
@@ -430,18 +419,18 @@ print("抓取台股籌碼...")
 flows = fetch_twse_flows()
 
 print("抓取金十快訊與日曆...")
-jin10_items = fetch_jin10_flash() if jin10_ok else []
-# 搜尋熱門關鍵字快訊
+jin10_items = []
+calendar_items = []
 if jin10_ok:
-    extra_flash = []
+    jin10_items = fetch_jin10_flash()
     for kw in ["美联储", "黄金", "原油", "非农"]:
-        extra_flash += fetch_jin10_search(kw)
+        extra = fetch_jin10_search(kw)
+        for item in extra:
+            if item not in jin10_items:
+                jin10_items.append(item)
         time.sleep(0.3)
-    for item in extra_flash:
-        if item not in jin10_items:
-            jin10_items.append(item)
     jin10_items = jin10_items[:10]
-calendar_items = fetch_jin10_calendar() if jin10_ok else []
+    calendar_items = fetch_jin10_calendar()
 
 print("抓取新聞...")
 tw_news = merge_news([
@@ -450,28 +439,26 @@ tw_news = merge_news([
     fetch_gnews("台灣 財經 科技 企業", "zh-TW", 8),
     fetch_newsdata("台股 股市", "zh"),
     fetch_newsdata("taiwan stock economy", "en")
-], limit=10)
-
+])
 us_news = merge_news([
     fetch_finnhub_news("general"),
     fetch_gnews("US stock market Trump Fed earnings", "en", 8),
-    fetch_gnews("Wall Street NASDAQ S&P500 economy", "en", 8),
+    fetch_gnews("Wall Street NASDAQ economy", "en", 8),
     fetch_newsdata("US stock market economy", "en")
-], limit=10)
-
+])
 global_news = merge_news([
     fetch_finnhub_news("forex"),
-    fetch_gnews("war Ukraine Russia oil OPEC geopolitics", "en", 8),
+    fetch_gnews("war Ukraine oil OPEC geopolitics", "en", 8),
     fetch_gnews("Fed inflation economy global trade", "en", 8),
     fetch_newsdata("war economy oil geopolitics", "en")
-], limit=10)
+])
 
 print("Claude 翻譯新聞標題...")
-tw_links     = build_links(tw_news, limit=8)
+tw_links     = build_links(tw_news)
 time.sleep(0.5)
-us_links     = build_links(us_news, limit=8)
+us_links     = build_links(us_news)
 time.sleep(0.5)
-global_links = build_links(global_news, limit=8)
+global_links = build_links(global_news)
 time.sleep(0.5)
 
 print("Claude 深度分析...")
@@ -481,16 +468,13 @@ flash_text     = make_flash_text(jin10_items)
 global_content = flash_text + "\n" + "\n".join([a["title"] for a in global_news[:8]])
 
 tw_analysis = claude_call(
-    "以下是今日台股新聞，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字，不用###或**：\n\n" + tw_content,
-    max_tokens=600)
+    "以下是今日台股新聞，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字：\n\n" + tw_content, max_tokens=600)
 us_analysis = claude_call(
-    "以下是今日美股新聞，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字，不用###或**：\n\n" + us_content,
-    max_tokens=600)
+    "以下是今日美股新聞，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字：\n\n" + us_content, max_tokens=600)
 global_analysis = claude_call(
-    "以下是今日全球財經快訊，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字，不用###或**：\n\n" + global_content,
-    max_tokens=600)
+    "以下是今日全球財經快訊，用繁體中文寫3-4個重點，每點•開頭，每點2句話，不超過200字：\n\n" + global_content, max_tokens=600)
 market_sentiment = claude_call(
-    "用繁體中文2-3句話分析以下指標對今日市場情緒的影響，不要標題或bullet：\n"
+    "用繁體中文2-3句話分析以下指標對今日市場情緒的影響：\n"
     "VIX:" + vix + " 美債10Y:" + us10y + " DXY:" + dxy + " 黃金:" + gold + " 原油:" + oil + " BTC:" + btc + " ETH:" + eth,
     max_tokens=200)
 
@@ -501,7 +485,6 @@ else:
 
 print("發送到 Discord...")
 
-# 台股 - 兩則
 send_embed(DISCORD_TW, {
     "title": "\U0001f1f9\U0001f1fc 台股市場 | " + now,
     "color": 3066993,
@@ -515,11 +498,10 @@ send_embed(DISCORD_TW, {
     "title": "\U0001f4f0 台股今日新聞 | " + now,
     "color": 2067276,
     "fields": [
-        {"name": "\U0001f517 新聞連結（Claude翻譯）", "value": safe_val(tw_links, 1000), "inline": False}
+        {"name": "\U0001f517 新聞連結", "value": safe_val(tw_links, 1000), "inline": False}
     ]
 })
 
-# 美股 - 兩則
 send_embed(DISCORD_US, {
     "title": "\U0001f1fa\U0001f1f8 美股市場 | " + now,
     "color": 3447003,
@@ -532,18 +514,17 @@ send_embed(DISCORD_US, {
     "title": "\U0001f4f0 美股今日新聞 | " + now,
     "color": 1127128,
     "fields": [
-        {"name": "\U0001f517 新聞連結（Claude翻譯）", "value": safe_val(us_links, 1000), "inline": False}
+        {"name": "\U0001f517 新聞連結", "value": safe_val(us_links, 1000), "inline": False}
     ]
 })
 
-# 國際 - 三則
 send_embed(DISCORD_GLOBAL, {
     "title": "\U0001f310 全球市場 | " + now,
     "color": 10181046,
     "fields": [
         {"name": "\U0001f4c9 總體指標", "value": safe_val("VIX：" + vix + "\n美債10Y：" + us10y + "\nDXY：" + dxy + "\n黃金：" + gold + "\n原油：" + oil), "inline": True},
         {"name": "\U0001fa99 加密貨幣", "value": safe_val("BTC：" + btc + "\nETH：" + eth + "\nSOL：" + sol), "inline": True},
-        {"name": "\U0001f321 市場情緒", "value": safe_val(market_sentiment, 500), "inline": False}
+        {"name": "\U0001f321 市場情緒", "value": safe_val(market_sentiment, 400), "inline": False}
     ]
 })
 send_embed(DISCORD_GLOBAL, {
@@ -559,7 +540,7 @@ send_embed(DISCORD_GLOBAL, {
     "color": 9807270,
     "fields": [
         {"name": "\U0001f916 AI 深度分析", "value": safe_val(global_analysis, 1000), "inline": False},
-        {"name": "\U0001f517 新聞連結（Claude翻譯）", "value": safe_val(global_links, 1000), "inline": False}
+        {"name": "\U0001f517 新聞連結", "value": safe_val(global_links, 1000), "inline": False}
     ]
 })
 
