@@ -21,15 +21,26 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝套件
-        run: pip install requests
+        run: pip install requests azure-ai-inference
 
       - name: 執行程式
         env:
-          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+          NEWSDATA_API_KEY: ${{ secrets.NEWSDATA_API_KEY }}
           JIN10_TOKEN: ${{ secrets.JIN10_TOKEN }}
           DISCORD_TW: ${{ secrets.DISCORD_TW }}
           DISCORD_US: ${{ secrets.DISCORD_US }}
           DISCORD_GLOBAL: ${{ secrets.DISCORD_GLOBAL }}
         run: python stock_news.py
+
+      - name: 儲存報告
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add reports/ || true
+          git diff --staged --quiet || git commit -m "新增 $(date +%Y-%m-%d) 股市報告"
+          git push || true
