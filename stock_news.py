@@ -42,17 +42,25 @@ def jin10_parse_response(r):
     text = r.text.strip()
     if not text:
         return None
-    # SSE 格式解析
+    # SSE 格式解析 - 取最後一個有效 JSON
     if "data:" in text:
+        candidates = []
         for line in text.split("\n"):
             line = line.strip()
             if line.startswith("data:"):
                 data = line[5:].strip()
-                if data and data != "[DONE]":
+                if data and data != "[DONE]" and data.startswith("{"):
                     try:
-                        return json.loads(data)
+                        parsed = json.loads(data)
+                        candidates.append(parsed)
                     except Exception:
                         pass
+        if candidates:
+            # 優先取有 result 的
+            for c in reversed(candidates):
+                if "result" in c or "id" in c:
+                    return c
+            return candidates[-1]
     # 直接 JSON
     try:
         return r.json()
@@ -229,29 +237,41 @@ def fetch_crypto():
 
 # 台股籌碼
 def fetch_twse_flows():
-    try:
-        r = requests.get("https://openapi.twse.com.tw/v1/fund/T86W", timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not data:
-            return None
-        row = data[0]
-        def fmt(val):
-            try:
-                v = int(str(val).replace(",", ""))
-                emoji = "\U0001f534" if v < 0 else "\U0001f7e2"
-                return emoji + " " + "{:+,.0f}".format(v) + " 萬元"
-            except Exception:
-                return "無法解析"
-        return {
-            "外資": fmt(row.get("Foreign_Investor_Net_Buy_Sell", "0")),
-            "投信": fmt(row.get("Investment_Trust_Net_Buy_Sell", "0")),
-            "自營商": fmt(row.get("Dealer_Net_Buy_Sell", "0"))
-        }
-    except Exception as e:
-        print("TWSE錯誤：" + str(e))
-        return None
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    endpoints = [
+        "https://openapi.twse.com.tw/v1/fund/T86W",
+        "https://openapi.twse.com.tw/v1/fund/MI_INDEX",
+    ]
+    for endpoint in endpoints:
+        try:
+            r = requests.get(endpoint, timeout=10, headers=headers)
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            data = r.json()
+            if not data or not isinstance(data, list):
+                continue
+            row = data[0]
+            def fmt(val):
+                try:
+                    v = int(str(val).replace(",", "").replace("+", ""))
+                    emoji = "\U0001f534" if v < 0 else "\U0001f7e2"
+                    return emoji + " " + "{:+,.0f}".format(v) + " 萬元"
+                except Exception:
+                    return "無法解析"
+            foreign = row.get("Foreign_Investor_Net_Buy_Sell") or row.get("FOREIGN_NET_BUY_SELL", "0")
+            trust   = row.get("Investment_Trust_Net_Buy_Sell") or row.get("TRUST_NET_BUY_SELL", "0")
+            dealer  = row.get("Dealer_Net_Buy_Sell") or row.get("DEALER_NET_BUY_SELL", "0")
+            if foreign == "0" and trust == "0":
+                continue
+            return {
+                "外資": fmt(foreign),
+                "投信": fmt(trust),
+                "自營商": fmt(dealer)
+            }
+        except Exception as e:
+            print("TWSE錯誤(" + endpoint[-20:] + ")：" + str(e))
+            continue
+    return None
 
 # 新聞
 def fetch_newsapi_tw():
