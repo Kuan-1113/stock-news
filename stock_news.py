@@ -1,7 +1,9 @@
 import requests
 import os
 import time
+import re
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qs
 
 # 環境變數
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -20,8 +22,15 @@ TW_TZ = timezone(timedelta(hours=8))
 def now_str():
     return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
 
-# GPT-5
-def gpt5_call(prompt, max_tokens=300):
+def clean_url(url):
+    try:
+        parsed = urlparse(url)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+    except Exception:
+        return url
+
+# GPT-5 翻譯
+def gpt5_translate(titles_text):
     try:
         res = requests.post(
             "https://models.github.ai/inference/chat/completions",
@@ -29,43 +38,54 @@ def gpt5_call(prompt, max_tokens=300):
             json={
                 "model": "openai/gpt-5",
                 "messages": [
-                    {"role": "system", "content": "你是專業財經分析師，請用繁體中文回應。"},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": "你是專業財經翻譯，只輸出翻譯結果，不加說明。"},
+                    {"role": "user", "content": "請將以下新聞標題逐條翻譯成繁體中文，只輸出編號+翻譯，每行一條：\n" + titles_text}
                 ],
-                "max_tokens": max_tokens
+                "max_tokens": 400
             },
             timeout=30
         )
-        data = res.json()
-        if "choices" in data:
-            return data["choices"][0]["message"]["content"].strip()
-        print("GPT-5錯誤：" + str(data))
+        if res.status_code == 200:
+            data = res.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"].strip()
+        print("GPT-5翻譯失敗：" + str(res.status_code))
         return None
     except Exception as e:
-        print("GPT-5失敗：" + str(e))
+        print("GPT-5錯誤：" + str(e))
         return None
 
-# Claude
-def claude_call(prompt, max_tokens=400):
+# Claude 分析
+def claude_analyze(content, prompt, max_tokens=400):
+    if not content or content.strip() == "":
+        return "今日暫無相關資訊。"
     try:
+        full_prompt = prompt + "\n\n" + content
         res = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-5", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-5", "max_tokens": max_tokens, "messages": [{"role": "user", "content": full_prompt}]},
             timeout=30
         )
-        result = res.json()
-        if "content" in result:
-            return result["content"][0]["text"].strip()
+        if res.status_code == 200:
+            result = res.json()
+            if "content" in result:
+                text = result["content"][0]["text"].strip()
+                text = re.sub(r'#{1,6}\s*', '', text)
+                text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+                return text[:900]
         return "AI分析暫時無法使用"
-    except Exception:
+    except Exception as e:
+        print("Claude錯誤：" + str(e))
         return "AI分析暫時無法使用"
 
 # 大盤數據
 def fetch_yahoo(symbol):
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=2d"
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=5d"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            return "無法取得"
         data = r.json()
         closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
         closes = [c for c in closes if c is not None]
@@ -75,7 +95,8 @@ def fetch_yahoo(symbol):
             emoji = "\U0001f534" if pct < 0 else "\U0001f7e2"
             return emoji + " " + "{:,.2f}".format(curr) + " (" + "{:+.2f}".format(pct) + "%)"
         return "數據不足"
-    except Exception:
+    except Exception as e:
+        print("Yahoo錯誤 " + symbol + "：" + str(e))
         return "無法取得"
 
 # CoinGecko 加密貨幣
@@ -83,7 +104,9 @@ def fetch_crypto():
     try:
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd", "include_24hr_change": "true"}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return {"BTC": "無法取得", "ETH": "無法取得", "SOL": "無法取得"}
         data = r.json()
         results = {}
         mapping = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
@@ -105,6 +128,8 @@ def fetch_twse_flows():
     try:
         url = "https://openapi.twse.com.tw/v1/fund/T86W"
         r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
         data = r.json()
         if not data:
             return None
@@ -121,25 +146,29 @@ def fetch_twse_flows():
             "投信": fmt(row.get("Investment_Trust_Net_Buy_Sell", "0")),
             "自營商": fmt(row.get("Dealer_Net_Buy_Sell", "0"))
         }
-    except Exception:
+    except Exception as e:
+        print("TWSE籌碼錯誤：" + str(e))
         return None
 
 # 金十數據
-def jin10_mcp(method, params=None):
+def jin10_call(tool_name, arguments=None):
     try:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+        payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments or {}}}
         r = requests.post(
             "https://mcp.jin10.com/mcp",
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + JIN10_TOKEN},
             json=payload, timeout=15
         )
-        return r.json()
-    except Exception:
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception as e:
+        print("金十錯誤：" + str(e))
         return None
 
 def fetch_jin10_flash():
     try:
-        result = jin10_mcp("tools/call", {"name": "list_flash", "arguments": {}})
+        result = jin10_call("list_flash")
         if not result:
             return []
         items = result.get("result", {}).get("structuredContent", {}).get("data", {}).get("items", [])
@@ -149,17 +178,17 @@ def fetch_jin10_flash():
 
 def fetch_jin10_calendar():
     try:
-        result = jin10_mcp("tools/call", {"name": "list_calendar", "arguments": {}})
+        result = jin10_call("list_calendar")
         if not result:
             return []
         items = result.get("result", {}).get("structuredContent", {}).get("data", [])
-        return [i for i in items if i.get("star", 0) >= 2][:6]
+        return [i for i in items if i.get("star", 0) >= 2][:5]
     except Exception:
         return []
 
 def fetch_jin10_quote(code):
     try:
-        result = jin10_mcp("tools/call", {"name": "get_quote", "arguments": {"code": code}})
+        result = jin10_call("get_quote", {"code": code})
         if not result:
             return "無法取得"
         data = result.get("result", {}).get("structuredContent", {}).get("data", {})
@@ -176,92 +205,91 @@ def fetch_jin10_quote(code):
     except Exception:
         return "無法取得"
 
-# 新聞抓取
+# 新聞抓取（回傳 list of {title, url}）
 def fetch_newsapi_tw():
     try:
-        url = "https://newsapi.org/v2/top-headlines"
-        params = {"country": "tw", "category": "business", "pageSize": 5, "apiKey": NEWS_API_KEY}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get("https://newsapi.org/v2/top-headlines",
+            params={"country": "tw", "category": "business", "pageSize": 8, "apiKey": NEWS_API_KEY}, timeout=10)
+        if r.status_code != 200:
+            return []
         articles = r.json().get("articles", [])
-        return [a for a in articles if a.get("title") and "[Removed]" not in a.get("title", "")]
+        return [{"title": a["title"], "url": clean_url(a.get("url","#"))} for a in articles if a.get("title") and "[Removed]" not in a.get("title","")]
     except Exception:
         return []
 
-def fetch_gnews(query, lang="zh-TW", count=5):
+def fetch_gnews(query, lang="zh-TW", count=8):
     try:
-        url = "https://gnews.io/api/v4/search"
-        params = {"q": query, "lang": lang, "max": count, "apikey": GNEWS_API_KEY, "sortby": "publishedAt"}
-        r = requests.get(url, params=params, timeout=10)
-        return r.json().get("articles", [])
+        r = requests.get("https://gnews.io/api/v4/search",
+            params={"q": query, "lang": lang, "max": count, "apikey": GNEWS_API_KEY, "sortby": "publishedAt"}, timeout=10)
+        if r.status_code != 200:
+            return []
+        return [{"title": a.get("title",""), "url": clean_url(a.get("url","#"))} for a in r.json().get("articles", []) if a.get("title")]
     except Exception:
         return []
 
-def fetch_finnhub(category="general"):
+def fetch_finnhub_news(category="general"):
     try:
-        url = "https://finnhub.io/api/v1/news"
-        params = {"category": category, "token": FINNHUB_KEY}
-        r = requests.get(url, params=params, timeout=10)
-        items = r.json()[:8] if isinstance(r.json(), list) else []
-        return [{"title": i.get("headline", ""), "url": i.get("url", "#"), "source": {"name": i.get("source", "")}} for i in items]
+        r = requests.get("https://finnhub.io/api/v1/news",
+            params={"category": category, "token": FINNHUB_KEY}, timeout=10)
+        if r.status_code != 200:
+            return []
+        items = r.json() if isinstance(r.json(), list) else []
+        return [{"title": i.get("headline",""), "url": clean_url(i.get("url","#"))} for i in items[:8] if i.get("headline")]
     except Exception:
         return []
 
 def fetch_newsdata(query, lang="zh"):
     try:
-        url = "https://newsdata.io/api/1/news"
-        params = {"apikey": NEWSDATA_API_KEY, "q": query, "language": lang, "category": "business"}
-        r = requests.get(url, params=params, timeout=10)
-        results = r.json().get("results", [])
-        return [{"title": i.get("title", ""), "url": i.get("link", "#"), "source": {"name": i.get("source_id", "")}} for i in results[:5]]
+        r = requests.get("https://newsdata.io/api/1/news",
+            params={"apikey": NEWSDATA_API_KEY, "q": query, "language": lang, "category": "business"}, timeout=10)
+        if r.status_code != 200:
+            return []
+        return [{"title": i.get("title",""), "url": clean_url(i.get("link","#"))} for i in r.json().get("results", [])[:8] if i.get("title")]
     except Exception:
         return []
 
-def merge_articles(lists):
+def merge_news(lists, limit=10):
     seen = set()
     merged = []
     for lst in lists:
         for a in lst:
-            title = a.get("title", "")
-            if title and title not in seen:
-                seen.add(title)
+            t = a.get("title", "")
+            if t and t not in seen and len(t) > 5:
+                seen.add(t)
                 merged.append(a)
-    return merged[:8]
+    return merged[:limit]
 
-# 翻譯新聞標題
-def translate_and_link(articles):
+# 翻譯並產生連結（中文標題 + URL）
+def build_links(articles):
     if not articles:
-        return "暫無新聞"
-    titles_raw = [a.get("title", "") for a in articles[:6]]
-    titles_text = "\n".join([str(i+1) + ". " + t for i, t in enumerate(titles_raw)])
-    translated = gpt5_call(
-        "請將以下新聞標題逐條翻譯成繁體中文，只輸出編號+翻譯結果，每行一條，不要加任何說明：\n" + titles_text,
-        max_tokens=300
-    )
+        return "暫無新聞", []
+    titles_text = "\n".join([str(i+1) + ". " + a["title"] for i, a in enumerate(articles[:8])])
+    translated = gpt5_translate(titles_text)
     lines = []
+    refs = []
+    trans_list = []
     if translated:
         trans_list = [l.strip() for l in translated.strip().split("\n") if l.strip()]
-        for i, a in enumerate(articles[:6]):
-            url = a.get("url", "#")
-            if i < len(trans_list):
-                t = trans_list[i].lstrip("0123456789.- ").strip()
-            else:
-                t = titles_raw[i][:35] + "..."
-            lines.append(str(i+1) + ". [" + t[:40] + "](" + url + ")")
-    else:
-        for i, a in enumerate(articles[:6]):
-            url = a.get("url", "#")
-            t = titles_raw[i][:35] + "..."
-            lines.append(str(i+1) + ". [" + t + "](" + url + ")")
-    return "\n".join(lines)
+    for i, a in enumerate(articles[:8]):
+        url = a.get("url", "#")
+        if i < len(trans_list):
+            t = re.sub(r'^\d+[\.\s]+', '', trans_list[i]).strip()
+        else:
+            t = a["title"][:35] + "..."
+        t = t[:45]
+        lines.append(str(i+1) + ". [" + t + "](" + url + ")")
+        refs.append({"title": t, "url": url})
+    return "\n".join(lines), refs
 
 def make_flash_text(items):
     if not items:
         return "暫無快訊"
     lines = []
     for item in items[:6]:
-        title = item.get("title", "") or item.get("content", "")
-        if title:
-            lines.append("\u2022 " + str(title)[:60])
+        t = item.get("title", "") or item.get("content", "")
+        if t:
+            t = re.sub(r'#{1,6}\s*', '', t)
+            lines.append("\u2022 " + str(t)[:70])
     return "\n".join(lines) if lines else "暫無快訊"
 
 def make_calendar_text(items):
@@ -294,16 +322,22 @@ now = now_str()
 
 print("抓取大盤數據...")
 twii = fetch_yahoo("^TWII")
-dji = fetch_yahoo("^DJI")
+dji  = fetch_yahoo("^DJI")
 ixic = fetch_yahoo("^IXIC")
 gspc = fetch_yahoo("^GSPC")
-vix = fetch_yahoo("^VIX")
+vix  = fetch_yahoo("^VIX")
 us10y = fetch_yahoo("^TNX")
-dxy = fetch_yahoo("DX-Y.NYB")
+dxy  = fetch_yahoo("DX-Y.NYB")
+gold_y = fetch_yahoo("GC=F")
+oil_y  = fetch_yahoo("CL=F")
 
 print("抓取金十報價...")
 gold = fetch_jin10_quote("XAUUSD")
-oil = fetch_jin10_quote("USOIL")
+oil  = fetch_jin10_quote("USOIL")
+if gold == "無法取得":
+    gold = gold_y
+if oil == "無法取得":
+    oil = oil_y
 
 print("抓取加密貨幣...")
 crypto = fetch_crypto()
@@ -319,38 +353,50 @@ jin10_items = fetch_jin10_flash()
 calendar_items = fetch_jin10_calendar()
 
 print("抓取新聞...")
-tw_articles = merge_articles([
+tw_news = merge_news([
     fetch_newsapi_tw(),
-    fetch_gnews("台股 股市 台灣經濟", "zh-TW", 5),
-    fetch_newsdata("台股 股市", "zh")
-])
-us_articles = merge_articles([
-    fetch_finnhub("general"),
-    fetch_gnews("US stock market Wall Street Trump Fed", "en", 5)
-])
-global_articles = merge_articles([
-    fetch_finnhub("forex"),
-    fetch_gnews("war Ukraine economy oil geopolitics", "en", 5),
-    fetch_newsdata("economy war oil", "en")
-])
+    fetch_gnews("台股 股市 台灣經濟 科技", "zh-TW", 8),
+    fetch_gnews("台灣 財經 企業", "zh-TW", 5),
+    fetch_newsdata("台股 股市 台灣", "zh"),
+    fetch_newsdata("taiwan stock economy", "en")
+], limit=10)
+
+us_news = merge_news([
+    fetch_finnhub_news("general"),
+    fetch_gnews("US stock market Trump Fed Wall Street earnings", "en", 8),
+    fetch_gnews("S&P500 NASDAQ Dow Jones", "en", 5),
+    fetch_newsdata("US stock market economy", "en")
+], limit=10)
+
+global_news = merge_news([
+    fetch_finnhub_news("forex"),
+    fetch_gnews("war Ukraine Russia geopolitics oil OPEC sanctions", "en", 8),
+    fetch_gnews("Fed interest rate inflation economy global", "en", 5),
+    fetch_newsdata("war economy oil geopolitics", "en")
+], limit=10)
 
 print("GPT-5 翻譯新聞標題...")
-tw_links = translate_and_link(tw_articles)
+tw_links, tw_refs = build_links(tw_news)
 time.sleep(1)
-us_links = translate_and_link(us_articles)
+us_links, us_refs = build_links(us_news)
 time.sleep(1)
-global_links = translate_and_link(global_articles)
+global_links, global_refs = build_links(global_news)
 time.sleep(1)
 
 print("Claude 深度分析...")
-tw_titles = "\n".join([a.get("title", "") for a in tw_articles[:6]])
-us_titles = "\n".join([a.get("title", "") for a in us_articles[:6]])
-flash_text = make_flash_text(jin10_items)
+tw_content = "\n".join([a["title"] for a in tw_news[:8]])
+us_content = "\n".join([a["title"] for a in us_news[:8]])
+global_content = make_flash_text(jin10_items) + "\n" + "\n".join([a["title"] for a in global_news[:6]])
 
-tw_analysis = claude_call("以下是今日台股新聞，請用繁體中文寫2-3個重點，每點用•開頭，總字數不超過100字：\n\n" + tw_titles)
-us_analysis = claude_call("以下是今日美股新聞，請用繁體中文寫2-3個重點，每點用•開頭，總字數不超過100字：\n\n" + us_titles)
-global_analysis = claude_call("以下是今日全球財經快訊，請用繁體中文寫2-3個重點，每點用•開頭，總字數不超過100字：\n\n" + flash_text)
-market_sentiment = claude_call("請用繁體中文一句話（不超過60字）分析以下指標對今日市場情緒的影響：\nVIX:" + vix + " 美債10Y:" + us10y + " DXY:" + dxy + " BTC:" + btc + " ETH:" + eth)
+tw_analysis = claude_analyze(tw_content,
+    "以下是今日台股新聞，請用繁體中文寫2-3個重點，每點用•開頭，不超過150字，不要用###或**：")
+us_analysis = claude_analyze(us_content,
+    "以下是今日美股新聞，請用繁體中文寫2-3個重點，每點用•開頭，不超過150字，不要用###或**：")
+global_analysis = claude_analyze(global_content,
+    "以下是今日全球財經快訊，請用繁體中文寫2-3個重點，每點用•開頭，不超過150字，不要用###或**：")
+market_sentiment = claude_analyze(
+    "VIX:" + vix + " 美債10Y:" + us10y + " DXY:" + dxy + " 黃金:" + gold + " 原油:" + oil + " BTC:" + btc + " ETH:" + eth,
+    "請用繁體中文一句話（不超過60字）分析以上指標對今日市場情緒的影響，不要標題或bullet：")
 
 if flows:
     flows_text = "外資：" + flows["外資"] + "\n投信：" + flows["投信"] + "\n自營商：" + flows["自營商"]
@@ -365,8 +411,8 @@ send_embed(DISCORD_TW, {
     "fields": [
         {"name": "\U0001f4ca 加權指數", "value": "台灣加權：" + twii, "inline": False},
         {"name": "\U0001f3e6 法人籌碼", "value": flows_text, "inline": False},
-        {"name": "\U0001f916 Claude 分析", "value": tw_analysis, "inline": False},
-        {"name": "\U0001f4f0 今日新聞", "value": tw_links, "inline": False}
+        {"name": "\U0001f916 AI 分析（Claude）", "value": tw_analysis, "inline": False},
+        {"name": "\U0001f4f0 今日新聞（GPT-5翻譯）", "value": tw_links, "inline": False}
     ]
 })
 
@@ -375,7 +421,7 @@ send_embed(DISCORD_US, {
     "color": 3447003,
     "fields": [
         {"name": "\U0001f4ca 大盤指數", "value": "道瓊：" + dji + "\n納斯達克：" + ixic + "\nS&P500：" + gspc, "inline": False},
-        {"name": "\U0001f916 Claude 分析", "value": us_analysis, "inline": False},
+        {"name": "\U0001f916 AI 分析（Claude）", "value": us_analysis, "inline": False},
         {"name": "\U0001f4f0 今日新聞（GPT-5翻譯）", "value": us_links, "inline": False}
     ]
 })
@@ -386,9 +432,9 @@ send_embed(DISCORD_GLOBAL, {
     "fields": [
         {"name": "\U0001f4c9 總體指標", "value": "VIX：" + vix + "\n美債10Y：" + us10y + "\nDXY：" + dxy + "\n黃金：" + gold + "\n原油：" + oil, "inline": True},
         {"name": "\U0001fa99 加密貨幣", "value": "BTC：" + btc + "\nETH：" + eth + "\nSOL：" + sol, "inline": True},
-        {"name": "\u26a1 金十快訊", "value": flash_text, "inline": False},
+        {"name": "\u26a1 金十快訊", "value": make_flash_text(jin10_items), "inline": False},
         {"name": "\U0001f4c5 財經日曆", "value": make_calendar_text(calendar_items), "inline": False},
-        {"name": "\U0001f916 Claude 分析", "value": global_analysis, "inline": False},
+        {"name": "\U0001f916 AI 分析（Claude）", "value": global_analysis, "inline": False},
         {"name": "\U0001f321 市場情緒", "value": market_sentiment, "inline": False},
         {"name": "\U0001f4f0 今日新聞（GPT-5翻譯）", "value": global_links, "inline": False}
     ]
