@@ -1,6 +1,0 @@
-requests
-feedparser
-schedule
-anthropic
-pytz
-discord.py

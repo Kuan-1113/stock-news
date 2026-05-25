@@ -21,6 +21,7 @@ import anthropic
 import discord
 from discord import app_commands
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt, format_indicators_for_discord
 
 # ─────────────────────────────────────────────────────────────
@@ -287,7 +288,8 @@ def _load_watchlist() -> list:
     """讀取 watchlist.txt"""
     result = []
     try:
-        with open("watchlist.txt", "r", encoding="utf-8") as f:
+        watchlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+        with open(watchlist_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):

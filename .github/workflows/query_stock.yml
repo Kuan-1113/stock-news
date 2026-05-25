@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: 📦 安裝套件
-        run: pip install requests feedparser anthropic pytz
+        run: pip install requests feedparser anthropic pytz yfinance pandas
 
       - name: 📊 執行查股
         env:
@@ -34,4 +34,4 @@ jobs:
           STOCK_SYMBOL: ${{ github.event.inputs.symbol }}
           STOCK_NAME: ${{ github.event.inputs.name }}
           PYTHONUTF8: "1"
-        run: python -X utf8 query_stock.py
+        run: python -X utf8 自選股/query_stock.py

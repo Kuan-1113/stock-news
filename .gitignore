@@ -23,9 +23,12 @@ env/
 daily_out.txt
 daily_err.txt
 *.log
+output_*.txt
+test_*.txt
 
-# 日報 Markdown（每次自動生成）
+# 日報 / 報告（自動生成）
 daily_report.md
+reports/
 
 # Windows
 Thumbs.db

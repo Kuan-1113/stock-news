@@ -3,7 +3,7 @@ services:
     name: taiwan-stock-discord-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python discord_bot.py
+    startCommand: python 自選股/discord_bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false

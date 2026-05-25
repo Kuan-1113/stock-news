@@ -13,6 +13,7 @@ import requests
 import feedparser
 import pytz
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")

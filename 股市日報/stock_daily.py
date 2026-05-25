@@ -32,6 +32,7 @@ import anthropic
 import pytz
 import io
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -59,7 +60,9 @@ print(f"🕐 程式啟動時間（台北）：{datetime.datetime.now(TAIPEI_TZ).
 # 自選股：從 watchlist.txt 讀取
 # ─────────────────────────────────────────────────────────────
 
-def load_watchlist(path: str = "watchlist.txt") -> list:
+def load_watchlist(path: str = None) -> list:
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "自選股", "watchlist.txt")
     """
     從 watchlist.txt 讀取自選股清單。
     格式：每行「代碼 名稱」，# 開頭為註解，空行忽略。

@@ -48,7 +48,7 @@ jobs:
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
-          python -X utf8 podcast_tracker.py
+          python -X utf8 Podcast/podcast_tracker.py
 
       - name: 💾 更新狀態檔（podcast_state.json）
         run: |
