@@ -4,3 +4,5 @@ schedule
 anthropic
 pytz
 discord.py
+yfinance
+pandas

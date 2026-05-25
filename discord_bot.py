@@ -21,6 +21,8 @@ import anthropic
 import discord
 from discord import app_commands
 
+from technical_indicators import get_full_indicators, format_indicators_for_prompt, format_indicators_for_discord
+
 # ─────────────────────────────────────────────────────────────
 # 設定
 # ─────────────────────────────────────────────────────────────
@@ -108,38 +110,46 @@ def fetch_yahoo(symbol: str) -> dict:
         return None
 
 def fetch_stock_news_for_bot(symbol: str, name: str) -> str:
-    """抓取股票相關新聞"""
-    queries = []
-    if ".TW" in symbol:
-        queries = [
-            f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-            f"https://news.google.com/rss/search?q={requests.utils.quote(symbol)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-        ]
-    else:
-        queries = [
-            f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock')}&hl=en-US&gl=US&ceid=US:en",
-            f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' earnings')}&hl=en-US&gl=US&ceid=US:en",
-        ]
-
+    """多源抓取個股新聞（Google News + 鉅亨網 + Yahoo Finance）"""
     titles = []
-    for url in queries[:2]:
+    seen   = set()
+
+    def _add(url):
         try:
             feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-            for e in feed.entries[:4]:
-                if hasattr(e, "title") and e.title not in titles:
-                    titles.append(e.title)
-            time.sleep(0.3)
+            for e in feed.entries[:6]:
+                t = getattr(e, "title", "").strip()
+                key = re.sub(r"\s+", "", t.lower())[:25]
+                if t and key not in seen:
+                    seen.add(key)
+                    titles.append(t)
         except Exception:
             pass
 
-    return "\n".join(titles[:6]) if titles else "（暫無相關新聞）"
+    if ".TW" in symbol:
+        stock_no = symbol.upper().replace(".TW", "")
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+        time.sleep(0.2)
+        _add("https://news.cnyes.com/rss/cat/tw_stock_news")
+        time.sleep(0.2)
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(stock_no)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+    else:
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock earnings')}&hl=en-US&gl=US&ceid=US:en")
+        time.sleep(0.2)
+        _add(f"https://finance.yahoo.com/rss/headline?s={symbol}")
+        time.sleep(0.2)
+        _add(f"https://feeds.content.dowjones.io/public/rss/mw_topstories")
 
-def analyze_stock_for_bot(symbol: str, quote: dict, news_ctx: str) -> str:
+    return "\n".join(titles[:8]) if titles else "（暫無相關新聞）"
+
+def analyze_stock_for_bot(symbol: str, quote: dict, news_ctx: str, ind: dict = None) -> str:
     """Claude 分析股票（Bot 版本）"""
     closes = quote.get("closes", [])
     price_history = ""
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
+
+    indicators_text = format_indicators_for_prompt(ind) if ind else "（未取得技術指標）"
 
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析與預測。
 
@@ -148,24 +158,29 @@ def analyze_stock_for_bot(symbol: str, quote: dict, news_ctx: str) -> str:
 - 名稱：{quote.get('name', symbol)}
 - 最新價格：{quote['price_str']} {quote.get('currency', '')}
 - 漲跌：{quote['change_str']} ({quote['pct_str']})
-- 5日均線：{quote.get('ma5', 'N/A')}
-- 10日均線：{quote.get('ma10', 'N/A')}
-- 成交量：{quote.get('volume', 'N/A')}
 - {price_history}
 
-【近期相關新聞】
+【技術指標（實際計算值）】
+{indicators_text}
+
+【近期相關新聞（多方查證）】
 {news_ctx}
 
-請以繁體中文撰寫分析報告（控制在 800 字以內），格式如下：
+請以繁體中文撰寫分析報告（900 字以內），依據上方**實際技術指標數值**進行判斷：
 
-📊 **近期走勢**
-（2-3句說明目前價格位置與趨勢方向）
+📊 **近期走勢**（2-3句，說明目前價格與均線關係）
 
 🔍 **技術面分析**
-（均線多空排列、支撐壓力位、RSI/MACD 可能狀態）
+- 均線多空排列
+- MACD 動能（多空判斷）
+- RSI 位置
+- KDJ 訊號
+- 乖離率（偏離程度）
+- 成交量（量能配合度）
+- 融資券動向（若有）
+- 三大法人動向（若有）
 
-📰 **基本面亮點**
-（結合近期新聞，2-3個重點）
+📰 **基本面亮點**（結合近期新聞，2-3點）
 
 🎯 **短期預測（1-2週）**
 - 目標價區間：...
@@ -173,12 +188,12 @@ def analyze_stock_for_bot(symbol: str, quote: dict, news_ctx: str) -> str:
 
 💡 **操作建議**
 - 多方：...
-- 空方：...
+- 空方或觀望：...
 - 停損參考：...
 
 ⚠️ 本報告由 AI 生成，不構成投資建議，請自行判斷風險。"""
 
-    return claude_call(prompt, max_tokens=1200)
+    return claude_call(prompt, max_tokens=1400)
 
 # ─────────────────────────────────────────────────────────────
 # Discord Bot
@@ -220,9 +235,14 @@ async def query_stock(interaction: discord.Interaction, 代碼: str):
             None, fetch_stock_news_for_bot, symbol, quote.get("name", symbol)
         )
 
+        # 技術指標
+        ind = await asyncio.get_event_loop().run_in_executor(
+            None, get_full_indicators, symbol
+        )
+
         # Claude 分析
         analysis = await asyncio.get_event_loop().run_in_executor(
-            None, analyze_stock_for_bot, symbol, quote, news_ctx
+            None, analyze_stock_for_bot, symbol, quote, news_ctx, ind
         )
 
         # 組合訊息
@@ -233,8 +253,9 @@ async def query_stock(interaction: discord.Interaction, 代碼: str):
             f"{quote['change_str']} ({quote['pct_str']})\n"
             f"📅 查詢時間：{now_str}\n\n"
         )
+        indicators_block = format_indicators_for_discord(ind) + "\n\n---\n\n"
 
-        full_msg = header + analysis
+        full_msg = header + indicators_block + analysis
 
         # Discord 訊息上限 2000 字，分段發送
         if len(full_msg) <= 2000:
@@ -262,33 +283,107 @@ async def query_stock(interaction: discord.Interaction, 代碼: str):
         print(f"❌ /查股 錯誤：{e}")
         await interaction.followup.send(f"❌ 查詢時發生錯誤：{str(e)[:200]}")
 
-@tree.command(name="自選股", description="立即查看所有自選股的最新報價")
+def _load_watchlist() -> list:
+    """讀取 watchlist.txt"""
+    result = []
+    try:
+        with open("watchlist.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    result.append({"symbol": parts[0].upper(), "name": parts[1].strip()})
+                elif len(parts) == 1:
+                    result.append({"symbol": parts[0].upper(), "name": parts[0].upper()})
+    except FileNotFoundError:
+        result = [
+            {"symbol": "2330.TW", "name": "台積電"},
+            {"symbol": "2454.TW", "name": "聯發科"},
+            {"symbol": "NVDA",    "name": "輝達"},
+            {"symbol": "AAPL",    "name": "蘋果"},
+            {"symbol": "TSLA",    "name": "特斯拉"},
+            {"symbol": "^TWII",   "name": "加權指數"},
+        ]
+    return result
+
+
+def _fetch_quote_and_indicators(stock: dict) -> str:
+    """同步取得報價 + 指標，回傳 Discord 顯示字串"""
+    symbol = stock["symbol"]
+    name   = stock["name"]
+    q = fetch_yahoo(symbol)
+    if not q:
+        return f"⚪ **{name}（{symbol}）**：無法取得報價"
+
+    ind = get_full_indicators(symbol)
+    m   = ind.get("macd", {})
+    r   = ind.get("rsi",  {})
+    k   = ind.get("kdj",  {})
+    v   = ind.get("volume", {})
+
+    macd_tag = ""
+    if m.get("golden_cross"):
+        macd_tag = " 🔔MACD黃金叉"
+    elif m.get("dead_cross"):
+        macd_tag = " 💀MACD死亡叉"
+
+    rsi_val  = f"RSI `{r['rsi']}`" if r.get("rsi") else ""
+    kdj_sig  = f"KDJ `{k['signal']}`" if k.get("signal") and k.get("k") else ""
+    vol_tag  = v.get("vol_trend", "") if v.get("vol_ratio") else ""
+
+    tags = " | ".join(t for t in [rsi_val, kdj_sig, vol_tag, macd_tag.strip()] if t)
+
+    # 融資/三大法人摘要（台股）
+    extra = ""
+    inst = ind.get("institutional", {})
+    if inst.get("total_net"):
+        total = inst["total_net"].replace(",", "")
+        try:
+            icon = "🟢" if int(total) > 0 else "🔴"
+            extra = f"\n　　法人合計：{icon} `{inst['total_net']}`"
+        except Exception:
+            pass
+
+    return (
+        f"{q['emoji']} **{name}（{symbol}）**　"
+        f"💰 `{q['price_str']}` {q['change_str']} ({q['pct_str']}){macd_tag}\n"
+        f"　　{tags}{extra}"
+    )
+
+
+@tree.command(name="自選股", description="查看所有自選股的最新報價與技術指標摘要")
 async def watchlist_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    WATCHLIST = [
-        {"symbol": "2330.TW", "name": "台積電"},
-        {"symbol": "2454.TW", "name": "聯發科"},
-        {"symbol": "NVDA",    "name": "輝達"},
-        {"symbol": "AAPL",    "name": "蘋果"},
-        {"symbol": "TSLA",    "name": "特斯拉"},
-        {"symbol": "^TWII",   "name": "加權指數"},
-    ]
+    watchlist = _load_watchlist()
+    now_str   = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+
+    await interaction.followup.send(f"## 📊 自選股即時報價與指標 | {now_str}\n⏳ 正在抓取資料，共 {len(watchlist)} 檔...")
 
     lines = []
-    for stock in WATCHLIST:
-        q = await asyncio.get_event_loop().run_in_executor(None, fetch_yahoo, stock["symbol"])
-        if q:
-            lines.append(
-                f"{q['emoji']} **{stock['name']}（{stock['symbol']}）**：{q['price_str']} ({q['pct_str']})"
-            )
-        else:
-            lines.append(f"⚪ **{stock['name']}（{stock['symbol']}）**：無法取得")
-        await asyncio.sleep(0.3)
+    for stock in watchlist:
+        line = await asyncio.get_event_loop().run_in_executor(None, _fetch_quote_and_indicators, stock)
+        lines.append(line)
+        await asyncio.sleep(0.5)
 
-    now_str = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
-    msg = f"## 📊 自選股即時報價 | {now_str}\n\n" + "\n".join(lines)
-    await interaction.followup.send(msg)
+    msg = f"## 📊 自選股即時報價與指標 | {now_str}\n\n" + "\n\n".join(lines)
+
+    # 分段發送（超過 2000 字）
+    chunks, current = [], ""
+    for line in msg.split("\n"):
+        if len(current) + len(line) + 1 > 1900:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await interaction.followup.send(chunk)
+        await asyncio.sleep(0.3)
 
 # ─────────────────────────────────────────────────────────────
 # 入口

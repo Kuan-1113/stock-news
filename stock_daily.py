@@ -32,6 +32,8 @@ import anthropic
 import pytz
 import io
 
+from technical_indicators import get_full_indicators, format_indicators_for_prompt
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 warnings.filterwarnings("ignore")
@@ -413,16 +415,37 @@ def analyze_global_news(articles, session_info, market_data) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def fetch_stock_news(symbol: str, name: str) -> str:
+    """多源爬取個股新聞（Google News + 鉅亨網）"""
+    titles = []
+    seen   = set()
+
+    def _add(url):
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for e in feed.entries[:6]:
+                t = getattr(e, "title", "").strip()
+                key = re.sub(r"\s+", "", t.lower())[:25]
+                if t and key not in seen:
+                    seen.add(key)
+                    titles.append(t)
+        except Exception:
+            pass
+
     if ".TW" in symbol:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        stock_no = symbol.upper().replace(".TW", "")
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+        time.sleep(0.2)
+        _add(f"https://news.cnyes.com/rss/cat/tw_stock_news")   # 鉅亨 台股新聞
+        time.sleep(0.2)
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(stock_no)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
     else:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock')}&hl=en-US&gl=US&ceid=US:en"
-    try:
-        feed   = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-        titles = [e.title for e in feed.entries[:5] if hasattr(e, "title")]
-        return "\n".join(titles) if titles else ""
-    except Exception:
-        return ""
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock earnings')}&hl=en-US&gl=US&ceid=US:en")
+        time.sleep(0.2)
+        _add(f"https://finance.yahoo.com/rss/headline?s={symbol}")  # Yahoo Finance 個股新聞
+        time.sleep(0.2)
+        _add(f"https://feeds.content.dowjones.io/public/rss/mw_topstories")
+
+    return "\n".join(titles[:8]) if titles else "（暫無相關新聞）"
 
 def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "") -> str:
     closes = quote.get("closes", [])
@@ -431,34 +454,53 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
 
     stale_note = "⚠️ 注意：今日為週末，以下為上次交易日收盤數據。\n" if quote.get("stale") else ""
+
+    # 取得完整技術指標
+    print(f"    計算技術指標 {symbol}...")
+    ind = get_full_indicators(symbol)
+    indicators_text = format_indicators_for_prompt(ind)
+
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析。
 
-{stale_note}
-【股票資訊】
+{stale_note}【股票資訊】
 - 名稱：{name}（{symbol}）
 - 最新價格：{quote.get('price', 'N/A')} {quote.get('currency', '')}
 - 漲跌幅：{quote.get('pct', 'N/A')}（{quote.get('change', 'N/A')}）
-- 5日均線：{quote.get('ma5', 'N/A')}
-- 10日均線：{quote.get('ma10', 'N/A')}
-- 成交量：{quote.get('volume', 'N/A')}
 - {price_history}
 
-【近期相關新聞】
+【技術指標（實際計算值）】
+{indicators_text}
+
+【近期相關新聞（多方查證）】
 {news_ctx if news_ctx else '（暫無相關新聞）'}
 
-請以繁體中文撰寫分析報告（800 字以內）：
-📊 **近期走勢**（2-3句說明趨勢方向）
-🔍 **技術面分析**（均線多空、支撐壓力、RSI/MACD 可能狀態）
+請以繁體中文撰寫分析報告（900 字以內），依據上方**實際技術指標數值**進行判斷，不要憑空猜測：
+
+📊 **近期走勢**（2-3句，說明目前價格與均線關係）
+
+🔍 **技術面分析**
+- 均線多空排列與趨勢
+- MACD 動能（依據實際數值判斷多空）
+- RSI 位置與超買超賣
+- KDJ 訊號（是否出現交叉）
+- 乖離率（是否過度偏離）
+- 成交量狀況（量能配合度）
+- 融資券動向（若有台股資料）：融資增減意涵、融券回補壓力
+- 三大法人動向（若有台股資料）：外資/投信/自營商買賣超判讀
+
 📰 **基本面亮點**（結合近期新聞，2-3點）
+
 🎯 **短期預測（1-2週）**
 - 目標價區間：...
 - 可能走向：...
+
 💡 **操作建議**
-- 多方：...
-- 空方：...
+- 多方進場條件：...
+- 空方或觀望條件：...
 - 停損參考：...
-⚠️ 本報告由 AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1200)
+
+⚠️ 本報告由 AI 生成，僅供參考，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1400)
 
 def run_watchlist_report():
     """執行自選股日報（每日 22:00）"""

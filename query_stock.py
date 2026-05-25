@@ -13,6 +13,8 @@ import requests
 import feedparser
 import pytz
 
+from technical_indicators import get_full_indicators, format_indicators_for_prompt
+
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 DISCORD_WATCHLIST  = os.environ.get("DISCORD_WATCHLIST", "")
 SYMBOL             = os.environ.get("STOCK_SYMBOL", "2330.TW").strip().upper()
@@ -90,27 +92,49 @@ def fetch_yahoo(symbol: str) -> dict:
         print(f"Yahoo 錯誤：{e}")
         return None
 
-# ── 新聞 ─────────────────────────────────────────────────────
+# ── 新聞（多方查證：Google News + 鉅亨網 + Yahoo Finance）────
 
 def fetch_news(symbol: str, name: str) -> str:
+    titles = []
+    seen   = set()
+
+    def _add(url):
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for e in feed.entries[:6]:
+                t = getattr(e, "title", "").strip()
+                key = re.sub(r"\s+", "", t.lower())[:25]
+                if t and key not in seen:
+                    seen.add(key)
+                    titles.append(t)
+        except Exception:
+            pass
+
     if ".TW" in symbol:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+        stock_no = symbol.upper().replace(".TW", "")
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(name + ' 台股')}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
+        time.sleep(0.2)
+        _add("https://news.cnyes.com/rss/cat/tw_stock_news")
+        time.sleep(0.2)
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(stock_no)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
     else:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock')}&hl=en-US&gl=US&ceid=US:en"
-    try:
-        feed   = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-        titles = [e.title for e in feed.entries[:6] if hasattr(e, "title")]
-        return "\n".join(titles) if titles else "（暫無相關新聞）"
-    except Exception:
-        return "（暫無相關新聞）"
+        _add(f"https://news.google.com/rss/search?q={requests.utils.quote(symbol + ' stock earnings')}&hl=en-US&gl=US&ceid=US:en")
+        time.sleep(0.2)
+        _add(f"https://finance.yahoo.com/rss/headline?s={symbol}")
+        time.sleep(0.2)
+        _add("https://feeds.content.dowjones.io/public/rss/mw_topstories")
+
+    return "\n".join(titles[:8]) if titles else "（暫無相關新聞）"
 
 # ── 分析 ─────────────────────────────────────────────────────
 
-def analyze(symbol: str, name: str, quote: dict, news: str) -> str:
+def analyze(symbol: str, name: str, quote: dict, news: str, ind: dict = None) -> str:
     closes = quote.get("closes", [])
     price_history = ""
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
+
+    indicators_text = format_indicators_for_prompt(ind) if ind else "（未取得技術指標）"
 
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析。
 
@@ -118,19 +142,27 @@ def analyze(symbol: str, name: str, quote: dict, news: str) -> str:
 - 名稱：{name}（{symbol}）
 - 最新價格：{quote['price']} {quote.get('currency', '')}
 - 漲跌：{quote['change']} ({quote['pct']})
-- 5日均線：{quote['ma5']}
-- 10日均線：{quote['ma10']}
-- 成交量：{quote['volume']}
 - {price_history}
 
-【近期相關新聞】
+【技術指標（實際計算值）】
+{indicators_text}
+
+【近期相關新聞（多方查證）】
 {news}
 
-請以繁體中文撰寫分析報告（800字以內）：
+請以繁體中文撰寫分析報告（900字以內），依據上方**實際技術指標數值**進行判斷：
 
-📊 **近期走勢**（2-3句說明趨勢方向）
+📊 **近期走勢**（2-3句，說明目前價格與均線關係）
 
-🔍 **技術面分析**（均線多空、支撐壓力、RSI/MACD 可能狀態）
+🔍 **技術面分析**
+- 均線多空排列
+- MACD 動能（依實際數值判斷）
+- RSI 位置與超買超賣
+- KDJ 訊號
+- 乖離率（偏離程度）
+- 成交量（量能配合度）
+- 融資券動向（若有台股資料）
+- 三大法人動向（若有台股資料）
 
 📰 **基本面亮點**（結合近期新聞，2-3點）
 
@@ -139,12 +171,12 @@ def analyze(symbol: str, name: str, quote: dict, news: str) -> str:
 - 可能走向：...
 
 💡 **操作建議**
-- 多方：...
-- 空方：...
+- 多方進場條件：...
+- 空方或觀望條件：...
 - 停損參考：...
 
 ⚠️ 本報告由 AI 生成，不構成投資建議。"""
-    return claude_call(prompt)
+    return claude_call(prompt, max_tokens=1400)
 
 # ── Discord 傳送 ─────────────────────────────────────────────
 
@@ -187,13 +219,17 @@ def main():
     display_name = NAME or quote.get("name", SYMBOL)
     print(f"✅ 報價：{quote['price']} ({quote['pct']})")
 
-    # 抓新聞
+    # 抓新聞（多方查證）
     news = fetch_news(SYMBOL, display_name)
-    time.sleep(0.5)
+    time.sleep(0.3)
+
+    # 技術指標
+    print("📊 計算技術指標...")
+    ind = get_full_indicators(SYMBOL)
 
     # AI 分析
     print("🤖 Claude 分析中...")
-    analysis = analyze(SYMBOL, display_name, quote, news)
+    analysis = analyze(SYMBOL, display_name, quote, news, ind)
 
     # 組合訊息
     header = (
