@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: taiwan-stock-discord-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python discord_bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PYTHONUTF8
+        value: "1"
