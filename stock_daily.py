@@ -43,6 +43,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+JIN10_TOKEN       = os.environ.get("JIN10_TOKEN", "")
 
 DISCORD_TW       = os.environ.get("DISCORD_TW",       "https://discord.com/api/webhooks/1507952802662449152/8iumIv-Bs5PTRVlMpFXbE7wH_uzHJlLtmybTHaj1zUDxksQBZwRAOs7v69tvSOezmWnW")
 DISCORD_US       = os.environ.get("DISCORD_US",       "https://discord.com/api/webhooks/1508308789537800242/y6l377lQUOovmgh19He7wn5DlPN2_k19B2ksGVpmErCV46K-o7XSRnoXM97DDkpmglOP")
@@ -241,6 +242,190 @@ def fetch_crypto() -> dict:
 # RSS 新聞爬蟲
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# 金十數據（Jin10 MCP API）— 國際即時新聞 + 財經行事曆
+# ─────────────────────────────────────────────────────────────
+
+_jin10_session_id: str = ""
+
+def _jin10_post(payload: dict, session_id: str = "") -> dict:
+    headers = {"Content-Type": "application/json"}
+    if JIN10_TOKEN:
+        headers["Authorization"] = f"Bearer {JIN10_TOKEN}"
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    try:
+        r = requests.post("https://mcp.jin10.com/mcp", headers=headers,
+                          json=payload, timeout=20)
+        # 解析 SSE 格式（data: {...} 行）
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                try:
+                    obj = json.loads(line[5:].strip())
+                    if "result" in obj:
+                        return obj["result"]
+                except Exception:
+                    pass
+        # 嘗試直接 JSON
+        try:
+            return r.json().get("result", {})
+        except Exception:
+            return {}
+    except Exception as e:
+        print(f"金十 API 錯誤：{e}")
+        return {}
+
+def jin10_initialize() -> str:
+    global _jin10_session_id
+    if not JIN10_TOKEN:
+        return ""
+    result = _jin10_post({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "clientInfo": {"name": "stock-bot", "version": "1.0"},
+        }
+    })
+    # session id 通常在 response header，但這裡用 result 裡的值（若有）
+    _jin10_session_id = result.get("sessionId", "") or result.get("session_id", "")
+    return _jin10_session_id
+
+def jin10_call(tool: str, args: dict) -> list:
+    if not JIN10_TOKEN:
+        return []
+    result = _jin10_post({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": tool, "arguments": args}
+    }, session_id=_jin10_session_id)
+    # 嘗試取出 data 陣列
+    data = result.get("structuredContent", {}).get("data") \
+        or result.get("content", [{}])[0].get("data") \
+        or result.get("data") \
+        or []
+    return data if isinstance(data, list) else []
+
+def fetch_jin10_flash(session_info: dict) -> list:
+    """取得本時段的金十國際即時快訊（★★+ 以上）"""
+    if not JIN10_TOKEN:
+        return []
+    try:
+        items = jin10_call("list_flash", {"limit": 50})
+        if not items:
+            return []
+
+        now    = now_tw()
+        start_h = session_info["start_h"]
+        end_h   = session_info["end_h"]
+        if start_h < end_h:
+            start_dt = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
+            end_dt   = now.replace(hour=end_h,   minute=0, second=0, microsecond=0)
+        else:
+            yesterday = now - datetime.timedelta(days=1)
+            start_dt  = yesterday.replace(hour=start_h, minute=0, second=0, microsecond=0)
+            end_dt    = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+
+        result = []
+        for item in items:
+            star = int(item.get("star", item.get("important", 0)) or 0)
+            if star < 2:
+                continue
+            pub_raw = item.get("pub_time") or item.get("time") or ""
+            try:
+                pub_dt = datetime.datetime.fromisoformat(pub_raw.replace("Z", "+00:00")).astimezone(TW_TZ)
+            except Exception:
+                pub_dt = None
+            if pub_dt and not (start_dt <= pub_dt <= end_dt):
+                continue
+            title   = item.get("title") or item.get("content") or ""
+            content = item.get("content") or ""
+            if title:
+                result.append({
+                    "star":    star,
+                    "time":    pub_dt.strftime("%H:%M") if pub_dt else "",
+                    "title":   title[:120],
+                    "content": content[:200] if content != title else "",
+                })
+        return result[:12]
+    except Exception as e:
+        print(f"金十快訊錯誤：{e}")
+        return []
+
+def fetch_jin10_calendar() -> list:
+    """取得今日重要財經事件行事曆（★★★以上）"""
+    if not JIN10_TOKEN:
+        return []
+    try:
+        items = jin10_call("list_calendar", {"importance": 3})
+        result = []
+        for item in items:
+            event   = item.get("event") or item.get("title") or ""
+            country = item.get("country") or item.get("currency") or ""
+            time_s  = item.get("time") or item.get("pub_time") or ""
+            actual  = item.get("actual") or ""
+            forecast= item.get("consensus") or item.get("forecast") or ""
+            star    = int(item.get("star", 3) or 3)
+            if event and star >= 3:
+                result.append({
+                    "event":    event[:60],
+                    "country":  country,
+                    "time":     time_s,
+                    "actual":   actual,
+                    "forecast": forecast,
+                    "star":     star,
+                })
+        return result[:10]
+    except Exception as e:
+        print(f"金十行事曆錯誤：{e}")
+        return []
+
+def build_jin10_text(flash: list, calendar: list) -> str:
+    """格式化金十數據為 Claude prompt 文字"""
+    lines = []
+    if flash:
+        lines.append("【金十數據 即時快訊】")
+        for f in flash:
+            star_tag = "★" * f["star"]
+            time_tag = f"[{f['time']}] " if f["time"] else ""
+            lines.append(f"{star_tag} {time_tag}{f['title']}")
+            if f.get("content"):
+                lines.append(f"   └ {f['content']}")
+    if calendar:
+        lines.append("\n【今日重要財經事件】")
+        for c in calendar:
+            actual_tag   = f"公布={c['actual']}" if c["actual"] else ""
+            forecast_tag = f"預期={c['forecast']}" if c["forecast"] else ""
+            vals = " / ".join(t for t in [actual_tag, forecast_tag] if t)
+            lines.append(f"★★★ [{c['time']}] {c['country']} {c['event']}"
+                         + (f"　{vals}" if vals else ""))
+    return "\n".join(lines)
+
+def build_jin10_discord_block(flash: list, calendar: list) -> str:
+    """格式化金十數據為 Discord Embed 顯示文字"""
+    parts = []
+    if flash:
+        news_lines = []
+        for f in flash:
+            stars = "🌟" * min(f["star"], 3)
+            t     = f"[{f['time']}] " if f["time"] else ""
+            news_lines.append(f"{stars} {t}{f['title']}")
+        parts.append("**📡 金十數據 即時快訊**\n" + "\n".join(news_lines))
+    if calendar:
+        cal_lines = []
+        for c in calendar:
+            vals = " / ".join(v for v in [
+                (f"公布 `{c['actual']}`" if c["actual"] else ""),
+                (f"預期 `{c['forecast']}`" if c["forecast"] else ""),
+            ] if v)
+            cal_lines.append(f"⭐⭐⭐ `{c['time']}` **{c['country']}** {c['event']}"
+                              + (f" — {vals}" if vals else ""))
+        parts.append("**📅 今日重要財經事件**\n" + "\n".join(cal_lines))
+    return "\n\n".join(parts) if parts else ""
+
+import json as _json_module
+# 讓金十解析用 json
+json = _json_module
+
 RSS_FEEDS = {
     "tw": [
         "https://news.cnyes.com/rss/cat/tw_stock",
@@ -378,7 +563,7 @@ def analyze_us_news(articles, session_info, market_data) -> str:
 5. **操作建議**（2-3點，每點以 • 開頭）"""
     return claude_call(prompt, max_tokens=1800)
 
-def analyze_global_news(articles, session_info, market_data) -> str:
+def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
     vix   = market_data.get("vix",   {})
     gold  = market_data.get("gold",  {})
     oil   = market_data.get("oil",   {})
@@ -399,16 +584,18 @@ def analyze_global_news(articles, session_info, market_data) -> str:
 - BTC：{btc.get('emoji','') + ' ' + btc.get('price','N/A') + ' (' + btc.get('pct','N/A') + ')' if btc else 'N/A'}
 - ETH：{eth.get('emoji','') + ' ' + eth.get('price','N/A') + ' (' + eth.get('pct','N/A') + ')' if eth else 'N/A'}
 
-【本時段國際重大新聞】
+【本時段國際重大新聞（RSS）】
 {build_news_text(articles)}
 
-請以繁體中文撰寫國際財經分析日報：
+{jin10_text if jin10_text else ''}
+
+請以繁體中文撰寫國際財經分析日報（優先參考金十即時快訊，再結合 RSS 新聞）：
 1. **全球市場情緒**（2-3句）
 2. **重大地緣政治與總經事件**（表格：| 事件 | 影響資產 | 利多/利空 | 影響程度 |，至少 3-5 個）
 3. **大宗商品與加密貨幣**（表格：| 品項 | 價格 | 漲跌 | 關鍵驅動 |）
 4. **對台股/亞股的影響**（2-3點，每點以 • 開頭）
-5. **本週重要財經數據預告**（若有）"""
-    return claude_call(prompt, max_tokens=1800)
+5. **本週重要財經數據預告**（若有，結合行事曆資料）"""
+    return claude_call(prompt, max_tokens=2000)
 
 # ─────────────────────────────────────────────────────────────
 # 自選股分析（22:00 執行）
@@ -680,6 +867,20 @@ def run_report():
     global_news = fetch_all_news("global", session_info)
     print(f"  台股：{len(tw_news)} 篇 | 美股：{len(us_news)} 篇 | 國際：{len(global_news)} 篇")
 
+    # 3b. 金十數據（國際即時快訊 + 行事曆）
+    jin10_flash_items    = []
+    jin10_calendar_items = []
+    jin10_discord_block  = ""
+    if JIN10_TOKEN:
+        print("\n📡 抓取金十數據...")
+        jin10_initialize()
+        jin10_flash_items    = fetch_jin10_flash(session_info)
+        jin10_calendar_items = fetch_jin10_calendar()
+        print(f"  快訊：{len(jin10_flash_items)} 則 | 行事曆：{len(jin10_calendar_items)} 個")
+        jin10_discord_block = build_jin10_discord_block(jin10_flash_items, jin10_calendar_items)
+    else:
+        print("\n⚠️  未設定 JIN10_TOKEN，跳過金十數據")
+
     # 4. Claude 分析
     print("\n🤖 Claude AI 分析中...")
     print("  分析台股...")
@@ -689,7 +890,8 @@ def run_report():
     us_analysis     = analyze_us_news(us_news,     session_info, market_data)
     time.sleep(1)
     print("  分析國際...")
-    global_analysis = analyze_global_news(global_news, session_info, market_data)
+    jin10_prompt_text = build_jin10_text(jin10_flash_items, jin10_calendar_items)
+    global_analysis   = analyze_global_news(global_news, session_info, market_data, jin10_prompt_text)
 
     # 5. 組合資料
     weekend_banner = "（週末版）" if is_weekend() else ""
@@ -758,15 +960,18 @@ def run_report():
         f"{market_data['gold']['emoji']}  **黃金**：{market_data['gold']['price']} ({market_data['gold']['pct']})" + (" ⚠️未更新" if market_data['gold'].get('stale') else ""),
         f"{market_data['oil']['emoji']}   **原油(WTI)**：{market_data['oil']['price']} ({market_data['oil']['pct']})" + (" ⚠️未更新" if market_data['oil'].get('stale') else ""),
     ])
+    global_fields = [
+        {"name": "📉 總體指標", "value": truncate(global_market_text), "inline": True},
+        {"name": "🪙 加密貨幣", "value": truncate(crypto_text),        "inline": True},
+    ]
+    if jin10_discord_block:
+        global_fields.append({"name": "📡 金十數據即時快訊", "value": truncate(jin10_discord_block), "inline": False})
     send_embed(DISCORD_GLOBAL, {
         "title":       f"🌍 國際市場{session_info['label']} {weekend_banner}| {ts}",
         "description": f"**時段：** {session_info['period']}",
         "color":       0x9B59B6,
-        "fields": [
-            {"name": "📉 總體指標", "value": truncate(global_market_text), "inline": True},
-            {"name": "🪙 加密貨幣", "value": truncate(crypto_text),        "inline": True},
-        ],
-        "footer": {"text": f"資料來源：Yahoo Finance / CoinGecko{stale_footer}"},
+        "fields":      global_fields,
+        "footer":      {"text": f"資料來源：Yahoo Finance / CoinGecko / 金十數據{stale_footer}"},
     })
     time.sleep(1.2)
     send_discord_message(DISCORD_GLOBAL, f"## 🤖 Claude AI 國際分析 — {session_tag}\n\n" + global_analysis)
@@ -775,7 +980,7 @@ def run_report():
         "title":  f"📰 國際新聞連結 | {ts}",
         "color":  0x8E44AD,
         "fields": [{"name": "🔗 本時段重要新聞", "value": truncate(global_links), "inline": False}],
-        "footer": {"text": "資料來源：Reuters / BBC / Google News"},
+        "footer": {"text": "資料來源：Reuters / BBC / Google News / 金十數據"},
     })
 
     # 7. 自選股（只在 22:00 盤後執行）
