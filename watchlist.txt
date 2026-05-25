@@ -4,4 +4,3 @@ NVDA 輝達
 AAPL 蘋果
 TSLA 特斯拉
 ^TWII 加權指數
-^TWII 台指期
