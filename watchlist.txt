@@ -1,0 +1,7 @@
+2330.TW 台積電
+2454.TW 聯發科
+NVDA 輝達
+AAPL 蘋果
+TSLA 特斯拉
+^TWII 加權指數
+^TWII 台指期
