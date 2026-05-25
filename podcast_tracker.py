@@ -21,9 +21,9 @@ DISCORD_PODCAST   = os.environ.get("DISCORD_PODCAST",
 
 TW_TZ            = pytz.timezone("Asia/Taipei")
 STATE_FILE        = "podcast_state.json"
-MAX_NEW_PER_SHOW  = 2      # 每次最多處理幾集新集數
+MAX_NEW_PER_SHOW  = 1      # 每次只處理最新一集（避免一次處理太多）
 MAX_BACKLOG_DAYS  = 7      # 只處理最近 N 天內的集數（避免第一次跑時倒灌舊集）
-MAX_AUDIO_MB      = 300    # 音訊大小上限
+MAX_AUDIO_MB      = 80     # 音訊大小上限（約 50 分鐘 128kbps）
 
 SHOWS = [
     {
@@ -151,8 +151,8 @@ def transcribe(audio_path: str) -> str:
         from faster_whisper import WhisperModel
         print("  🎙️  載入 Whisper base 模型...")
         model = WhisperModel("base", device="cpu", compute_type="int8")
-        print("  🔄  轉錄中（約需 5-15 分鐘）...")
-        segments, _ = model.transcribe(audio_path, beam_size=3)
+        print("  🔄  轉錄中（約需 3-8 分鐘）...")
+        segments, _ = model.transcribe(audio_path, beam_size=1, vad_filter=True)
         text = " ".join(s.text.strip() for s in segments)
         print(f"  ✅ 轉錄完成（{len(text)} 字元）")
         return text
@@ -295,14 +295,26 @@ def process_episode(show_name: str, entry) -> bool:
 # 主程式
 # ─────────────────────────────────────────────────────────────
 
+def send_daily_summary(show_statuses: list):
+    """每次執行結束後，發送一則當日 Podcast 檢查摘要到 Discord"""
+    ts   = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [f"## 🎙️ Podcast 每日追蹤報告 | {ts}", ""]
+    for name, status in show_statuses:
+        lines.append(f"• **{name}**　{status}")
+    lines.append("")
+    lines.append("─" * 30)
+    send_discord("\n".join(lines))
+
+
 def main():
     print("=" * 60)
     print(f"🎙️  Podcast 追蹤器 — {datetime.datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')}")
     print("=" * 60)
 
-    state   = load_state()
-    cutoff  = datetime.datetime.now(TW_TZ) - datetime.timedelta(days=MAX_BACKLOG_DAYS)
-    any_new = False
+    state        = load_state()
+    cutoff       = datetime.datetime.now(TW_TZ) - datetime.timedelta(days=MAX_BACKLOG_DAYS)
+    any_new      = False
+    show_statuses = []   # [(name, status_str), ...]
 
     for show in SHOWS:
         name = show["name"]
@@ -313,6 +325,7 @@ def main():
         entries  = fetch_rss_episodes(rss)
         if not entries:
             print("  ⚠️  無法取得 RSS")
+            show_statuses.append((name, "⚠️ RSS 無法取得"))
             continue
 
         seen     = set(state.get(name, []))
@@ -327,21 +340,29 @@ def main():
 
         if not new_eps:
             latest_title = getattr(entries[0], "title", "?")[:40] if entries else "?"
+            latest_date  = parse_entry_date(entries[0]).strftime("%m/%d") if entries else ""
             print(f"  ✅ 無新集數（最新：{latest_title}）")
+            show_statuses.append((name, f"✅ 無新集數　最新：{latest_title}（{latest_date}）"))
             continue
 
         print(f"  🆕 {len(new_eps)} 集新集數")
 
         for entry in reversed(new_eps):  # 從舊到新發送
+            title = getattr(entry, "title", "Unknown")[:40]
             try:
                 process_episode(name, entry)
                 seen.add(get_episode_id(entry))
                 state[name] = list(seen)
                 save_state(state)
                 any_new = True
+                show_statuses.append((name, f"🆕 新集數已分析：{title}"))
                 time.sleep(2)
             except Exception as e:
                 print(f"  ❌ 處理失敗：{e}")
+                show_statuses.append((name, f"❌ 處理失敗：{str(e)[:60]}"))
+
+    # 每次執行都發送摘要（無論有無新集數）
+    send_daily_summary(show_statuses)
 
     print("\n" + "=" * 60)
     print(f"✅ 完成！{'已傳送 Discord 通知' if any_new else '無新集數'}")
