@@ -31,7 +31,7 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule anthropic pytz
+          pip install requests feedparser schedule anthropic pytz yfinance pandas pandas-ta
 
       - name: 🕐 確認目前台北時間
         run: |
