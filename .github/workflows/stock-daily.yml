@@ -15,6 +15,9 @@ jobs:
   run-report:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # 設定時區為台北，確保時間判斷正確
+    env:
+      TZ: Asia/Taipei
 
     steps:
       - name: 📥 Checkout 程式碼
@@ -28,11 +31,16 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule anthropic
+          pip install requests feedparser schedule anthropic pytz
+
+      - name: 🕐 確認目前台北時間
+        run: |
+          python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
 
       - name: 🚀 執行台股日報
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUTF8: "1"
+          TZ: Asia/Taipei
         run: |
           python -X utf8 stock_daily.py

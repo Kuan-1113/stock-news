@@ -26,6 +26,7 @@ import feedparser
 import requests
 import schedule
 import anthropic
+import pytz
 
 # 強制 stdout/stderr 使用 UTF-8（解決 Windows cp950 emoji 問題）
 import io
@@ -44,7 +45,12 @@ DISCORD_US     = "https://discord.com/api/webhooks/1507952945130635307/3Rd1BBhGE
 DISCORD_GLOBAL = "https://discord.com/api/webhooks/1507953174512668902/QsKOUt5afzwQYfbQQeGi8Tza2-gkLKUJaP-B03lWEyX9C5ops59NuGHLJCK7a8UC9N5-"
 DISCORD_WATCHLIST = "https://discord.com/api/webhooks/1508115009924894744/rlYl9lqindxWlauA4Ie4UJsWbneXM2nQZbuCa8_0XWKLvF3gpku5LONetISQ-MHzJhl1"
 
-TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
+# 使用 pytz 確保台北時間永遠正確，不受伺服器時區影響
+TAIPEI_TZ = pytz.timezone("Asia/Taipei")
+# 保留舊名稱相容性（TW_TZ 仍可使用）
+TW_TZ = TAIPEI_TZ
+
+print(f"🕐 程式啟動時間（台北）：{datetime.datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
 # 自選股清單
 WATCHLIST = [
@@ -92,9 +98,11 @@ def is_weekend() -> bool:
     return datetime.datetime.now(TW_TZ).weekday() >= 5  # 5=Saturday, 6=Sunday
 
 def now_tw() -> datetime.datetime:
-    return datetime.datetime.now(TW_TZ)
+    """取得目前台北時間（使用 pytz，確保不受伺服器時區影響）"""
+    return datetime.datetime.now(TAIPEI_TZ)
 
 def now_str() -> str:
+    """取得台北時間字串"""
     return now_tw().strftime("%Y-%m-%d %H:%M")
 
 # ─────────────────────────────────────────────────────────────
@@ -112,16 +120,31 @@ def get_claude_client():
 claude_client = get_claude_client()
 
 def claude_call(prompt: str, max_tokens: int = 1500) -> str:
-    """呼叫 Claude API"""
-    if not claude_client:
+    """呼叫 Claude API（使用 requests 直接呼叫，避免 httpx 連線問題）"""
+    if not ANTHROPIC_API_KEY:
         return "⚠️ 未設定 ANTHROPIC_API_KEY，AI 分析無法使用。"
     try:
-        message = claude_client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": "claude-opus-4-5",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=60,
         )
-        return message.content[0].text.strip()
+        if r.status_code == 200:
+            return r.json()["content"][0]["text"].strip()
+        else:
+            print(f"❌ Claude API 錯誤：HTTP {r.status_code} {r.text[:200]}")
+            return f"AI 分析暫時無法使用（HTTP {r.status_code}）"
     except Exception as e:
         print(f"❌ Claude 呼叫失敗：{e}")
         return f"AI 分析暫時無法使用（{str(e)[:100]}）"
