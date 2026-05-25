@@ -1,0 +1,37 @@
+name: 📈 查股
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: '股票代碼（台股：2330.TW，美股：NVDA，指數：^TWII）'
+        required: true
+        default: '2330.TW'
+      name:
+        description: '股票名稱（可選，例如：台積電）'
+        required: false
+        default: ''
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安裝套件
+        run: pip install requests feedparser anthropic pytz
+
+      - name: 📊 執行查股
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          STOCK_SYMBOL: ${{ github.event.inputs.symbol }}
+          STOCK_NAME: ${{ github.event.inputs.name }}
+          PYTHONUTF8: "1"
+        run: python -X utf8 query_stock.py
