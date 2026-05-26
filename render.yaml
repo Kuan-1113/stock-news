@@ -2,10 +2,12 @@ services:
   - type: worker
     name: taiwan-stock-discord-bot
     env: python
-    buildCommand: pip install discord.py requests
+    buildCommand: pip install discord.py requests feedparser anthropic pytz yfinance pandas
     startCommand: python 自選股/discord_bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: ANTHROPIC_API_KEY
         sync: false
       - key: GITHUB_PAT
         sync: false
