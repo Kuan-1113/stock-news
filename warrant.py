@@ -244,18 +244,32 @@ def _field(row: dict, *candidates) -> str:
 
 
 def _underlying_code(row: dict) -> str:
-    return _field(row,
+    # 實際欄位：'標的證券/指數'，值可能是 "2330" 或 "台積電" 或 "2330台積電"
+    raw = _field(row,
+        "標的證券/指數",
         "標的有價證券代號", "標的股票代號", "標的代號",
         "標的有価証券代號", "標的",
-        "標的證券代號", "標的股代號",
     )
+    if raw:
+        # 嘗試抽取純4位數股票代碼
+        m = re.search(r"\b(\d{4})\b", raw)
+        if m:
+            return m.group(1)
+        return raw
+    return ""
 
 
 def _underlying_name(row: dict) -> str:
-    return _field(row,
+    # 嘗試從 '標的證券/指數' 取中文名稱部分
+    raw = _field(row,
+        "標的證券/指數",
         "標的有價證券名稱", "標的股票名稱", "標的名稱",
-        "標的有価証券名稱", "標的證券名稱",
     )
+    if raw:
+        # 移除數字只留中文部分
+        name = re.sub(r"\d+", "", raw).strip()
+        return name if name else raw
+    return ""
 
 
 def _expiry(row: dict) -> str:
@@ -263,17 +277,22 @@ def _expiry(row: dict) -> str:
 
 
 def _strike(row: dict) -> str:
+    # 優先取最新履約價（已調整），fallback 原始
     return _field(row,
-        "原始履約價格（元）/履約指數",
-        "履約價格", "行使價格", "履約價", "執行價格",
-        "最新標的履約配發數量（每仟單位權證）",
+        "最新履約價格(元)/履約指數",
+        "原始履約價格(元)/履約指數",
+        "履約價格", "行使價格", "履約價",
     )
 
 
 def _ratio(row: dict) -> str:
+    # 實際欄位：最新標的的履約配發數量(每仟單位權證)（注意有兩個「的」）
     return _field(row,
+        "最新標的的履約配發數量(每仟單位權證)",
+        "最新標的履約配發數量(每仟單位權證)",
+        "最新標的的履約配發數量（每仟單位權證）",
         "最新標的履約配發數量（每仟單位權證）",
-        "行使比例", "換股比例", "權利比例", "行使率",
+        "行使比例", "換股比例",
     )
 
 
@@ -301,7 +320,7 @@ def _prev_close(row: dict) -> str:
 
 
 def _issued_units(row: dict) -> str:
-    return _field(row, "發行單位數量（仟單位）", "發行張數", "發行量")
+    return _field(row, "發行單位數量(仟單位)", "發行單位數量（仟單位）", "發行張數", "發行量")
 
 
 def _wtype(row: dict) -> str:
