@@ -7,33 +7,45 @@ warrant.py  —  台灣上市認購(售)權證查詢與分析
 
 import re
 import time
+import threading
 import datetime
 import requests
 
 TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/opendata"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ── 快取（每小時更新一次）────────────────────────────────────────
-_basic_cache: dict = {"data": None, "ts": 0}
-_daily_cache: dict = {"data": None, "ts": 0}
+# ── 快取（附 Lock 避免同時下載）──────────────────────────────────
+_basic_cache: dict   = {"data": None, "ts": 0}
+_daily_cache: dict   = {"data": None, "ts": 0}
+_basic_lock          = threading.Lock()
+_daily_lock          = threading.Lock()
+
 
 def _fetch_basic_all() -> list:
-    """下載並快取 t187ap37_L（全部權證基本資料，約 5-15 MB）"""
+    """下載並快取 t187ap37_L（全部權證基本資料）"""
     now = time.time()
     if _basic_cache["data"] is not None and (now - _basic_cache["ts"]) < 3600:
         return _basic_cache["data"]
-    try:
-        r = requests.get(
-            f"{TWSE_OPENAPI}/t187ap37_L",
-            headers=HEADERS, timeout=90,
-        )
-        if r.status_code == 200:
-            _basic_cache["data"] = r.json()
-            _basic_cache["ts"] = now
-            print(f"✅ 權證基本資料已載入 {len(_basic_cache['data'])} 筆", flush=True)
+    with _basic_lock:
+        # 再次確認（另一個 thread 可能已下載完）
+        if _basic_cache["data"] is not None and (time.time() - _basic_cache["ts"]) < 3600:
             return _basic_cache["data"]
-    except Exception as e:
-        print(f"⚠️  t187ap37_L 下載失敗：{e}", flush=True)
+        try:
+            r = requests.get(
+                f"{TWSE_OPENAPI}/t187ap37_L",
+                headers=HEADERS, timeout=120,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                _basic_cache["data"] = data
+                _basic_cache["ts"]   = time.time()
+                # 第一次載入時印出欄位名稱（用於除錯）
+                if data:
+                    print(f"✅ 權證基本資料已載入 {len(data)} 筆", flush=True)
+                    print(f"🔍 欄位：{list(data[0].keys())[:15]}", flush=True)
+                return _basic_cache["data"]
+        except Exception as e:
+            print(f"⚠️  t187ap37_L 下載失敗：{e}", flush=True)
     return _basic_cache["data"] or []
 
 
@@ -42,30 +54,67 @@ def _fetch_daily() -> list:
     now = time.time()
     if _daily_cache["data"] is not None and (now - _daily_cache["ts"]) < 1800:
         return _daily_cache["data"]
-    try:
-        r = requests.get(
-            f"{TWSE_OPENAPI}/t187ap42_L",
-            headers=HEADERS, timeout=30,
-        )
-        if r.status_code == 200:
-            _daily_cache["data"] = r.json()
-            _daily_cache["ts"] = now
+    with _daily_lock:
+        if _daily_cache["data"] is not None and (time.time() - _daily_cache["ts"]) < 1800:
             return _daily_cache["data"]
-    except Exception as e:
-        print(f"⚠️  t187ap42_L 下載失敗：{e}", flush=True)
+        try:
+            r = requests.get(
+                f"{TWSE_OPENAPI}/t187ap42_L",
+                headers=HEADERS, timeout=30,
+            )
+            if r.status_code == 200:
+                _daily_cache["data"] = r.json()
+                _daily_cache["ts"]   = time.time()
+                return _daily_cache["data"]
+        except Exception as e:
+            print(f"⚠️  t187ap42_L 下載失敗：{e}", flush=True)
     return _daily_cache["data"] or []
 
 
-# ── 股票代號查詢 ──────────────────────────────────────────────
+def prewarm_cache():
+    """Bot 啟動時在背景預先下載，確保第一個使用者不需等待"""
+    def _task():
+        print("🔄 預熱權證快取中…", flush=True)
+        _fetch_basic_all()
+        _fetch_daily()
+        print("✅ 權證快取預熱完成", flush=True)
+    threading.Thread(target=_task, daemon=True).start()
+
+
+# ── 股票代號 / 中文名稱查詢 ───────────────────────────────────────
+
+def _get_tw_name(code: str) -> str:
+    """從 mis.twse.com.tw 取得台股中文名稱"""
+    try:
+        r = requests.get(
+            f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+            f"?ex_ch=tw_{code}.tw&json=1&delay=0",
+            headers=HEADERS, timeout=6,
+        )
+        if r.status_code == 200:
+            msgs = r.json().get("msgArray", [])
+            if msgs:
+                name = msgs[0].get("n", "").strip()
+                if name:
+                    return name
+    except Exception:
+        pass
+    return ""
+
 
 def lookup_stock(query: str) -> tuple[str, str]:
     """
     輸入代號(2330)或中文名(台積電) → (code, zh_name)
-    優先用 Yahoo Finance 搜尋
+    優先用 TWSE MIS 取中文名；fallback Yahoo Finance
     """
     q = query.strip()
-    # 純數字 4 碼 → 直接查 Yahoo 取中文名
-    if re.match(r"^\d{4}$", q):
+
+    # 純數字 4-6 碼 → 嘗試取中文名
+    if re.match(r"^\d{4,6}$", q):
+        name = _get_tw_name(q)
+        if name:
+            return q, name
+        # fallback Yahoo Finance
         try:
             r = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{q}.TW?interval=1d&range=1d",
@@ -73,16 +122,16 @@ def lookup_stock(query: str) -> tuple[str, str]:
             )
             if r.status_code == 200:
                 meta = r.json()["chart"]["result"][0]["meta"]
-                name = meta.get("shortName", q)
-                return q, name
+                return q, meta.get("shortName", q)
         except Exception:
             pass
         return q, q
 
-    # 中文名 → 用 Yahoo Finance 搜尋
+    # 中文/英文名 → Yahoo Finance 搜尋
     try:
         r = requests.get(
-            f"https://query1.finance.yahoo.com/v1/finance/search?q={requests.utils.quote(q)}&newsCount=0&quotesCount=5&region=TW&lang=zh-TW",
+            f"https://query1.finance.yahoo.com/v1/finance/search"
+            f"?q={requests.utils.quote(q)}&newsCount=0&quotesCount=5&region=TW&lang=zh-TW",
             headers=HEADERS, timeout=8,
         )
         if r.status_code == 200:
@@ -90,25 +139,26 @@ def lookup_stock(query: str) -> tuple[str, str]:
                 sym = item.get("symbol", "")
                 if re.match(r"^\d{4}\.TW$", sym):
                     code = sym.replace(".TW", "")
-                    name = item.get("longname") or item.get("shortname", code)
-                    return code, name
+                    # 用 TWSE MIS 取中文名
+                    zh = _get_tw_name(code)
+                    if not zh:
+                        zh = item.get("longname") or item.get("shortname", code)
+                    return code, zh
     except Exception:
         pass
 
-    # 找不到 → 原樣返回
     return q, q
 
 
 # ── 日期處理 ──────────────────────────────────────────────────
 
 def _parse_date(s: str) -> datetime.date | None:
-    """支援 1150815 (民國) 或 20250815 (西元) 兩種格式"""
     s = str(s).strip().replace("/", "").replace("-", "")
     try:
-        if len(s) == 7:          # 民國年 yyyMMdd → 加 1911
+        if len(s) == 7:          # 民國年 yyyMMdd
             y = int(s[:3]) + 1911
             m, d = int(s[3:5]), int(s[5:7])
-        elif len(s) == 8:        # 西元 yyyyMMdd
+        elif len(s) == 8:        # 西元年 yyyyMMdd
             y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
         else:
             return None
@@ -124,37 +174,40 @@ def _days_to_expiry(expiry_str: str) -> int:
     return max(0, (d - datetime.date.today()).days)
 
 
-# ── 欄位自動偵測 ───────────────────────────────────────────────
+# ── 欄位自動偵測（相容不同欄位名稱版本）────────────────────────
 
 def _field(row: dict, *candidates) -> str:
     for k in candidates:
-        if k in row:
+        if k in row and str(row[k]).strip():
             return str(row[k]).strip()
     return ""
 
 
 def _underlying_code(row: dict) -> str:
-    return _field(row, "標的有價證券代號", "標的股票代號", "標的代號", "標的")
+    return _field(row,
+        "標的有價證券代號", "標的股票代號", "標的代號",
+        "標的有価証券代號", "標的",
+    )
 
 
 def _expiry(row: dict) -> str:
-    return _field(row, "到期日期", "到期日", "下市日期", "最後交易日")
+    return _field(row, "到期日期", "到期日", "下市日期", "最後交易日", "期限")
 
 
 def _strike(row: dict) -> str:
-    return _field(row, "履約價格", "行使價格", "履約價")
+    return _field(row, "履約價格", "行使價格", "履約價", "執行價格")
 
 
 def _ratio(row: dict) -> str:
-    return _field(row, "行使比例", "換股比例", "權利比例")
+    return _field(row, "行使比例", "換股比例", "權利比例", "行使率")
 
 
 def _delta(row: dict) -> str:
-    return _field(row, "Delta", "delta", "DELTA", "δ")
+    return _field(row, "Delta", "delta", "DELTA")
 
 
 def _iv(row: dict) -> str:
-    return _field(row, "隱含波動率", "IV", "隱波率")
+    return _field(row, "隱含波動率", "IV", "隱波率", "波動率")
 
 
 def _premium(row: dict) -> str:
@@ -162,110 +215,80 @@ def _premium(row: dict) -> str:
 
 
 def _leverage(row: dict) -> str:
-    return _field(row, "實際槓桿倍數", "實際槓桿", "有效槓桿", "槓桿比例")
+    return _field(row, "實際槓桿倍數", "實際槓桿", "有效槓桿", "槓桿比例", "槓桿倍數")
 
 
 def _prev_close(row: dict) -> str:
-    return _field(row, "前一日收盤價", "昨收", "昨收盤", "收盤價")
+    return _field(row, "前一日收盤價", "昨收", "昨收盤", "收盤價", "前收")
 
 
 def _wtype(row: dict) -> str:
-    """認購 or 認售"""
-    t = _field(row, "行使類型", "認購認售", "類型", "Type")
+    t = _field(row, "行使類型", "認購認售", "類型", "Type", "權證類型")
     if not t:
         name = row.get("權證名稱", "")
-        if "購" in name:
-            return "認購"
-        if "售" in name:
-            return "認售"
-    return t or "未知"
+        return "認購" if "購" in name else ("認售" if "售" in name else "未知")
+    return t
 
 
-# ── 評分函數 ──────────────────────────────────────────────────
+# ── 評分 ──────────────────────────────────────────────────────
 
 def _score(row: dict, vol_map: dict) -> float:
-    """
-    綜合評分（越高越好）：
-    - 剩餘天數 30-120 天最佳
-    - 成交張數（流動性）
-    - 溢價率低
-    - Delta 適中（0.3~0.6 最佳）
-    - 實際槓桿 5~15 倍最佳
-    """
     score = 0.0
-    code = row.get("權證代號", "")
+    code  = row.get("權證代號", "")
 
     # 剩餘天數
-    exp = _expiry(row)
+    exp  = _expiry(row)
     days = _days_to_expiry(exp) if exp else 0
     if days <= 0:
         return -999.0
-    if 30 <= days <= 120:
-        score += 30.0
-    elif days > 120:
-        score += 20.0
-    elif 15 <= days < 30:
-        score += 10.0
+    if   30 <= days <= 120: score += 30.0
+    elif days > 120:        score += 20.0
+    elif 15 <= days < 30:   score += 10.0
 
     # 成交張數（流動性）
     vol = int(vol_map.get(code, {}).get("成交張數", 0) or 0)
-    if vol > 1_000_000:
-        score += 30.0
-    elif vol > 500_000:
-        score += 20.0
-    elif vol > 100_000:
-        score += 10.0
-    elif vol > 0:
-        score += 2.0
+    if   vol > 1_000_000: score += 30.0
+    elif vol > 500_000:   score += 20.0
+    elif vol > 100_000:   score += 10.0
+    elif vol > 0:         score +=  2.0
 
-    # 溢價率（越低越好）
-    prem_s = _premium(row)
+    # 溢價率（低為佳）
     try:
-        prem = float(prem_s.replace("%", ""))
-        if prem < 3:
-            score += 20.0
-        elif prem < 6:
-            score += 12.0
-        elif prem < 10:
-            score += 5.0
-        elif prem >= 15:
-            score -= 5.0
+        prem = float(_premium(row).replace("%", ""))
+        if   prem < 3:   score += 20.0
+        elif prem < 6:   score += 12.0
+        elif prem < 10:  score +=  5.0
+        elif prem >= 15: score -=  5.0
     except Exception:
         pass
 
-    # Delta（認購 0.3-0.6 最佳）
-    delta_s = _delta(row)
+    # Delta（認購 0.3~0.6 最佳）
     try:
-        delta = abs(float(delta_s))
-        if 0.3 <= delta <= 0.6:
-            score += 15.0
-        elif 0.2 <= delta < 0.3 or 0.6 < delta <= 0.75:
-            score += 8.0
+        delta = abs(float(_delta(row)))
+        if   0.3 <= delta <= 0.6:          score += 15.0
+        elif 0.2 <= delta < 0.3 or 0.6 < delta <= 0.75: score += 8.0
     except Exception:
         pass
 
-    # 實際槓桿 5~15 倍最佳
-    lev_s = _leverage(row)
+    # 實際槓桿（5~15 倍最佳）
     try:
-        lev = float(lev_s)
-        if 5 <= lev <= 15:
-            score += 15.0
-        elif 3 <= lev < 5 or 15 < lev <= 25:
-            score += 7.0
+        lev = float(_leverage(row))
+        if   5 <= lev <= 15:             score += 15.0
+        elif 3 <= lev < 5 or 15 < lev <= 25: score +=  7.0
     except Exception:
         pass
 
     return score
 
 
-# ── 格式化單一權證摘要（給 Claude 用）──────────────────────────
+# ── 格式化單筆 ────────────────────────────────────────────────
 
 def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None) -> str:
-    code = row.get("權證代號", "?")
-    name = row.get("權證名稱", "?")
-    wt   = _wtype(row)
-    exp  = _expiry(row)
-    days = _days_to_expiry(exp) if exp else "?"
+    code   = row.get("權證代號", "?")
+    name   = row.get("權證名稱", "?")
+    wt     = _wtype(row)
+    exp    = _expiry(row)
+    days   = _days_to_expiry(exp) if exp else "?"
     strike = _strike(row)
     ratio  = _ratio(row)
     delta  = _delta(row)
@@ -283,99 +306,95 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None) -> str:
     )
 
 
-# ── 主功能：搜尋特定股票的好權證 ────────────────────────────────
+# ── 搜尋特定股票的好權證 ─────────────────────────────────────
 
 def search_warrants(stock_input: str, top_n: int = 5) -> str:
-    """
-    輸入股票代號或名稱，回傳 top_n 優質認購權證摘要（給 Claude 分析用）
-    """
     code, zh_name = lookup_stock(stock_input)
 
     basic_all = _fetch_basic_all()
     if not basic_all:
-        return f"❌ 無法取得權證基本資料"
+        return "❌ 無法取得權證基本資料，請稍後再試"
 
-    # 過濾出此標的的認購權證（未到期）
     today = datetime.date.today()
-    matched = []
-    for row in basic_all:
-        uc = _underlying_code(row)
-        exp_str = _expiry(row)
-        exp_date = _parse_date(exp_str) if exp_str else None
-        if uc == code and exp_date and exp_date > today:
-            matched.append(row)
 
-    # 如果靠代碼沒找到，試試用名稱中有股票名稱
-    if not matched and len(zh_name) >= 2:
-        short_name = zh_name[:4]  # 取前4字避免太長
-        for row in basic_all:
-            name = row.get("權證名稱", "")
-            exp_str = _expiry(row)
-            exp_date = _parse_date(exp_str) if exp_str else None
-            if short_name in name and exp_date and exp_date > today:
-                matched.append(row)
+    # 方式1：用標的代號過濾
+    matched = [
+        r for r in basic_all
+        if _underlying_code(r) == code
+        and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
+    ]
+
+    # 方式2：用中文名稱過濾（前3字）
+    if not matched and re.search(r"[一-鿿]", zh_name):
+        short = zh_name[:3]
+        matched = [
+            r for r in basic_all
+            if short in r.get("權證名稱", "")
+            and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
+        ]
+
+    # 方式3：從 t187ap42_L 裡用名稱找代號，再查 t187ap37_L
+    if not matched and re.search(r"[一-鿿]", zh_name):
+        short = zh_name[:3]
+        daily = _fetch_daily()
+        daily_codes = {
+            r["權證代號"] for r in daily if short in r.get("權證名稱", "")
+        }
+        matched = [
+            r for r in basic_all
+            if r.get("權證代號", "") in daily_codes
+            and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
+        ]
 
     if not matched:
-        return f"❌ 找不到 {zh_name}（{code}）的有效認購權證"
+        return f"❌ 找不到 {zh_name}（{code}）的有效認購權證（共查 {len(basic_all)} 筆）"
 
-    # 建立成交張數對照表
-    daily = _fetch_daily()
-    vol_map: dict = {}
-    for row in daily:
-        wc = row.get("權證代號", "")
-        if wc:
-            vol_map[wc] = row
+    # 只取認購
+    calls = [r for r in matched if "購" in _wtype(r) or "購" in r.get("權證名稱", "")]
+    if not calls:
+        calls = matched  # 若全部都是認售，就全取
 
-    # 評分排序，只取認購
-    call_warrants = [r for r in matched if "購" in _wtype(r) or "購" in r.get("權證名稱", "")]
-    ranked = sorted(call_warrants, key=lambda r: _score(r, vol_map), reverse=True)[:top_n]
-
-    if not ranked:
-        return f"❌ 找不到 {zh_name}（{code}）的合適認購權證"
+    daily     = _fetch_daily()
+    vol_map   = {r.get("權證代號", ""): r for r in daily}
+    ranked    = sorted(calls, key=lambda r: _score(r, vol_map), reverse=True)[:top_n]
 
     lines = [f"**{zh_name}（{code}）認購權證前{len(ranked)}名**\n"]
     for i, row in enumerate(ranked, 1):
         lines.append(_fmt_warrant(row, vol_map, rank=i))
         lines.append("")
-
     return "\n".join(lines)
 
 
-# ── 主功能：分析指定權證 ─────────────────────────────────────
+# ── 分析指定權證 ─────────────────────────────────────────────
 
 def analyze_warrant(warrant_code: str) -> tuple[str, str]:
-    """
-    輸入權證代號，回傳 (warrant_summary, similar_warrants_summary)
-    兩者都是要給 Claude 分析的文字
-    """
-    wc = warrant_code.strip().upper()
-
+    wc        = warrant_code.strip().upper()
     basic_all = _fetch_basic_all()
-    daily = _fetch_daily()
+    daily     = _fetch_daily()
 
-    # 找此權證
-    target = next((r for r in basic_all if r.get("權證代號", "").upper() == wc), None)
+    target = next(
+        (r for r in basic_all if r.get("權證代號", "").upper() == wc), None
+    )
     if not target:
-        return f"❌ 找不到權證代號 `{wc}`", ""
+        return f"❌ 找不到權證代號 `{wc}`（已查詢 {len(basic_all)} 筆）", ""
 
-    # 當日成交
-    vol_map = {r.get("權證代號", ""): r for r in daily}
-
+    vol_map        = {r.get("權證代號", ""): r for r in daily}
     target_summary = _fmt_warrant(target, vol_map)
 
-    # 找同標的其他認購權證
     und_code = _underlying_code(target)
-    today = datetime.date.today()
-    similar = []
-    for row in basic_all:
-        if (row.get("權證代號", "").upper() == wc):
-            continue  # 排除自己
-        rc = _underlying_code(row)
-        exp_str = _expiry(row)
-        exp_date = _parse_date(exp_str) if exp_str else None
-        is_call = "購" in _wtype(row) or "購" in row.get("權證名稱", "")
-        if rc == und_code and exp_date and exp_date > today and is_call:
-            similar.append(row)
+    und_name = target.get("權證名稱", "")[:3]  # 從名稱推斷標的
+    today    = datetime.date.today()
+
+    similar = [
+        r for r in basic_all
+        if r.get("權證代號", "").upper() != wc
+        and (
+            (_underlying_code(r) == und_code and und_code)
+            or (und_name and und_name in r.get("權證名稱", ""))
+        )
+        and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
+        and ("購" in _wtype(r) or "購" in r.get("權證名稱", ""))
+    ]
 
     ranked_sim = sorted(similar, key=lambda r: _score(r, vol_map), reverse=True)[:3]
 

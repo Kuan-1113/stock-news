@@ -30,7 +30,7 @@ print("=== Discord Bot starting ===", flush=True)
 # ── local imports ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
-from warrant import search_warrants, analyze_warrant, lookup_stock
+from warrant import search_warrants, analyze_warrant, lookup_stock, prewarm_cache
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -373,6 +373,13 @@ async def cmd_查權證(interaction: discord.Interaction, stock: str):
     print(f"⚡ /查權證 收到：{stock}", flush=True)
     try:
         await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /查權證 互動已過期（10062），忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /查權證 defer 失敗：{e}", flush=True)
+        return
+    try:
         loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _do_warrant_search, stock.strip())
         for i, chunk in enumerate(_split_messages(result)):
@@ -381,7 +388,7 @@ async def cmd_查權證(interaction: discord.Interaction, stock: str):
             else:
                 await interaction.channel.send(chunk)
     except Exception as e:
-        print(f"❌ /查權證 例外：{e}", flush=True)
+        print(f"❌ /查權證 執行失敗：{e}", flush=True)
         try:
             await interaction.followup.send(f"❌ 查詢失敗：{str(e)[:150]}")
         except Exception:
@@ -394,6 +401,13 @@ async def cmd_分析權證(interaction: discord.Interaction, code: str):
     print(f"⚡ /分析權證 收到：{code}", flush=True)
     try:
         await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /分析權證 互動已過期（10062），忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /分析權證 defer 失敗：{e}", flush=True)
+        return
+    try:
         loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _do_warrant_analyze, code.strip())
         for i, chunk in enumerate(_split_messages(result)):
@@ -402,7 +416,7 @@ async def cmd_分析權證(interaction: discord.Interaction, code: str):
             else:
                 await interaction.channel.send(chunk)
     except Exception as e:
-        print(f"❌ /分析權證 例外：{e}", flush=True)
+        print(f"❌ /分析權證 執行失敗：{e}", flush=True)
         try:
             await interaction.followup.send(f"❌ 分析失敗：{str(e)[:150]}")
         except Exception:
@@ -417,6 +431,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
+    prewarm_cache()  # 背景預熱權證快取，避免第一次使用者等太久
 
 if not DISCORD_BOT_TOKEN:
     print("❌ 未設定 DISCORD_BOT_TOKEN，Bot 無法啟動", flush=True)
