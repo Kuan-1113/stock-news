@@ -81,6 +81,66 @@ def prewarm_cache():
     threading.Thread(target=_task, daemon=True).start()
 
 
+# ── mis.twse.com.tw 即時補充資料 ─────────────────────────────────
+
+def _fetch_mis(code: str) -> dict:
+    """
+    從 mis.twse.com.tw 取得即時行情（權證或股票均適用）
+    回傳欄位：price, prev_close, open, high, low, volume, bid, ask, name
+    """
+    try:
+        r = requests.get(
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+            f"?ex_ch=tw_{code}.tw&json=1&delay=0",
+            headers=HEADERS, timeout=8,
+        )
+        if r.status_code == 200:
+            msgs = r.json().get("msgArray", [])
+            if msgs:
+                m = msgs[0]
+                return {
+                    "price":      m.get("z", ""),   # 最新成交
+                    "prev_close": m.get("y", ""),   # 昨收
+                    "open":       m.get("o", ""),   # 開盤
+                    "high":       m.get("h", ""),   # 最高
+                    "low":        m.get("l", ""),   # 最低
+                    "volume":     m.get("v", ""),   # 成交量（張）
+                    "bid":        m.get("b", ""),   # 最佳買進
+                    "ask":        m.get("a", ""),   # 最佳賣出
+                    "name":       m.get("n", ""),   # 名稱
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def _calc_premium(warrant_price: float, stock_price: float,
+                  strike: float, ratio: float) -> str:
+    """
+    計算溢價率（認購）：
+    溢價率 = (權證價/行使比例 + 履約價 - 股價) / 股價 × 100
+    """
+    try:
+        if ratio <= 0 or stock_price <= 0:
+            return ""
+        prem = (warrant_price / ratio + strike - stock_price) / stock_price * 100
+        return f"{prem:.2f}"
+    except Exception:
+        return ""
+
+
+def _calc_leverage(warrant_price: float, stock_price: float,
+                   delta: float, ratio: float) -> str:
+    """實際槓桿 = Delta × 股價 / (權證價 × 行使比例 × 1000 / 1000)"""
+    try:
+        if warrant_price <= 0 or ratio <= 0:
+            return ""
+        lev = delta * stock_price / (warrant_price / ratio)
+        return f"{lev:.2f}"
+    except Exception:
+        return ""
+
+
 # ── 股票代號 / 中文名稱查詢 ───────────────────────────────────────
 
 def _get_tw_name(code: str) -> str:
@@ -313,32 +373,86 @@ def _na(v: str) -> str:
     return v if v else "—"
 
 
-def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None) -> str:
+def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
+                 mis_data: dict | None = None,
+                 stock_price: float = 0.0) -> str:
+    """
+    格式化單筆權證。
+    mis_data  — _fetch_mis() 的結果（補充即時價格）
+    stock_price — 標的股票現價（用於計算溢價率/槓桿）
+    """
     code   = row.get("權證代號", "?")
     name   = row.get("權證簡稱", row.get("權證名稱", "?"))
     wt     = _wtype(row)
     exp    = _expiry(row)
     days   = _days_to_expiry(exp) if exp else "?"
-    strike = _na(_strike(row))
-    ratio  = _na(_ratio(row))
-    delta  = _na(_delta(row))
-    iv     = _na(_iv(row))
-    prem   = _na(_premium(row))
-    lev    = _na(_leverage(row))
-    close  = _na(_prev_close(row))
-    issued = _na(_issued_units(row))
     und_c  = _na(_underlying_code(row))
     und_n  = _na(_underlying_name(row))
-    vol    = vol_map.get(code, {}).get("成交張數", "N/A")
+    issued = _na(_issued_units(row))
+
+    # 履約價 & 行使比例（靜態資料）
+    strike_s = _strike(row)
+    ratio_s  = _ratio(row)          # 每千單位可換幾股（原始欄位值）
+    try:
+        ratio_f = float(ratio_s) / 1000.0   # 每1單位權證換股數
+    except Exception:
+        ratio_f = 0.0
+
+    # 昨收：優先用 MIS 即時資料，fallback API
+    mis      = mis_data or {}
+    close    = mis.get("prev_close") or _prev_close(row) or "—"
+    curr_p   = mis.get("price") or close   # 盤中最新價
+    bid      = mis.get("bid", "")
+    ask      = mis.get("ask", "")
+    mis_vol  = mis.get("volume", "")
+
+    # Delta / IV — API 欄位（若有）
+    delta_s = _delta(row)
+    iv_s    = _iv(row)
+
+    # 溢價率：優先 API，其次自算
+    prem_s = _premium(row)
+    if not prem_s:
+        try:
+            w  = float(curr_p)
+            k  = float(strike_s)
+            s  = stock_price
+            r  = ratio_f
+            if w > 0 and k > 0 and s > 0 and r > 0:
+                prem_s = _calc_premium(w, s, k, r)
+        except Exception:
+            pass
+
+    # 實際槓桿：優先 API，其次自算（需 Delta）
+    lev_s = _leverage(row)
+    if not lev_s and delta_s:
+        try:
+            w = float(curr_p)
+            s = stock_price
+            d = abs(float(delta_s))
+            r = ratio_f
+            if w > 0 and r > 0:
+                lev_s = _calc_leverage(w, s, d, r)
+        except Exception:
+            pass
+
+    vol    = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
     prefix = f"#{rank} " if rank else ""
-    return (
-        f"{prefix}**{name}**（{code}） — {wt}\n"
-        f"  標的：{und_n}（{und_c}）\n"
-        f"  昨收：{close} 元 | 到期日：{exp}（剩 {days} 天）\n"
-        f"  履約價：{strike} | 行使比例：{ratio}\n"
-        f"  Delta：{delta} | IV：{iv}% | 溢價率：{prem}% | 實際槓桿：{lev}x\n"
-        f"  發行量：{issued} 仟單位 | 今日成交張數：{vol}"
-    )
+
+    lines = [
+        f"{prefix}**{name}**（{code}） — {wt}",
+        f"  標的：{und_n}（{und_c}）",
+        f"  昨收：{close} 元",
+    ]
+    if curr_p and curr_p != close:
+        lines.append(f"  現價：{curr_p} 元  買：{bid}  賣：{ask}")
+    lines += [
+        f"  到期日：{exp}（剩 {days} 天）",
+        f"  履約價：{_na(strike_s)} 元 | 行使比例：{_na(ratio_s)} 股/千單位",
+        f"  Delta：{_na(delta_s)} | IV：{_na(iv_s)}% | 溢價率：{_na(prem_s)}% | 實際槓桿：{_na(lev_s)}x",
+        f"  發行量：{issued} 仟單位 | 今日成交張數：{vol}",
+    ]
+    return "\n".join(lines)
 
 
 # ── 搜尋特定股票的好權證 ─────────────────────────────────────
@@ -417,10 +531,23 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     if not target:
         return f"❌ 找不到權證代號 `{wc}`（已查詢 {len(basic_all)} 筆）", ""
 
-    vol_map        = {r.get("權證代號", ""): r for r in daily}
-    target_summary = _fmt_warrant(target, vol_map)
+    vol_map  = {r.get("權證代號", ""): r for r in daily}
+    und_code = _underlying_code(target)
 
-    und_code  = _underlying_code(target)
+    # 補充即時資料：取目標權證和標的股票的 MIS 資料
+    mis_w       = _fetch_mis(wc)
+    stock_price = 0.0
+    if und_code:
+        mis_s       = _fetch_mis(und_code)
+        sp          = mis_s.get("price") or mis_s.get("prev_close", "")
+        try:
+            stock_price = float(sp)
+        except Exception:
+            pass
+
+    target_summary = _fmt_warrant(target, vol_map,
+                                  mis_data=mis_w, stock_price=stock_price)
+
     # 從名稱推出標的前3字（例：台積電凱基→台積電）
     t_name    = target.get("權證簡稱", target.get("權證名稱", ""))
     und_short = t_name[:3] if re.search(r"[一-鿿]", t_name) else ""
