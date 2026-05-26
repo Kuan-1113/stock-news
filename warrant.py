@@ -42,7 +42,7 @@ def _fetch_basic_all() -> list:
                 # 第一次載入時印出欄位名稱（用於除錯）
                 if data:
                     print(f"✅ 權證基本資料已載入 {len(data)} 筆", flush=True)
-                    print(f"🔍 欄位：{list(data[0].keys())[:15]}", flush=True)
+                    print(f"🔍 全部欄位：{list(data[0].keys())}", flush=True)
                 return _basic_cache["data"]
         except Exception as e:
             print(f"⚠️  t187ap37_L 下載失敗：{e}", flush=True)
@@ -187,46 +187,73 @@ def _underlying_code(row: dict) -> str:
     return _field(row,
         "標的有價證券代號", "標的股票代號", "標的代號",
         "標的有価証券代號", "標的",
+        "標的證券代號", "標的股代號",
+    )
+
+
+def _underlying_name(row: dict) -> str:
+    return _field(row,
+        "標的有價證券名稱", "標的股票名稱", "標的名稱",
+        "標的有価証券名稱", "標的證券名稱",
     )
 
 
 def _expiry(row: dict) -> str:
-    return _field(row, "到期日期", "到期日", "下市日期", "最後交易日", "期限")
+    return _field(row, "最後交易日", "到期日期", "到期日", "下市日期", "履約截止日", "期限")
 
 
 def _strike(row: dict) -> str:
-    return _field(row, "履約價格", "行使價格", "履約價", "執行價格")
+    return _field(row,
+        "原始履約價格（元）/履約指數",
+        "履約價格", "行使價格", "履約價", "執行價格",
+        "最新標的履約配發數量（每仟單位權證）",
+    )
 
 
 def _ratio(row: dict) -> str:
-    return _field(row, "行使比例", "換股比例", "權利比例", "行使率")
+    return _field(row,
+        "最新標的履約配發數量（每仟單位權證）",
+        "行使比例", "換股比例", "權利比例", "行使率",
+    )
 
 
 def _delta(row: dict) -> str:
-    return _field(row, "Delta", "delta", "DELTA")
+    return _field(row, "Delta", "delta", "DELTA", "Greeks_Delta", "避險比率")
 
 
 def _iv(row: dict) -> str:
-    return _field(row, "隱含波動率", "IV", "隱波率", "波動率")
+    return _field(row, "隱含波動率", "IV", "隱波率", "波動率", "隱含波動率(%)")
 
 
 def _premium(row: dict) -> str:
-    return _field(row, "溢價率", "溢價", "Premium")
+    return _field(row, "溢價率", "溢價", "Premium", "溢價率(%)")
 
 
 def _leverage(row: dict) -> str:
-    return _field(row, "實際槓桿倍數", "實際槓桿", "有效槓桿", "槓桿比例", "槓桿倍數")
+    return _field(row,
+        "實際槓桿倍數", "實際槓桿", "有效槓桿", "槓桿比例", "槓桿倍數",
+        "槓桿比率", "實際槓桿比率",
+    )
 
 
 def _prev_close(row: dict) -> str:
-    return _field(row, "前一日收盤價", "昨收", "昨收盤", "收盤價", "前收")
+    return _field(row, "前一日收盤價", "昨收", "昨收盤", "收盤價", "前收", "參考價")
+
+
+def _issued_units(row: dict) -> str:
+    return _field(row, "發行單位數量（仟單位）", "發行張數", "發行量")
 
 
 def _wtype(row: dict) -> str:
-    t = _field(row, "行使類型", "認購認售", "類型", "Type", "權證類型")
+    t = _field(row, "權證類型", "行使類型", "認購認售", "類型", "Type")
     if not t:
-        name = row.get("權證名稱", "")
+        name = row.get("權證簡稱", row.get("權證名稱", ""))
         return "認購" if "購" in name else ("認售" if "售" in name else "未知")
+    # 統一格式
+    if "認購" in t or "購" in t:
+        return "認購"
+    if "認售" in t or "售" in t:
+        return "認售"
     return t
 
 
@@ -236,14 +263,13 @@ def _score(row: dict, vol_map: dict) -> float:
     score = 0.0
     code  = row.get("權證代號", "")
 
-    # 剩餘天數
+    # 剩餘天數：要求 >90 天
     exp  = _expiry(row)
     days = _days_to_expiry(exp) if exp else 0
-    if days <= 0:
+    if days < 90:           # 少於 90 天直接排除
         return -999.0
-    if   30 <= days <= 120: score += 30.0
-    elif days > 120:        score += 20.0
-    elif 15 <= days < 30:   score += 10.0
+    if   90 <= days <= 180: score += 30.0
+    elif days > 180:        score += 20.0
 
     # 成交張數（流動性）
     vol = int(vol_map.get(code, {}).get("成交張數", 0) or 0)
@@ -283,26 +309,35 @@ def _score(row: dict, vol_map: dict) -> float:
 
 # ── 格式化單筆 ────────────────────────────────────────────────
 
+def _na(v: str) -> str:
+    return v if v else "—"
+
+
 def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None) -> str:
     code   = row.get("權證代號", "?")
-    name   = row.get("權證名稱", "?")
+    name   = row.get("權證簡稱", row.get("權證名稱", "?"))
     wt     = _wtype(row)
     exp    = _expiry(row)
     days   = _days_to_expiry(exp) if exp else "?"
-    strike = _strike(row)
-    ratio  = _ratio(row)
-    delta  = _delta(row)
-    iv     = _iv(row)
-    prem   = _premium(row)
-    lev    = _leverage(row)
-    close  = _prev_close(row)
+    strike = _na(_strike(row))
+    ratio  = _na(_ratio(row))
+    delta  = _na(_delta(row))
+    iv     = _na(_iv(row))
+    prem   = _na(_premium(row))
+    lev    = _na(_leverage(row))
+    close  = _na(_prev_close(row))
+    issued = _na(_issued_units(row))
+    und_c  = _na(_underlying_code(row))
+    und_n  = _na(_underlying_name(row))
     vol    = vol_map.get(code, {}).get("成交張數", "N/A")
     prefix = f"#{rank} " if rank else ""
     return (
         f"{prefix}**{name}**（{code}） — {wt}\n"
-        f"  昨收 {close} | 到期 {exp}（剩{days}天） | 履約價 {strike} | 行使比例 {ratio}\n"
-        f"  Delta {delta} | IV {iv}% | 溢價率 {prem}% | 實際槓桿 {lev}x\n"
-        f"  今日成交張數 {vol}"
+        f"  標的：{und_n}（{und_c}）\n"
+        f"  昨收：{close} 元 | 到期日：{exp}（剩 {days} 天）\n"
+        f"  履約價：{strike} | 行使比例：{ratio}\n"
+        f"  Delta：{delta} | IV：{iv}% | 溢價率：{prem}% | 實際槓桿：{lev}x\n"
+        f"  發行量：{issued} 仟單位 | 今日成交張數：{vol}"
     )
 
 
@@ -324,12 +359,15 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
         and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
     ]
 
+    def _wname(r):
+        return r.get("權證簡稱", r.get("權證名稱", ""))
+
     # 方式2：用中文名稱過濾（前3字）
     if not matched and re.search(r"[一-鿿]", zh_name):
         short = zh_name[:3]
         matched = [
             r for r in basic_all
-            if short in r.get("權證名稱", "")
+            if short in _wname(r)
             and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
         ]
 
@@ -338,7 +376,8 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
         short = zh_name[:3]
         daily = _fetch_daily()
         daily_codes = {
-            r["權證代號"] for r in daily if short in r.get("權證名稱", "")
+            r["權證代號"] for r in daily
+            if short in r.get("權證名稱", r.get("權證簡稱", ""))
         }
         matched = [
             r for r in basic_all
@@ -349,10 +388,10 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     if not matched:
         return f"❌ 找不到 {zh_name}（{code}）的有效認購權證（共查 {len(basic_all)} 筆）"
 
-    # 只取認購
-    calls = [r for r in matched if "購" in _wtype(r) or "購" in r.get("權證名稱", "")]
+    # 只取認購（>90 天在 _score 已排除）
+    calls = [r for r in matched if "購" in _wtype(r) or "購" in _wname(r)]
     if not calls:
-        calls = matched  # 若全部都是認售，就全取
+        calls = matched
 
     daily     = _fetch_daily()
     vol_map   = {r.get("權證代號", ""): r for r in daily}
@@ -381,19 +420,24 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     vol_map        = {r.get("權證代號", ""): r for r in daily}
     target_summary = _fmt_warrant(target, vol_map)
 
-    und_code = _underlying_code(target)
-    und_name = target.get("權證名稱", "")[:3]  # 從名稱推斷標的
-    today    = datetime.date.today()
+    und_code  = _underlying_code(target)
+    # 從名稱推出標的前3字（例：台積電凱基→台積電）
+    t_name    = target.get("權證簡稱", target.get("權證名稱", ""))
+    und_short = t_name[:3] if re.search(r"[一-鿿]", t_name) else ""
+    today     = datetime.date.today()
+
+    def _wname2(r):
+        return r.get("權證簡稱", r.get("權證名稱", ""))
 
     similar = [
         r for r in basic_all
         if r.get("權證代號", "").upper() != wc
         and (
-            (_underlying_code(r) == und_code and und_code)
-            or (und_name and und_name in r.get("權證名稱", ""))
+            (und_code and _underlying_code(r) == und_code)
+            or (und_short and und_short in _wname2(r))
         )
         and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
-        and ("購" in _wtype(r) or "購" in r.get("權證名稱", ""))
+        and ("購" in _wtype(r) or "購" in _wname2(r))
     ]
 
     ranked_sim = sorted(similar, key=lambda r: _score(r, vol_map), reverse=True)[:3]
