@@ -197,6 +197,34 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)[:80]
 
+# ── 定時觸發日報（Railway 永遠在線，取代不可靠的 GitHub cron）────
+
+def _daily_scheduler():
+    """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報"""
+    _triggered = set()
+    TRIGGER_HOURS = {8: "morning", 15: "afternoon", 22: "evening"}
+    while True:
+        try:
+            now  = datetime.datetime.now(TW_TZ)
+            key  = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
+            if now.hour in TRIGGER_HOURS and now.minute < 5 and key not in _triggered:
+                _triggered.add(key)
+                if GITHUB_PAT:
+                    ok, err = _trigger_workflow("stock-daily.yml", {})
+                    label = TRIGGER_HOURS[now.hour]
+                    print(f"⏰ 觸發{label}日報 {'✅' if ok else f'❌ {err}'}", flush=True)
+                else:
+                    print("⏰ 跳過日報觸發（未設定 GITHUB_PAT）", flush=True)
+            # 每天 00:00 清除已觸發記錄
+            if now.hour == 0 and now.minute == 0:
+                _triggered.clear()
+        except Exception as e:
+            print(f"⚠️ 排程例外：{e}", flush=True)
+        time.sleep(30)
+
+threading.Thread(target=_daily_scheduler, daemon=True).start()
+print("⏰ 日報排程啟動（TW 08:00 / 15:00 / 22:00）", flush=True)
+
 # ── Discord Bot ───────────────────────────────────────────────
 
 intents = discord.Intents.default()
