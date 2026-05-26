@@ -277,7 +277,8 @@ def fetch_crypto() -> dict:
 
 _jin10_session_id: str = ""
 
-def _jin10_post(payload: dict, session_id: str = "") -> dict:
+def _jin10_post(payload: dict, session_id: str = "") -> tuple:
+    """返回 (result_dict, new_session_id)"""
     headers = {"Content-Type": "application/json"}
     if JIN10_TOKEN:
         headers["Authorization"] = f"Bearer {JIN10_TOKEN}"
@@ -286,69 +287,85 @@ def _jin10_post(payload: dict, session_id: str = "") -> dict:
     try:
         r = requests.post("https://mcp.jin10.com/mcp", headers=headers,
                           json=payload, timeout=20)
+        # Session ID 在 HTTP response header 裡
+        new_sid = r.headers.get("Mcp-Session-Id", session_id)
         # 解析 SSE 格式（data: {...} 行）
-        for line in r.text.splitlines():
+        for line in r.content.decode("utf-8").splitlines():
             line = line.strip()
             if line.startswith("data:"):
                 try:
                     obj = json.loads(line[5:].strip())
                     if "result" in obj:
-                        return obj["result"]
+                        return obj["result"], new_sid
                 except Exception:
                     pass
-        # 嘗試直接 JSON
         try:
-            return r.json().get("result", {})
+            return r.json().get("result", {}), new_sid
         except Exception:
-            return {}
+            return {}, new_sid
     except Exception as e:
         print(f"金十 API 錯誤：{e}")
-        return {}
+        return {}, session_id
 
 def jin10_initialize() -> str:
     global _jin10_session_id
     if not JIN10_TOKEN:
         return ""
-    result = _jin10_post({
+    _, new_sid = _jin10_post({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "protocolVersion": "2025-11-25",
             "clientInfo": {"name": "stock-bot", "version": "1.0"},
         }
     })
-    # session id 通常在 response header，但這裡用 result 裡的值（若有）
-    _jin10_session_id = result.get("sessionId", "") or result.get("session_id", "")
+    _jin10_session_id = new_sid
+    print(f"  金十 Session ID：{_jin10_session_id[:16]}..." if _jin10_session_id else "  金十 Session ID：未取得")
     return _jin10_session_id
 
 def jin10_call(tool: str, args: dict) -> list:
     if not JIN10_TOKEN:
         return []
-    result = _jin10_post({
+    result, _ = _jin10_post({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": tool, "arguments": args}
     }, session_id=_jin10_session_id)
-    # 嘗試取出 data 陣列
-    data = result.get("structuredContent", {}).get("data") \
-        or result.get("content", [{}])[0].get("data") \
-        or result.get("data") \
-        or []
-    return data if isinstance(data, list) else []
+    # result.content[0].text 是一個 JSON 字串，需再次 parse
+    try:
+        content_list = result.get("content", [])
+        if result.get("isError") and content_list:
+            print(f"  金十工具錯誤（{tool}）：{content_list[0].get('text','')[:120]}")
+            return []
+        text = content_list[0].get("text", "") if content_list else ""
+        parsed = json.loads(text)
+        data = parsed.get("data", [])
+        # list_flash 回傳 {"data": {"has_more": ..., "items": [...]}}
+        if isinstance(data, dict):
+            return data.get("items", [])
+        # list_calendar 回傳 {"data": [...]}
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception as e:
+        print(f"  金十解析錯誤（{tool}）：{e}")
+        return []
 
 def fetch_jin10_flash(session_info: dict) -> list:
-    """取得本時段的金十國際即時快訊（★★+ 以上）"""
+    """取得本時段的金十國際即時快訊"""
     if not JIN10_TOKEN:
         return []
     try:
-        items = jin10_call("list_flash", {"limit": 50})
+        items = jin10_call("list_flash", {})
         if not items:
+            print("  金十快訊：無資料")
             return []
 
-        now    = now_tw()
+        now     = now_tw()
         start_h = session_info["start_h"]
         end_h   = session_info["end_h"]
         if start_h < end_h:
-            start_dt = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
-            end_dt   = now.replace(hour=end_h,   minute=0, second=0, microsecond=0)
+            ref      = (now - datetime.timedelta(days=1)) if (now.hour < 6 and start_h == 15) else now
+            start_dt = ref.replace(hour=start_h, minute=0, second=0, microsecond=0)
+            end_dt   = ref.replace(hour=end_h,   minute=0, second=0, microsecond=0)
         else:
             yesterday = now - datetime.timedelta(days=1)
             start_dt  = yesterday.replace(hour=start_h, minute=0, second=0, microsecond=0)
@@ -356,56 +373,56 @@ def fetch_jin10_flash(session_info: dict) -> list:
 
         result = []
         for item in items:
-            star = int(item.get("star", item.get("important", 0)) or 0)
-            if star < 2:
+            content = item.get("content") or ""
+            time_raw = item.get("time") or ""
+            if not content:
                 continue
-            pub_raw = item.get("pub_time") or item.get("time") or ""
             try:
-                pub_dt = datetime.datetime.fromisoformat(pub_raw.replace("Z", "+00:00")).astimezone(TW_TZ)
+                pub_dt = datetime.datetime.fromisoformat(
+                    time_raw.replace("Z", "+00:00")).astimezone(TW_TZ)
             except Exception:
                 pub_dt = None
             if pub_dt and not (start_dt <= pub_dt <= end_dt):
                 continue
-            title   = item.get("title") or item.get("content") or ""
-            content = item.get("content") or ""
-            if title:
-                result.append({
-                    "star":    star,
-                    "time":    pub_dt.strftime("%H:%M") if pub_dt else "",
-                    "title":   title[:120],
-                    "content": content[:200] if content != title else "",
-                })
-        return result[:12]
+            result.append({
+                "time":    pub_dt.strftime("%H:%M") if pub_dt else "",
+                "title":   content[:150],
+            })
+        print(f"  金十快訊：取得 {len(result)} 則（時段內）")
+        return result[:15]
     except Exception as e:
-        print(f"金十快訊錯誤：{e}")
+        print(f"  金十快訊錯誤：{e}")
         return []
 
 def fetch_jin10_calendar() -> list:
-    """取得今日重要財經事件行事曆（★★★以上）"""
+    """取得今日重要財經事件行事曆（★★以上）"""
     if not JIN10_TOKEN:
         return []
     try:
-        items = jin10_call("list_calendar", {"importance": 3})
+        items = jin10_call("list_calendar", {})
         result = []
         for item in items:
-            event   = item.get("event") or item.get("title") or ""
-            country = item.get("country") or item.get("currency") or ""
-            time_s  = item.get("time") or item.get("pub_time") or ""
-            actual  = item.get("actual") or ""
-            forecast= item.get("consensus") or item.get("forecast") or ""
-            star    = int(item.get("star", 3) or 3)
-            if event and star >= 3:
+            star     = int(item.get("star", 0) or 0)
+            if star < 2:
+                continue
+            event    = item.get("title") or ""
+            time_s   = item.get("pub_time") or item.get("time") or ""
+            actual   = item.get("actual") or ""
+            forecast = item.get("consensus") or ""
+            affect   = item.get("affect_txt") or ""
+            if event:
                 result.append({
                     "event":    event[:60],
-                    "country":  country,
                     "time":     time_s,
                     "actual":   actual,
                     "forecast": forecast,
+                    "affect":   affect,
                     "star":     star,
                 })
+        print(f"  金十行事曆：取得 {len(result)} 筆（★★以上）")
         return result[:10]
     except Exception as e:
-        print(f"金十行事曆錯誤：{e}")
+        print(f"  金十行事曆錯誤：{e}")
         return []
 
 def build_jin10_text(flash: list, calendar: list) -> str:
@@ -414,18 +431,17 @@ def build_jin10_text(flash: list, calendar: list) -> str:
     if flash:
         lines.append("【金十數據 即時快訊】")
         for f in flash:
-            star_tag = "★" * f["star"]
-            time_tag = f"[{f['time']}] " if f["time"] else ""
-            lines.append(f"{star_tag} {time_tag}{f['title']}")
-            if f.get("content"):
-                lines.append(f"   └ {f['content']}")
+            t = f"[{f['time']}] " if f["time"] else ""
+            lines.append(f"• {t}{f['title']}")
     if calendar:
         lines.append("\n【今日重要財經事件】")
         for c in calendar:
+            stars        = "★" * min(c["star"], 3)
             actual_tag   = f"公布={c['actual']}" if c["actual"] else ""
             forecast_tag = f"預期={c['forecast']}" if c["forecast"] else ""
-            vals = " / ".join(t for t in [actual_tag, forecast_tag] if t)
-            lines.append(f"★★★ [{c['time']}] {c['country']} {c['event']}"
+            affect_tag   = c.get("affect", "")
+            vals = "　".join(t for t in [actual_tag, forecast_tag, affect_tag] if t)
+            lines.append(f"{stars} [{c['time']}] {c['event']}"
                          + (f"　{vals}" if vals else ""))
     return "\n".join(lines)
 
@@ -435,19 +451,20 @@ def build_jin10_discord_block(flash: list, calendar: list) -> str:
     if flash:
         news_lines = []
         for f in flash:
-            stars = "🌟" * min(f["star"], 3)
-            t     = f"[{f['time']}] " if f["time"] else ""
-            news_lines.append(f"{stars} {t}{f['title']}")
+            t = f"`{f['time']}` " if f["time"] else ""
+            news_lines.append(f"• {t}{f['title']}")
         parts.append("**📡 金十數據 即時快訊**\n" + "\n".join(news_lines))
     if calendar:
         cal_lines = []
         for c in calendar:
-            vals = " / ".join(v for v in [
-                (f"公布 `{c['actual']}`" if c["actual"] else ""),
+            stars = "⭐" * min(c["star"], 3)
+            vals  = "　".join(v for v in [
+                (f"公布 `{c['actual']}`"   if c["actual"]   else ""),
                 (f"預期 `{c['forecast']}`" if c["forecast"] else ""),
+                (c.get("affect", "")),
             ] if v)
-            cal_lines.append(f"⭐⭐⭐ `{c['time']}` **{c['country']}** {c['event']}"
-                              + (f" — {vals}" if vals else ""))
+            cal_lines.append(f"{stars} `{c['time']}` {c['event']}"
+                             + (f" — {vals}" if vals else ""))
         parts.append("**📅 今日重要財經事件**\n" + "\n".join(cal_lines))
     return "\n\n".join(parts) if parts else ""
 
