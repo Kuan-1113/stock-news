@@ -27,9 +27,10 @@ def _start_health():
 threading.Thread(target=_start_health, daemon=True).start()
 print("=== Discord Bot starting ===", flush=True)
 
-# ── technical_indicators import ───────────────────────────────
+# ── local imports ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
+from warrant import search_warrants, analyze_warrant, lookup_stock
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -295,6 +296,118 @@ async def cmd_自選股(interaction: discord.Interaction):
             await interaction.followup.send(f"❌ 發生錯誤：{str(e)[:100]}")
         except Exception:
             pass
+
+# ── 權證指令 ─────────────────────────────────────────────────
+
+def _do_warrant_search(stock_input: str) -> str:
+    code, zh_name = lookup_stock(stock_input)
+    summary = search_warrants(stock_input)
+    if summary.startswith("❌"):
+        return summary
+
+    prompt = f"""你是一位台灣權證專家，請根據以下資料為投資人提供分析建議。
+
+【標的股票】{zh_name}（{code}）
+
+【候選認購權證清單（已依綜合評分排序）】
+{summary}
+
+請以繁體中文撰寫分析（700字以內），格式如下：
+
+🏆 **推薦排名**
+對每一檔權證說明：
+- 名稱、代號
+- ✅ 優點（2-3點）
+- ⚠️ 缺點或注意（1-2點）
+
+💡 **操作建議**
+哪一檔最值得優先考慮？說明理由（剩餘天數、溢價率、流動性、槓桿等角度）。
+
+⚠️ 本分析由 AI 生成，不構成投資建議，請自行評估風險。"""
+
+    analysis = _claude_call(prompt, max_tokens=1200)
+    header = f"## 🔍 {zh_name}（{code}）認購權證推薦 | {now_str()}\n\n"
+    return header + analysis
+
+
+def _do_warrant_analyze(warrant_code: str) -> str:
+    target_summary, similar_summary = analyze_warrant(warrant_code)
+    if target_summary.startswith("❌"):
+        return target_summary
+
+    prompt = f"""你是一位台灣權證專家，請對以下權證進行深度分析。
+
+【目標權證】
+{target_summary}
+
+【同標的其他推薦認購權證】
+{similar_summary}
+
+請以繁體中文撰寫分析（700字以內），格式如下：
+
+📋 **權證基本評估**
+- 到期時間是否充裕？
+- Delta 值的涵義與影響
+- 隱含波動率（IV）是否偏高？
+- 溢價率是否合理？
+- 實際槓桿倍數評估
+- 流動性（成交張數）評估
+
+✅ **優點**（2-3點）
+
+⚠️ **缺點 / 注意事項**（2-3點）
+
+🔄 **同標的推薦替代選項**
+比較上方3檔，說明各自優缺點及推薦順序。
+
+⚠️ 本分析由 AI 生成，不構成投資建議，請自行評估風險。"""
+
+    analysis = _claude_call(prompt, max_tokens=1200)
+    header = f"## 🎯 權證 `{warrant_code.upper()}` 深度分析 | {now_str()}\n\n"
+    return header + analysis
+
+
+@tree.command(name="查權證", description="輸入股票代碼或名稱，列出推薦認購權證（含排名與優缺點）")
+@app_commands.describe(stock="股票代碼或中文名（例：2330 或 台積電）")
+async def cmd_查權證(interaction: discord.Interaction, stock: str):
+    print(f"⚡ /查權證 收到：{stock}", flush=True)
+    try:
+        await interaction.response.defer()
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _do_warrant_search, stock.strip())
+        for i, chunk in enumerate(_split_messages(result)):
+            if i == 0:
+                await interaction.followup.send(chunk)
+            else:
+                await interaction.channel.send(chunk)
+    except Exception as e:
+        print(f"❌ /查權證 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 查詢失敗：{str(e)[:150]}")
+        except Exception:
+            pass
+
+
+@tree.command(name="分析權證", description="輸入權證代號，深度分析並推薦同標的替代選項")
+@app_commands.describe(code="權證代號（例：038542）")
+async def cmd_分析權證(interaction: discord.Interaction, code: str):
+    print(f"⚡ /分析權證 收到：{code}", flush=True)
+    try:
+        await interaction.response.defer()
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _do_warrant_analyze, code.strip())
+        for i, chunk in enumerate(_split_messages(result)):
+            if i == 0:
+                await interaction.followup.send(chunk)
+            else:
+                await interaction.channel.send(chunk)
+    except Exception as e:
+        print(f"❌ /分析權證 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 分析失敗：{str(e)[:150]}")
+        except Exception:
+            pass
+
 
 @client.event
 async def on_ready():
