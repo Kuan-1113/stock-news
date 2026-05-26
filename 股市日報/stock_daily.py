@@ -1090,6 +1090,9 @@ if __name__ == "__main__":
 
     if "--schedule" in sys.argv:
         run_schedule()
+    elif "--watchlist" in sys.argv:
+        print("📋 自選股分析模式\n")
+        run_watchlist_report()
     else:
-        print("💡 提示：加上 --schedule 參數可啟動自動排程模式\n")
+        print("💡 提示：加上 --schedule 啟動排程 / --watchlist 只跑自選股\n")
         run_report()

@@ -2,12 +2,14 @@ services:
   - type: worker
     name: taiwan-stock-discord-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install discord.py requests
     startCommand: python 自選股/discord_bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
-      - key: ANTHROPIC_API_KEY
+      - key: GITHUB_PAT
         sync: false
+      - key: GITHUB_REPO
+        value: "Kuan-1113/stock-news"
       - key: PYTHONUTF8
         value: "1"

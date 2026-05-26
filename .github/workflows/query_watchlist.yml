@@ -1,0 +1,31 @@
+name: 📋 自選股分析
+
+on:
+  workflow_dispatch:
+
+jobs:
+  watchlist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安裝套件
+        run: |
+          pip install --upgrade pip
+          pip install requests feedparser anthropic pytz yfinance pandas
+
+      - name: 📋 執行自選股分析
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          REPORT_SESSION: evening
+          PYTHONUTF8: "1"
+          TZ: Asia/Taipei
+        run: python -X utf8 股市日報/stock_daily.py --watchlist
