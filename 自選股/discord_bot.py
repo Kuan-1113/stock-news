@@ -234,8 +234,11 @@ def _split_messages(text: str, limit: int = 1900) -> list[str]:
     name="股票名稱（選填，如：台積電）",
 )
 async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = ""):
+    print(f"⚡ /查股 收到：{symbol}", flush=True)
     try:
+        print(f"⚡ 準備 defer...", flush=True)
         await interaction.response.defer()
+        print(f"⚡ defer 成功", flush=True)
         sym = symbol.strip().upper()
         # 在背景執行緒中跑全部同步分析，不阻塞 event loop
         loop   = asyncio.get_running_loop()
