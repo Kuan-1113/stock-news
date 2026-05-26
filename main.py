@@ -202,19 +202,23 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
 def _daily_scheduler():
     """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報"""
     _triggered = set()
-    TRIGGER_HOURS = {8: "morning", 15: "afternoon", 22: "evening"}
+    # 日報：08:00 / 15:00 / 22:00 TW
+    # Podcast：09:00 / 21:00 TW
+    DAILY_HOURS   = {8: "morning", 15: "afternoon", 22: "evening"}
+    PODCAST_HOURS = {9, 21}
     while True:
         try:
             now  = datetime.datetime.now(TW_TZ)
             key  = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
-            if now.hour in TRIGGER_HOURS and now.minute < 5 and key not in _triggered:
-                _triggered.add(key)
-                if GITHUB_PAT:
+            if now.minute < 5 and key not in _triggered:
+                if now.hour in DAILY_HOURS and GITHUB_PAT:
                     ok, err = _trigger_workflow("stock-daily.yml", {})
-                    label = TRIGGER_HOURS[now.hour]
-                    print(f"⏰ 觸發{label}日報 {'✅' if ok else f'❌ {err}'}", flush=True)
-                else:
-                    print("⏰ 跳過日報觸發（未設定 GITHUB_PAT）", flush=True)
+                    print(f"⏰ 觸發{DAILY_HOURS[now.hour]}日報 {'✅' if ok else f'❌ {err}'}", flush=True)
+                    _triggered.add(key)
+                elif now.hour in PODCAST_HOURS and GITHUB_PAT:
+                    ok, err = _trigger_workflow("podcast.yml", {})
+                    print(f"⏰ 觸發Podcast追蹤 {'✅' if ok else f'❌ {err}'}", flush=True)
+                    _triggered.add(key)
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
                 _triggered.clear()
@@ -223,7 +227,7 @@ def _daily_scheduler():
         time.sleep(30)
 
 threading.Thread(target=_daily_scheduler, daemon=True).start()
-print("⏰ 日報排程啟動（TW 08:00 / 15:00 / 22:00）", flush=True)
+print("⏰ 排程啟動（日報 08/15/22:00、Podcast 09/21:00 TW）", flush=True)
 
 # ── Discord Bot ───────────────────────────────────────────────
 
