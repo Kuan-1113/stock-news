@@ -238,7 +238,7 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
         await interaction.response.defer()
         sym = symbol.strip().upper()
         # 在背景執行緒中跑全部同步分析，不阻塞 event loop
-        loop   = asyncio.get_event_loop()
+        loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _do_analysis, sym, name.strip())
         # 分段傳送（Discord 單則訊息上限 2000 字）
         chunks = _split_messages(result)
@@ -258,7 +258,7 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
 async def cmd_自選股(interaction: discord.Interaction):
     try:
         await interaction.response.defer()
-        loop          = asyncio.get_event_loop()
+        loop          = asyncio.get_running_loop()
         ok, errmsg    = await loop.run_in_executor(None, _trigger_workflow, "query_watchlist.yml", {})
         if ok:
             await interaction.followup.send("⏳ 自選股分析啟動！約 **2 分鐘**後報告會出現在自選股頻道。")
