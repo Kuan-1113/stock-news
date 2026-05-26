@@ -22,6 +22,7 @@ stock_daily.py
 import os
 import sys
 import re
+import json
 import time
 import datetime
 import warnings
@@ -45,6 +46,8 @@ warnings.filterwarnings("ignore")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 JIN10_TOKEN       = os.environ.get("JIN10_TOKEN", "")
+REPORT_SESSION    = os.environ.get("REPORT_SESSION", "auto")   # morning / afternoon / evening / auto
+RUN_STATE_FILE    = "run_state.json"
 
 DISCORD_TW       = os.environ.get("DISCORD_TW",       "https://discord.com/api/webhooks/1507952802662449152/8iumIv-Bs5PTRVlMpFXbE7wH_uzHJlLtmybTHaj1zUDxksQBZwRAOs7v69tvSOezmWnW")
 DISCORD_US       = os.environ.get("DISCORD_US",       "https://discord.com/api/webhooks/1508308789537800242/y6l377lQUOovmgh19He7wn5DlPN2_k19B2ksGVpmErCV46K-o7XSRnoXM97DDkpmglOP")
@@ -111,16 +114,39 @@ WATCHLIST = load_watchlist()
 # ─────────────────────────────────────────────────────────────
 
 def get_session_info() -> dict:
+    _sessions = {
+        "morning":   {"label": "盤前早報", "period": "前日 22:00 ～ 今日 08:00", "emoji": "🌅", "start_h": 22, "end_h": 8},
+        "afternoon": {"label": "盤中午報", "period": "今日 08:00 ～ 15:00",       "emoji": "☀️", "start_h": 8,  "end_h": 15},
+        "evening":   {"label": "盤後晚報", "period": "今日 15:00 ～ 22:00",       "emoji": "🌙", "start_h": 15, "end_h": 22},
+    }
+    # Workflow 明確傳入時段 → 直接使用（不受延遲影響）
+    if REPORT_SESSION in _sessions:
+        return _sessions[REPORT_SESSION]
+    # 自動偵測（手動觸發 / 本機測試）
+    # 加寬邊界：每個時段各有 ±1h 緩衝，避免 GitHub Actions 延遲誤判
     h = datetime.datetime.now(TW_TZ).hour
-    if 8 <= h < 15:
-        return {"label": "盤前早報", "period": "前日 22:00 ～ 今日 08:00", "emoji": "🌅", "start_h": 22, "end_h": 8}
-    elif 15 <= h < 22:
-        return {"label": "盤中午報", "period": "今日 08:00 ～ 15:00",       "emoji": "☀️", "start_h": 8,  "end_h": 15}
+    if 7 <= h < 14:
+        return _sessions["morning"]
+    elif 14 <= h < 21:
+        return _sessions["afternoon"]
     else:
-        return {"label": "盤後晚報", "period": "今日 15:00 ～ 22:00",       "emoji": "🌙", "start_h": 15, "end_h": 22}
+        return _sessions["evening"]
 
 def is_weekend() -> bool:
     return datetime.datetime.now(TW_TZ).weekday() >= 5
+
+def load_run_state() -> dict:
+    try:
+        with open(RUN_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_run_state(state: dict):
+    cutoff = (datetime.datetime.now(TW_TZ) - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    state  = {k: v for k, v in state.items() if k >= cutoff}
+    with open(RUN_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 def now_tw() -> datetime.datetime:
     return datetime.datetime.now(TAIPEI_TZ)
@@ -498,9 +524,13 @@ def fetch_all_news(category: str, session_info: dict) -> list:
     end_h   = session_info["end_h"]
 
     if start_h < end_h:
-        start_dt = now.replace(hour=start_h, minute=0, second=0, microsecond=0)
-        end_dt   = now.replace(hour=end_h,   minute=0, second=0, microsecond=0)
+        # 正常時段（如 8→15、15→22）
+        # 若已過午夜（h<6）且執行的是盤後晚報，新聞窗口應指向前一天 15→22
+        ref = (now - datetime.timedelta(days=1)) if (now.hour < 6 and start_h == 15) else now
+        start_dt = ref.replace(hour=start_h, minute=0, second=0, microsecond=0)
+        end_dt   = ref.replace(hour=end_h,   minute=0, second=0, microsecond=0)
     else:
+        # 跨日時段（22→8）
         yesterday = now - datetime.timedelta(days=1)
         start_dt  = yesterday.replace(hour=start_h, minute=0, second=0, microsecond=0)
         end_dt    = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
@@ -831,6 +861,15 @@ def build_market_table(market_data: dict) -> str:
 def run_report():
     print("=" * 65)
     session_info  = get_session_info()
+    today         = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    run_state     = load_run_state()
+
+    # 防重複：同一時段當天已成功執行過就跳過
+    if session_info["label"] in run_state.get(today, []):
+        print(f"⏭️  {session_info['label']} 今日已執行（{today}），跳過重複執行")
+        print("=" * 65)
+        return
+
     weekend_note  = "（週末版）" if is_weekend() else ""
     print(f"🚀 股市日報啟動 — {now_str()} {weekend_note}")
     print(f"📅 本次時段：{session_info['emoji']} {session_info['label']} ({session_info['period']})")
@@ -990,6 +1029,13 @@ def run_report():
     if session_info["label"] == "盤後晚報":
         time.sleep(2)
         run_watchlist_report()
+
+    # 記錄本次執行成功（防重複用）
+    run_state = load_run_state()
+    run_state.setdefault(today, [])
+    if session_info["label"] not in run_state[today]:
+        run_state[today].append(session_info["label"])
+    save_run_state(run_state)
 
     print("\n" + "=" * 65)
     print(f"✅ 日報完成！— {now_str()}")
