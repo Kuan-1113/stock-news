@@ -19,7 +19,7 @@ jobs:
       - name: 📦 安裝套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser anthropic pytz yfinance pandas
+          pip install requests feedparser anthropic pytz yfinance pandas schedule
 
       - name: 📋 執行自選股分析
         env:
