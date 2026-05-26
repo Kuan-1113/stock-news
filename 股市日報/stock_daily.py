@@ -33,6 +33,14 @@ import anthropic
 import pytz
 import io
 
+try:
+    import zhconv
+    def _s2tw(text: str) -> str:
+        return zhconv.convert(text, "zh-tw")
+except ImportError:
+    def _s2tw(text: str) -> str:
+        return text
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 
@@ -373,7 +381,7 @@ def fetch_jin10_flash(session_info: dict) -> list:
 
         result = []
         for item in items:
-            content = item.get("content") or ""
+            content = _s2tw(item.get("content") or "")
             time_raw = item.get("time") or ""
             if not content:
                 continue
@@ -405,11 +413,11 @@ def fetch_jin10_calendar() -> list:
             star     = int(item.get("star", 0) or 0)
             if star < 2:
                 continue
-            event    = item.get("title") or ""
+            event    = _s2tw(item.get("title") or "")
             time_s   = item.get("pub_time") or item.get("time") or ""
             actual   = item.get("actual") or ""
             forecast = item.get("consensus") or ""
-            affect   = item.get("affect_txt") or ""
+            affect   = _s2tw(item.get("affect_txt") or "")
             if event:
                 result.append({
                     "event":    event[:60],
@@ -466,6 +474,29 @@ def build_jin10_discord_block(flash: list, calendar: list) -> str:
             cal_lines.append(f"{stars} `{c['time']}` {c['event']}"
                              + (f" — {vals}" if vals else ""))
         parts.append("**📅 今日重要財經事件**\n" + "\n".join(cal_lines))
+    return "\n\n".join(parts) if parts else ""
+
+def build_jin10_discord_message(flash: list, calendar: list) -> str:
+    """格式化金十數據為獨立 Discord 訊息（繁體中文大字體版）"""
+    parts = []
+    if flash:
+        lines = ["## 📡 金十數據 即時快訊"]
+        for f in flash:
+            t = f"`{f['time']}` " if f["time"] else ""
+            lines.append(f"**{t}{f['title']}**")
+        parts.append("\n".join(lines))
+    if calendar:
+        lines = ["## 📅 今日重要財經事件"]
+        for c in calendar:
+            stars = "⭐" * min(c["star"], 3)
+            vals = "  ".join(v for v in [
+                (f"公布 `{c['actual']}`"   if c["actual"]   else ""),
+                (f"預期 `{c['forecast']}`" if c["forecast"] else ""),
+                (c.get("affect", "")),
+            ] if v)
+            lines.append(f"{stars} **`{c['time']}`** {c['event']}"
+                         + (f" — {vals}" if vals else ""))
+        parts.append("\n".join(lines))
     return "\n\n".join(parts) if parts else ""
 
 import json as _json_module
@@ -646,6 +677,24 @@ def analyze_global_news(articles, session_info, market_data, jin10_text: str = "
 4. **對台股/亞股的影響**（2-3點，每點以 • 開頭）
 5. **本週重要財經數據預告**（若有，結合行事曆資料）"""
     return claude_call(prompt, max_tokens=2000)
+
+def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
+    """針對金十數據進行專屬 AI 分析"""
+    if not flash and not calendar:
+        return ""
+    jin10_text = build_jin10_text(flash, calendar)
+    prompt = f"""你是一位資深國際財經分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
+
+以下為金十數據最新即時快訊與財經行事曆：
+
+{jin10_text}
+
+請以**繁體中文**撰寫金十數據分析摘要（500字以內）：
+1. **重大事件解讀**（針對最重要的2-3個事件，分析其市場影響）
+2. **市場情緒判斷**（整體市場情緒方向，並說明原因）
+3. **對台股／亞股影響**（2-3點，每點以 • 開頭）
+4. **今日需關注財經數據**（若行事曆有重要數據請標出時間）"""
+    return claude_call(prompt, max_tokens=900)
 
 # ─────────────────────────────────────────────────────────────
 # 自選股分析（22:00 執行）
@@ -929,14 +978,12 @@ def run_report():
     # 3b. 金十數據（國際即時快訊 + 行事曆）
     jin10_flash_items    = []
     jin10_calendar_items = []
-    jin10_discord_block  = ""
     if JIN10_TOKEN:
         print("\n📡 抓取金十數據...")
         jin10_initialize()
         jin10_flash_items    = fetch_jin10_flash(session_info)
         jin10_calendar_items = fetch_jin10_calendar()
         print(f"  快訊：{len(jin10_flash_items)} 則 | 行事曆：{len(jin10_calendar_items)} 個")
-        jin10_discord_block = build_jin10_discord_block(jin10_flash_items, jin10_calendar_items)
     else:
         print("\n⚠️  未設定 JIN10_TOKEN，跳過金十數據")
 
@@ -951,6 +998,9 @@ def run_report():
     print("  分析國際...")
     jin10_prompt_text = build_jin10_text(jin10_flash_items, jin10_calendar_items)
     global_analysis   = analyze_global_news(global_news, session_info, market_data, jin10_prompt_text)
+    time.sleep(1)
+    print("  分析金十數據...")
+    jin10_analysis = analyze_jin10(jin10_flash_items, jin10_calendar_items, session_info) if JIN10_TOKEN else ""
 
     # 5. 組合資料
     weekend_banner = "（週末版）" if is_weekend() else ""
@@ -1023,8 +1073,6 @@ def run_report():
         {"name": "📉 總體指標", "value": truncate(global_market_text), "inline": True},
         {"name": "🪙 加密貨幣", "value": truncate(crypto_text),        "inline": True},
     ]
-    if jin10_discord_block:
-        global_fields.append({"name": "📡 金十數據即時快訊", "value": truncate(jin10_discord_block), "inline": False})
     send_embed(DISCORD_GLOBAL, {
         "title":       f"🌍 國際市場{session_info['label']} {weekend_banner}| {ts}",
         "description": f"**時段：** {session_info['period']}",
@@ -1041,6 +1089,16 @@ def run_report():
         "fields": [{"name": "🔗 本時段重要新聞", "value": truncate(global_links), "inline": False}],
         "footer": {"text": "資料來源：Reuters / BBC / Google News / 金十數據"},
     })
+
+    # 金十數據獨立發送（繁體中文大字體）
+    if JIN10_TOKEN and (jin10_flash_items or jin10_calendar_items):
+        time.sleep(1.2)
+        jin10_msg = build_jin10_discord_message(jin10_flash_items, jin10_calendar_items)
+        if jin10_msg:
+            send_discord_message(DISCORD_GLOBAL, jin10_msg)
+            time.sleep(1.2)
+        if jin10_analysis:
+            send_discord_message(DISCORD_GLOBAL, f"## 🤖 Claude AI 金十數據分析 — {session_tag}\n\n{jin10_analysis}")
 
     # 7. 自選股（只在 22:00 盤後執行）
     if session_info["label"] == "盤後晚報":

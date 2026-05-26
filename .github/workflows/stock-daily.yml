@@ -11,6 +11,10 @@ on:
   workflow_dispatch:
     # 允許手動觸發（測試用）
 
+concurrency:
+  group: stock-daily-${{ github.event.schedule || github.run_id }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -34,7 +38,7 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule anthropic pytz yfinance pandas
+          pip install requests feedparser schedule anthropic pytz yfinance pandas zhconv
 
       - name: 🕐 確認台北時間 & 設定時段
         run: |
