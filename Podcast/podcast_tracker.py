@@ -22,7 +22,6 @@ DISCORD_PODCAST   = os.environ.get("DISCORD_PODCAST",
 TW_TZ            = pytz.timezone("Asia/Taipei")
 STATE_FILE        = "podcast_state.json"
 MAX_NEW_PER_SHOW  = 1      # 每次只處理最新一集（避免一次處理太多）
-MAX_BACKLOG_DAYS  = 7      # 只處理最近 N 天內的集數（避免第一次跑時倒灌舊集）
 MAX_AUDIO_MB      = 80     # 音訊大小上限（約 50 分鐘 128kbps）
 
 SHOWS = [
@@ -312,7 +311,8 @@ def main():
     print("=" * 60)
 
     state        = load_state()
-    cutoff       = datetime.datetime.now(TW_TZ) - datetime.timedelta(days=MAX_BACKLOG_DAYS)
+    now_tw       = datetime.datetime.now(TW_TZ)
+    today_start  = now_tw.replace(hour=0, minute=0, second=0, microsecond=0)
     any_new      = False
     show_statuses = []   # [(name, status_str), ...]
 
@@ -333,7 +333,8 @@ def main():
         for entry in entries:
             ep_id   = get_episode_id(entry)
             pub_dt  = parse_entry_date(entry)
-            if ep_id and ep_id not in seen and pub_dt >= cutoff:
+            # 只處理「今天」發布且尚未處理過的集數
+            if ep_id and ep_id not in seen and pub_dt >= today_start:
                 new_eps.append(entry)
 
         new_eps = new_eps[:MAX_NEW_PER_SHOW]
@@ -341,8 +342,8 @@ def main():
         if not new_eps:
             latest_title = getattr(entries[0], "title", "?")[:40] if entries else "?"
             latest_date  = parse_entry_date(entries[0]).strftime("%m/%d") if entries else ""
-            print(f"  ✅ 無新集數（最新：{latest_title}）")
-            show_statuses.append((name, f"✅ 無新集數　最新：{latest_title}（{latest_date}）"))
+            print(f"  ✅ 今日無新增內容（最新：{latest_title}）")
+            show_statuses.append((name, f"📭 今日無新增內容　最新：{latest_title}（{latest_date}）"))
             continue
 
         print(f"  🆕 {len(new_eps)} 集新集數")
