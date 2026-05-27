@@ -118,6 +118,27 @@ def load_watchlist(path: str = None) -> list:
 WATCHLIST = load_watchlist()
 
 # ─────────────────────────────────────────────────────────────
+# AI 動態選股候選池（0050 / 00878 共同大市值成分股）
+# ─────────────────────────────────────────────────────────────
+CANDIDATE_STOCKS = [
+    {"symbol": "2330.TW", "name": "台積電"},      # 半導體龍頭
+    {"symbol": "2317.TW", "name": "鴻海"},        # AI伺服器供應鏈
+    {"symbol": "2454.TW", "name": "聯發科"},      # IC設計/AI邊緣
+    {"symbol": "2382.TW", "name": "廣達"},        # AI伺服器
+    {"symbol": "2308.TW", "name": "台達電"},      # 電源/散熱
+    {"symbol": "2881.TW", "name": "富邦金"},      # 金融龍頭
+    {"symbol": "2882.TW", "name": "國泰金"},      # 金融
+    {"symbol": "2891.TW", "name": "中信金"},      # 金融
+    {"symbol": "2412.TW", "name": "中華電"},      # 電信/防禦
+    {"symbol": "6669.TW", "name": "緯穎"},        # AI伺服器
+    {"symbol": "2376.TW", "name": "技嘉"},        # AI主機板
+    {"symbol": "3711.TW", "name": "日月光投控"},  # 封裝測試
+    {"symbol": "2303.TW", "name": "聯電"},        # 晶圓代工
+    {"symbol": "2002.TW", "name": "中鋼"},        # 鋼鐵/傳產
+    {"symbol": "2609.TW", "name": "陽明"},        # 航運
+]
+
+# ─────────────────────────────────────────────────────────────
 # 時段判斷
 # ─────────────────────────────────────────────────────────────
 
@@ -503,6 +524,146 @@ import json as _json_module
 # 讓金十解析用 json
 json = _json_module
 
+# ─────────────────────────────────────────────────────────────
+# 類股 / 板塊強弱數據
+# ─────────────────────────────────────────────────────────────
+
+def fetch_tw_sectors() -> list:
+    """抓取台股各類股代表股漲跌幅，依漲跌排序"""
+    TW_SECTOR_STOCKS = [
+        ("2330.TW", "半導體"),
+        ("2317.TW", "電子/AI供應鏈"),
+        ("2454.TW", "IC設計"),
+        ("2382.TW", "AI伺服器"),
+        ("2882.TW", "金融"),
+        ("2609.TW", "航運"),
+        ("1301.TW", "傳產/石化"),
+    ]
+    result = []
+    for sym, name in TW_SECTOR_STOCKS:
+        q = fetch_yahoo(sym, name)
+        if q.get("price") != "N/A":
+            pct_str = q.get("pct", "0%")
+            try:
+                pct_f = float(pct_str.replace("%", "").replace("+", ""))
+            except Exception:
+                pct_f = 0.0
+            result.append({
+                "name": name, "symbol": sym,
+                "pct": pct_str, "pct_f": pct_f,
+                "emoji": q.get("emoji", "⚪"),
+            })
+        time.sleep(0.15)
+    return sorted(result, key=lambda x: x["pct_f"], reverse=True)
+
+
+def fetch_us_sectors() -> list:
+    """抓取美股各板塊 ETF (SPDR) 漲跌幅，依漲跌排序"""
+    US_SECTOR_ETFS = [
+        ("XLK",  "科技"),
+        ("XLC",  "通訊服務"),
+        ("XLE",  "能源"),
+        ("XLF",  "金融"),
+        ("XLV",  "醫療保健"),
+        ("XLI",  "工業"),
+        ("XLY",  "非必需消費"),
+        ("XLP",  "必需消費"),
+        ("XLB",  "材料"),
+        ("XLRE", "房地產"),
+    ]
+    result = []
+    for etf, name in US_SECTOR_ETFS:
+        q = fetch_yahoo(etf, name)
+        if q.get("price") != "N/A":
+            pct_str = q.get("pct", "0%")
+            try:
+                pct_f = float(pct_str.replace("%", "").replace("+", ""))
+            except Exception:
+                pct_f = 0.0
+            result.append({
+                "name": name, "symbol": etf,
+                "pct": pct_str, "pct_f": pct_f,
+                "emoji": q.get("emoji", "⚪"),
+            })
+        time.sleep(0.15)
+    return sorted(result, key=lambda x: x["pct_f"], reverse=True)
+
+
+def format_sectors_text(sectors: list) -> str:
+    """排序後格式化為 prompt 用文字"""
+    if not sectors:
+        return "（數據未取得）"
+    return "\n".join(
+        f"  {s['emoji']} {s['name']}（{s['symbol']}）：{s['pct']}"
+        for s in sectors
+    )
+
+# ─────────────────────────────────────────────────────────────
+# AI & AI Agent 全球新聞
+# ─────────────────────────────────────────────────────────────
+
+RSS_AI_FEEDS = [
+    "https://news.google.com/rss/search?q=AI+artificial+intelligence+AGI+breakthrough&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=OpenAI+Anthropic+Google+AI+agent&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=AI+robot+LLM+invention+2025&hl=en-US&gl=US&ceid=US:en",
+    "https://feeds.arstechnica.com/arstechnica/index",
+]
+
+def fetch_ai_news(session_info: dict) -> list:
+    """抓取 AI & AI Agent 全球最新動態新聞"""
+    all_articles, seen_titles = [], set()
+    for url in RSS_AI_FEEDS:
+        for a in fetch_rss(url, limit=10):
+            key = re.sub(r"\s+", "", a["title"].lower())[:30]
+            if key not in seen_titles:
+                seen_titles.add(key)
+                all_articles.append(a)
+        time.sleep(0.3)
+    ai_keywords = [
+        "ai", "artificial intelligence", "llm", "gpt", "claude", "gemini", "agent",
+        "robot", "openai", "deepmind", "anthropic", "chatgpt", "copilot",
+        "inference", "foundation model", "generative", "nvidia", "automation",
+    ]
+    relevant = [a for a in all_articles if any(kw in a["title"].lower() for kw in ai_keywords)]
+    other    = [a for a in all_articles if a not in relevant]
+    result   = (relevant + other)
+    result.sort(key=lambda x: x["pub_dt"] or datetime.datetime.min.replace(tzinfo=TW_TZ), reverse=True)
+    print(f"  AI新聞：取得 {len(result)} 篇（AI相關 {len(relevant)} 篇）")
+    return result[:12]
+
+
+def analyze_ai_news(articles: list, session_info: dict) -> str:
+    """AI & AI Agent 全球動態分析"""
+    if not articles:
+        return ""
+    prompt = f"""你是一位 AI 科技趨勢分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
+
+【本時段 AI & AI Agent 全球最新動態】
+{build_news_text(articles)}
+
+**撰寫規則（必須遵守）：**
+- 必須說出具體公司名稱、產品名稱、技術名稱，不可說「某AI公司」
+- 每個分析點說明「這代表什麼、對誰有什麼具體影響、影響程度如何」
+- 禁止泛說「AI持續進步」，要說「哪個具體能力提升、可做到什麼新事情」
+- 台灣受益股必須帶代號與具體邏輯，不只是舉例
+
+請以繁體中文撰寫（700字以內）：
+
+## 🚀 今日重大突破 / 新發布
+（最重要 1-3 個技術突破或產品發布：是什麼、技術意義、實際應用影響各一句）
+
+## 🤖 AI Agent 最新動態
+（Agent 新能力或部署進展；重點說明「能做到之前做不到的什麼事」）
+
+## 💼 商業化 & 產業衝擊
+（最快受益的公司或產業；哪些需求被創造、哪些被取代，要具體）
+
+## 📈 台灣科技股啟示
+（直接點出最受益的台灣相關股票，帶代號，一句話說明受益邏輯）
+
+> ⚠️ AI 生成，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1200)
+
 RSS_FEEDS = {
     "tw": [
         "https://news.cnyes.com/rss/cat/tw_stock",
@@ -603,45 +764,82 @@ def build_news_text(articles: list, limit: int = 12) -> str:
         lines.append(line)
     return "\n".join(lines) if lines else "（本時段暫無新聞）"
 
-def analyze_tw_news(articles, session_info, market_data) -> str:
+def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = "") -> str:
     twii = market_data.get("twii", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
+    sector_block = f"\n【台股類股今日強弱（代表股漲跌，由強至弱）】\n{tw_sectors_text}" if tw_sectors_text else ""
     prompt = f"""你是一位資深台股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{wknd}
 
 【台灣加權指數】{fmt_quote(twii) if twii else 'N/A'}
+{sector_block}
 
 【本時段台股重大新聞】
 {build_news_text(articles)}
 
-請以繁體中文撰寫台股分析日報：
-1. **市場概況**（2-3句）
-2. **重點個股利多/利空分析**（Markdown 表格：| 個股名稱（代號） | 方向 | 關鍵事件 | 影響評估 |，至少 3-5 檔）
-3. **類股動態**（表格：| 類股 | 趨勢 | 主要驅動因素 |）
-4. **操作建議**（2-3點，每點以 • 開頭）
-5. **風險提示**（1-2句）"""
+**撰寫規則（必須遵守）：**
+- 每個論點必須帶具體數字（漲跌幅、成交量、價格、日期）或特定事件（法說、財報、政策）
+- 領漲/領跌族群必須直接引用上方類股的實際漲跌幅數據，不可用臆測取代
+- 禁止空話（「市場情緒偏多」「資金面寬鬆」等不帶數字的模糊說法不被接受）
+- 個股表格每欄都要有實質內容，不可留白或寫「待觀察」
+
+請以繁體中文撰寫台股分析日報（1000字以內）：
+
+**📊 大盤概況**
+加權指數 {fmt_quote(twii) if twii else 'N/A'}，一句點出量能狀況與今日核心驅動事件。
+
+**💹 領漲 / 領跌族群**（依上方類股漲跌幅排序）
+• 🏆 強勢族群（前 2-3 名）：族群名稱 ＋ 漲幅 ＋ 一句說明核心驅動
+• 📉 弱勢族群（後 1-2 名）：族群名稱 ＋ 跌幅 ＋ 一句說明壓力來源
+
+**📌 重點個股分析**（Markdown 表格）
+| 個股（代號） | 今日表現 | 關鍵事件 | 影響評估（利多🟢／利空🔴／中性⚪） |
+（至少 4-5 檔，直接引用新聞中的具體事件與數字）
+
+**💡 操作建議**（3點，每點以 • 開頭）
+每點需包含：適用標的 ／ 進場條件 ／ 目標 ／ 停損參考
+
+**⚠️ 主要風險**（1-2句，說明具體的觸發條件，不是泛泛說「注意風險」）"""
     return claude_call(prompt, max_tokens=1800)
 
-def analyze_us_news(articles, session_info, market_data) -> str:
+def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "") -> str:
     dji  = market_data.get("dji",  {})
     ixic = market_data.get("ixic", {})
     gspc = market_data.get("gspc", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
+    sector_block = f"\n【S&P 500 板塊 ETF 今日漲跌（由強至弱）】\n{us_sectors_text}" if us_sectors_text else ""
     prompt = f"""你是一位資深美股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{wknd}
 
-【美股大盤】
-- 道瓊：{fmt_quote(dji) if dji else 'N/A'}
-- 納斯達克：{fmt_quote(ixic) if ixic else 'N/A'}
-- S&P 500：{fmt_quote(gspc) if gspc else 'N/A'}
+【美股三大指數】
+道瓊：{fmt_quote(dji) if dji else 'N/A'} ／ 納斯達克：{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P 500：{fmt_quote(gspc) if gspc else 'N/A'}
+{sector_block}
 
 【本時段美股重大新聞】
 {build_news_text(articles)}
 
-請以繁體中文撰寫美股分析日報：
-1. **市場概況**（2-3句）
-2. **重點個股利多/利空分析**（Markdown 表格，至少 3-5 檔）
-3. **產業板塊輪動**（表格：| 板塊 | 表現 | 主要驅動因素 |）
-4. **Fed 政策與總經觀察**（2-3句）
-5. **操作建議**（2-3點，每點以 • 開頭）"""
+**撰寫規則（必須遵守）：**
+- 板塊輪動分析必須直接引用上方板塊 ETF 的實際漲跌幅，不可只說「科技股上漲」
+- 每個論點帶具體數字（財報EPS、指數點位、漲跌幅、Fed利率點陣圖數字等）
+- 個股分析必須有具體事件驅動（不接受「基本面良好」這類空話）
+- 帶數字的操作建議：目標價位 or 關鍵技術支撐
+
+請以繁體中文撰寫美股分析日報（1000字以內）：
+
+**📊 大盤概況**
+三大指數今日表現，一句說明核心驅動事件（是財報、Fed、地緣、技術突破還是其他）。
+
+**🏆 領漲 / 領跌板塊**（依上方板塊 ETF 漲跌幅排序）
+• 強勢板塊（前 2-3 名）：板塊名稱（ETF代號 X%）＋ 一句說明核心驅動
+• 弱勢板塊（後 1-2 名）：板塊名稱（ETF代號 X%）＋ 一句說明壓力來源
+
+**📌 重點個股分析**（Markdown 表格）
+| 個股（代號） | 今日表現 | 關鍵事件（財報/消息/政策） | 影響評估（利多🟢／利空🔴） |
+（至少 4-5 檔，每欄填具體內容）
+
+**🏦 Fed & 總經觀察**
+（必須結合最新新聞，不可憑空說「市場預期降息」，要說「哪個數據/聲明導致市場重新定價」）
+
+**💡 操作建議**（3點，每點以 • 開頭）
+每點需包含：適用板塊或個股 ／ 進場觸發條件 ／ 目標或停損"""
     return claude_call(prompt, max_tokens=1800)
 
 def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
@@ -746,74 +944,144 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
 
-    prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析。
+    prompt = f"""你是一位資深股票分析師，請根據以下**實際數據**進行深度分析。
 
-{stale_note}【股票資訊】
-- 名稱：{name}（{symbol}）
-- 最新價格：{quote.get('price', 'N/A')} {quote.get('currency', '')}
-- 漲跌幅：{quote.get('pct', 'N/A')}（{quote.get('change', 'N/A')}）
-- {price_history}
+{stale_note}【股票基本資訊】
+名稱：{name}（{symbol}）
+現價：{quote.get('price', 'N/A')} {quote.get('currency', '')}　漲跌：{quote.get('change', 'N/A')}（{quote.get('pct', 'N/A')}）
+{price_history}
 
-【技術指標（實際計算值）】
+【技術指標（實際計算值，請直接引用這些數值進行分析，不可泛泛而談）】
 {indicators_text}
 
-【近期相關新聞（多方查證）】
+【近期相關新聞】
 {news_ctx if news_ctx else '（暫無相關新聞）'}
 
-請以繁體中文撰寫分析報告（900 字以內），依據上方**實際技術指標數值**進行判斷，不要憑空猜測：
+**撰寫規則（必須遵守）：**
+- 技術指標分析每一項都要帶入上方的**實際數值**，例如「RSI = 68.3，接近超買」而非「RSI偏高」
+- 目標價與停損點必須說明依據（例如前高/前低/均線位置/壓力支撐）
+- 每個論點禁止使用空話（「基本面良好」「市場看好」這類不帶數據的描述不被接受）
+- 新聞分析要說明「這個消息對本股的具體影響方向與幅度」
 
-📊 **近期走勢**（2-3句，說明目前價格與均線關係）
+請以繁體中文撰寫（800字以內）：
 
-🔍 **技術面分析**
-- 均線多空排列與趨勢
-- MACD 動能（依據實際數值判斷多空）
-- RSI 位置與超買超賣
-- KDJ 訊號（是否出現交叉）
-- 乖離率（是否過度偏離）
-- 成交量狀況（量能配合度）
-- 融資券動向（若有台股資料）：融資增減意涵、融券回補壓力
-- 三大法人動向（若有台股資料）：外資/投信/自營商買賣超判讀
+**📊 近期走勢**（2句：目前價格位置 + 最近5日方向變化）
 
-📰 **基本面亮點**（結合近期新聞，2-3點）
+**🔍 技術面解析**（每項必須帶指標實際數值）
+• 均線：MA5 / MA20 數值比較 → 多空排列現況與趨勢方向
+• MACD：MACD 線 / 訊號線 / 柱狀體數值 → 動能擴散或收斂
+• RSI：實際數值 → 超買（>70）/ 超賣（<30）/ 中性，信號意涵
+• KD：K 值 / D 值 → 是否黃金/死亡交叉，位置判讀
+• 成交量：今日量能 vs 均量 → 放量/縮量 + 量價配合度
+• 法人/融資（台股）：三大法人買賣超方向、融資增減趨勢
 
-🎯 **短期預測（1-2週）**
-- 目標價區間：...
-- 可能走向：...
+**📰 消息面重點**（條列 1-3 則最相關新聞，說明對本股的具體影響）
 
-💡 **操作建議**
-- 多方進場條件：...
-- 空方或觀望條件：...
-- 停損參考：...
+**🎯 短期展望（1-2週）**
+• 多方情境：目標 XXX 元（依據：XXX 技術位 / XXX 均線）
+• 空方情境：跌破 XXX 元需留意（依據：XXX 支撐 / XXX 訊號）
 
-⚠️ 本報告由 AI 生成，僅供參考，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1400)
+**💡 操作建議**
+• 積極進場：觸發條件 XXX，目標 XXX 元
+• 停損設置：XXX 元（依據：前低 / 均線 / 關鍵支撐）
+
+> ⚠️ AI 生成，僅供參考，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1500)
+
+def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:
+    """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔"""
+    cand_list = "\n".join([f"- {s['name']}（{s['symbol']}）" for s in candidates])
+    prompt = f"""你是一位台股選股專家。現在是台灣時間 {now_str()}。
+
+【今日盤面概況（0050/00878 成分股快照）】
+{market_ctx}
+
+【候選股清單（0050 / 00878 重要成分股）】
+{cand_list}
+
+任務：從上方清單挑選今日最值得深度追蹤的 **2-3 檔** 個股。
+
+選股優先順序：
+1. 今日有明顯題材或催化劑（法說、財報、重大新聞、訂單）
+2. 技術面處於關鍵突破或回測位置
+3. 與當日市場主旋律最相關的族群領頭羊
+
+**只輸出以下格式，不加任何其他文字：**
+PICK:代號|原因（一句話，帶具體數字或事件）
+
+範例：
+PICK:2330.TW|CoWoS需求持續爆單，本周站穩1000元關鍵支撐
+PICK:2382.TW|GB200出貨加速，AI伺服器族群今日領漲3.2%"""
+    response = claude_call(prompt, max_tokens=300)
+    picks = []
+    for line in response.split("\n"):
+        line = line.strip()
+        if line.startswith("PICK:"):
+            try:
+                parts = line[5:].split("|", 1)
+                symbol = parts[0].strip()
+                reason = parts[1].strip() if len(parts) > 1 else ""
+                match = next((c for c in candidates if c["symbol"] == symbol), None)
+                if match:
+                    picks.append({**match, "ai_reason": reason})
+            except Exception:
+                pass
+    if not picks:  # fallback：AI 解析失敗就取前兩名
+        picks = [{**c, "ai_reason": "AI 精選"} for c in candidates[:2]]
+    return picks[:3]
+
 
 def run_watchlist_report():
     """執行自選股日報（每日 22:00）"""
-    # 重新讀取最新的 watchlist.txt（讓用戶修改後立即生效）
-    watchlist = load_watchlist()
+    watchlist = load_watchlist()  # 固定項目（^TWII 加權指數）
 
-    print(f"\n📈 執行自選股分析（共 {len(watchlist)} 檔）...")
+    print(f"\n📈 自選股分析 — 固定 {len(watchlist)} 檔 + AI 動態精選...")
     session_info  = get_session_info()
     ts            = now_str()
-    weekend_banner= "（週末版 — 數據為上次交易日）" if is_weekend() else ""
+    weekend_banner = "（週末版 — 數據為上次交易日）" if is_weekend() else ""
+
+    # ── AI 動態選股：快速抓候選股行情後由 Claude 選 2-3 檔 ──
+    print("  🤖 AI 從候選股動態選股中...")
+    market_lines = []
+    for s in CANDIDATE_STOCKS:
+        q = fetch_yahoo(s["symbol"], s["name"])
+        if q.get("price") != "N/A":
+            market_lines.append(f"{s['name']}（{s['symbol']}）：{fmt_quote(q)}")
+        time.sleep(0.15)
+
+    market_ctx = "\n".join(market_lines) if market_lines else "（行情暫時無法取得）"
+    ai_picks   = ai_pick_watchlist(CANDIDATE_STOCKS, market_ctx)
+    print(f"  AI 精選：{', '.join([p['name'] for p in ai_picks])}")
+
+    # 合併清單（固定 + AI 精選，去重）
+    fixed_syms = {w["symbol"] for w in watchlist}
+    full_list  = list(watchlist) + [p for p in ai_picks if p["symbol"] not in fixed_syms]
+
+    picks_desc = "\n".join([
+        f"• **{p['name']}（{p['symbol']}）** — {p.get('ai_reason', 'AI 精選')}"
+        for p in ai_picks
+    ])
 
     send_embed(DISCORD_WATCHLIST, {
         "title":       f"📊 自選股日報 {session_info['emoji']} {session_info['label']} {weekend_banner}| {ts}",
-        "description": f"**時段：** {session_info['period']}\n共 **{len(watchlist)}** 檔自選股，由 Claude AI 生成，不構成投資建議。",
-        "color":       0xF39C12,
-        "footer":      {"text": "資料來源：Yahoo Finance + Google News + Claude AI"},
+        "description": (
+            f"**時段：** {session_info['period']}\n"
+            f"固定追蹤 **{len(watchlist)}** 檔 ＋ AI 精選 **{len(ai_picks)}** 檔\n\n"
+            f"**🤖 今日 AI 精選理由：**\n{picks_desc}\n\n"
+            f"由 Claude AI 生成，不構成投資建議。"
+        ),
+        "color":  0xF39C12,
+        "footer": {"text": "資料來源：Yahoo Finance + Google News + Claude AI"},
     })
     time.sleep(1.2)
 
-    for stock in watchlist:
+    for stock in full_list:
         symbol = stock["symbol"]
         name   = stock["name"]
         print(f"  分析 {name}（{symbol}）...")
 
         quote    = fetch_yahoo(symbol, name)
         print(f"  價格：{fmt_quote(quote)}")
-
         news_ctx = fetch_stock_news(symbol, name)
         time.sleep(0.5)
 
@@ -821,9 +1089,10 @@ def run_watchlist_report():
         time.sleep(1)
 
         stale_tag = " ⚠️未更新" if quote.get("stale") else ""
+        ai_tag    = f"\n> 🤖 AI 精選理由：{stock.get('ai_reason', '')}" if stock.get("ai_reason") else ""
         send_discord_message(
             DISCORD_WATCHLIST,
-            f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — {quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}\n\n{analysis}"
+            f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — {quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}{ai_tag}\n\n{analysis}"
         )
         time.sleep(1.5)
 
@@ -987,13 +1256,25 @@ def run_report():
     else:
         print("\n⚠️  未設定 JIN10_TOKEN，跳過金十數據")
 
+    # 3c. 類股強弱數據
+    print("\n📊 抓取類股強弱數據...")
+    tw_sectors      = fetch_tw_sectors()
+    us_sectors      = fetch_us_sectors()
+    tw_sectors_text = format_sectors_text(tw_sectors)
+    us_sectors_text = format_sectors_text(us_sectors)
+    print(f"  台股類股：{len(tw_sectors)} 個 | 美股板塊：{len(us_sectors)} 個")
+
+    # 3d. AI & AI Agent 全球新聞
+    print("\n🤖 抓取 AI & AI Agent 全球新聞...")
+    ai_news = fetch_ai_news(session_info)
+
     # 4. Claude 分析
     print("\n🤖 Claude AI 分析中...")
     print("  分析台股...")
-    tw_analysis     = analyze_tw_news(tw_news,     session_info, market_data)
+    tw_analysis     = analyze_tw_news(tw_news,     session_info, market_data, tw_sectors_text)
     time.sleep(1)
     print("  分析美股...")
-    us_analysis     = analyze_us_news(us_news,     session_info, market_data)
+    us_analysis     = analyze_us_news(us_news,     session_info, market_data, us_sectors_text)
     time.sleep(1)
     print("  分析國際...")
     jin10_prompt_text = build_jin10_text(jin10_flash_items, jin10_calendar_items)
@@ -1099,6 +1380,25 @@ def run_report():
             time.sleep(1.2)
         if jin10_analysis:
             send_discord_message(DISCORD_GLOBAL, f"## 🤖 Claude AI 金十數據分析 — {session_tag}\n\n{jin10_analysis}")
+
+    # AI & AI Agent 全球新聞（附在國際頻道）
+    if ai_news:
+        time.sleep(1.2)
+        ai_news_links = build_news_links(ai_news, limit=8)
+        send_embed(DISCORD_GLOBAL, {
+            "title":  f"🤖 AI & AI Agent 全球動態 | {ts}",
+            "color":  0xE74C3C,
+            "fields": [{"name": "🔗 最新 AI 新聞", "value": truncate(ai_news_links), "inline": False}],
+            "footer": {"text": "資料來源：Google News / Ars Technica"},
+        })
+        time.sleep(1.2)
+        print("  分析 AI & AI Agent 新聞...")
+        ai_analysis_result = analyze_ai_news(ai_news, session_info)
+        if ai_analysis_result:
+            send_discord_message(
+                DISCORD_GLOBAL,
+                f"## 🤖 Claude AI — AI & AI Agent 全球趨勢 — {session_tag}\n\n{ai_analysis_result}"
+            )
 
     # 7. 自選股（只在 22:00 盤後執行）
     if session_info["label"] == "盤後晚報":

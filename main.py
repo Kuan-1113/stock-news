@@ -38,6 +38,10 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GITHUB_PAT        = os.environ.get("GITHUB_PAT", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPO", "Kuan-1113/stock-news")
+# 查詢指令限制頻道（只有此頻道可使用 /查股 /查權證 /分析權證）
+# 設定方法：Discord 開啟開發者模式 → 右鍵頻道 → 複製頻道 ID → 填入 QUERY_CHANNEL_ID
+# 留空 = 所有頻道都開放查詢
+QUERY_CHANNEL_ID  = os.environ.get("QUERY_CHANNEL_ID", "")
 
 import pytz
 TW_TZ = pytz.timezone("Asia/Taipei")
@@ -342,6 +346,12 @@ def _split_messages(text: str, limit: int = 1900) -> list[str]:
         chunks.append(cur)
     return chunks
 
+def _is_query_channel(interaction: discord.Interaction) -> bool:
+    """檢查是否在允許查詢的頻道（未設定 QUERY_CHANNEL_ID 則允許全部）"""
+    if not QUERY_CHANNEL_ID:
+        return True
+    return str(interaction.channel_id) == QUERY_CHANNEL_ID
+
 @tree.command(name="查股", description="查詢股票即時行情與 AI 深度分析")
 @app_commands.describe(
     symbol="股票代碼（台股：2330.TW｜美股：NVDA｜指數：^TWII）",
@@ -349,6 +359,10 @@ def _split_messages(text: str, limit: int = 1900) -> list[str]:
 )
 async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = ""):
     print(f"⚡ /查股 收到：{symbol}", flush=True)
+    if not _is_query_channel(interaction):
+        await interaction.response.send_message(
+            "⚠️ 此頻道不開放查詢功能，請前往指定頻道使用 /查股。", ephemeral=True)
+        return
     try:
         await interaction.response.defer()
     except discord.errors.NotFound:
@@ -511,6 +525,10 @@ def _do_warrant_analyze(warrant_code: str) -> str:
 @app_commands.describe(stock="股票代碼或中文名（例：2330 或 台積電）")
 async def cmd_查權證(interaction: discord.Interaction, stock: str):
     print(f"⚡ /查權證 收到：{stock}", flush=True)
+    if not _is_query_channel(interaction):
+        await interaction.response.send_message(
+            "⚠️ 此頻道不開放查詢功能，請前往指定頻道使用 /查權證。", ephemeral=True)
+        return
     try:
         await interaction.response.defer()
     except discord.errors.NotFound:
@@ -539,6 +557,10 @@ async def cmd_查權證(interaction: discord.Interaction, stock: str):
 @app_commands.describe(code="權證代號（例：038542）")
 async def cmd_分析權證(interaction: discord.Interaction, code: str):
     print(f"⚡ /分析權證 收到：{code}", flush=True)
+    if not _is_query_channel(interaction):
+        await interaction.response.send_message(
+            "⚠️ 此頻道不開放查詢功能，請前往指定頻道使用 /分析權證。", ephemeral=True)
+        return
     try:
         await interaction.response.defer()
     except discord.errors.NotFound:
