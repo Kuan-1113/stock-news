@@ -73,7 +73,9 @@ def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
         )
         if r.status_code == 200:
             return r.json()["content"][0]["text"].strip()
-        return f"AI 分析暫時無法使用（HTTP {r.status_code}）"
+        err_detail = r.text[:300] if r.text else "(no body)"
+        print(f"❌ Claude API {r.status_code}：{err_detail}", flush=True)
+        return f"AI 分析暫時無法使用（HTTP {r.status_code}）\n`{err_detail[:150]}`"
     except Exception as e:
         return f"AI 分析暫時無法使用（{str(e)[:80]}）"
 
