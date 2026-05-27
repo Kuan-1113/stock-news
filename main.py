@@ -369,7 +369,7 @@ def _do_warrant_search(stock_input: str) -> str:
 
 ⚠️ AI 生成，不構成投資建議。"""
 
-    analysis = _claude_call(prompt, max_tokens=1200)
+    analysis = _claude_call(prompt, max_tokens=2000)
     header = f"## 🔍 {zh_name}（{code}）認購權證推薦 | {now_str()}\n\n"
     return header + analysis
 
@@ -427,7 +427,7 @@ def _do_warrant_analyze(warrant_code: str) -> str:
 
 ⚠️ AI 生成，不構成投資建議。"""
 
-    analysis = _claude_call(prompt, max_tokens=1400)
+    analysis = _claude_call(prompt, max_tokens=2200)
     header = f"## 🎯 權證 `{warrant_code.upper()}` 深度分析 | {now_str()}\n\n"
     return header + analysis
 
