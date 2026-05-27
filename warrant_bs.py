@@ -192,3 +192,54 @@ def full_calc(S: float, K: float, days: int, w_price: float,
     result["anomaly"] = "、".join(flags) if flags else ""
 
     return result
+
+
+# ── 綜合評級 ──────────────────────────────────────────────────────
+
+def calc_grade(bs_result: dict, days: int = 0) -> tuple[str, str]:
+    """
+    綜合評級，回傳 (grade, label)。
+    grade: "A+" / "A" / "B" / "C" / "D"
+    label: 含 emoji 的說明文字
+    """
+    score = 0
+    prem    = bs_result.get("premium_pct")
+    delta   = bs_result.get("delta")
+    lev     = bs_result.get("leverage")
+    anomaly = bs_result.get("anomaly", "")
+
+    # 溢價率（越低越好；0~5% 最理想）
+    if prem is not None:
+        if  -2 <= prem <=  5: score += 30
+        elif 5 < prem <= 10:  score += 15
+        elif 10 < prem <= 20: score +=  5
+        elif prem > 30:       score -= 20
+        elif prem < -5:       score -= 15
+
+    # Delta（認購 0.3~0.65 最佳；過深價內或極度價外均不佳）
+    if delta is not None:
+        d = abs(delta)
+        if   0.3 <= d <= 0.65:                       score += 25
+        elif 0.2 <= d < 0.3 or 0.65 < d <= 0.8:     score += 12
+        elif d < 0.1 or d > 0.9:                     score -= 10
+
+    # 有效槓桿（5~15 倍甜蜜點；過高風險大）
+    if lev is not None:
+        if   5  <= lev <= 15:                         score += 25
+        elif 3  <= lev <  5 or 15 < lev <= 25:       score += 10
+        elif lev > 30:                                score -= 10
+
+    # 剩餘天數
+    if   days > 180: score += 20
+    elif days >  90: score += 10
+    elif days <=  30: score -= 30
+
+    # 異常警示
+    if anomaly:
+        score -= 25
+
+    if   score >= 75: return "A+", "🟢⭐ 優選"
+    elif score >= 55: return "A",  "🟢 良好"
+    elif score >= 35: return "B",  "🟡 普通"
+    elif score >= 15: return "C",  "🟠 較差"
+    else:             return "D",  "🔴 差"

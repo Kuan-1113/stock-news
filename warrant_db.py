@@ -52,6 +52,7 @@ def init_db():
                     expiry      TEXT,
                     status      TEXT DEFAULT 'active',
                     is_anomaly  INTEGER DEFAULT 0,
+                    source      TEXT DEFAULT 'twse',
                     raw         TEXT NOT NULL,
                     updated_at  TEXT
                 );
@@ -107,6 +108,7 @@ def init_db():
             for migration in [
                 "ALTER TABLE warrant_basic ADD COLUMN status TEXT DEFAULT 'active'",
                 "ALTER TABLE warrant_basic ADD COLUMN is_anomaly INTEGER DEFAULT 0",
+                "ALTER TABLE warrant_basic ADD COLUMN source TEXT DEFAULT 'twse'",
                 "ALTER TABLE price_history ADD COLUMN iv_bs REAL",
                 "ALTER TABLE price_history ADD COLUMN delta_bs REAL",
                 "ALTER TABLE price_history ADD COLUMN premium_pct REAL",
@@ -148,9 +150,10 @@ def _meta_age_hours(key: str) -> float:
 
 # ── 基本資料 ─────────────────────────────────────────────────────
 
-def save_basic(rows: list) -> int:
+def save_basic(rows: list, source: str = "twse") -> int:
     """
-    將 t187ap37_L 整批寫入 DB。
+    將基本資料整批寫入 DB。
+    source: "twse"（t187ap37_L）或 "tpex"（tpex_warrant_issue 正規化後）
     同時建立索引欄位（und_code / expiry）方便 SQL 查詢。
     """
     if not rows:
@@ -161,8 +164,8 @@ def save_basic(rows: list) -> int:
         code = r.get("權證代號", "").strip()
         if not code:
             continue
-        und_raw = r.get("標的證券/指數", "")
-        m = re.search(r"\b(\d{4})\b", und_raw)
+        und_raw  = r.get("標的證券/指數", "")
+        m        = re.search(r"\b(\d{4,6})\b", und_raw)
         und_code = m.group(1) if m else und_raw
         records.append((
             code,
@@ -170,6 +173,7 @@ def save_basic(rows: list) -> int:
             r.get("權證類型", ""),
             und_code,
             r.get("最後交易日", ""),
+            source,
             json.dumps(r, ensure_ascii=False),
             now,
         ))
@@ -179,12 +183,15 @@ def save_basic(rows: list) -> int:
         with _conn() as c:
             c.executemany("""
                 INSERT OR REPLACE INTO warrant_basic
-                    (code, name, wtype, und_code, expiry, raw, updated_at)
-                VALUES (?,?,?,?,?,?,?)
+                    (code, name, wtype, und_code, expiry, source, raw, updated_at)
+                VALUES (?,?,?,?,?,?,?,?)
             """, records)
-            _set_meta(c, "basic_updated_at", now)
-            _set_meta(c, "basic_count", str(len(records)))
-    print(f"✅ 基本資料入庫：{len(records)} 筆", flush=True)
+            _set_meta(c, f"basic_updated_at_{source}", now)
+            _set_meta(c, f"basic_count_{source}", str(len(records)))
+            if source == "twse":   # backward compat
+                _set_meta(c, "basic_updated_at", now)
+                _set_meta(c, "basic_count", str(len(records)))
+    print(f"✅ 基本資料入庫（{source}）：{len(records)} 筆", flush=True)
     return len(records)
 
 

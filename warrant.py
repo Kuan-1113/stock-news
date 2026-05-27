@@ -230,6 +230,14 @@ def _fetch_basic_all_tpex() -> list:
                 _tpex_basic_cache["data"] = data
                 _tpex_basic_cache["ts"]   = time.time()
                 print(f"✅ TPEX 上櫃權證基本資料已載入 {len(data)} 筆", flush=True)
+                # 寫入 DB，讓 SQL 搜尋路徑也能查到上櫃權證
+                try:
+                    from warrant_db import save_basic as _save_basic
+                    threading.Thread(
+                        target=_save_basic, args=(data,), kwargs={"source": "tpex"}, daemon=True
+                    ).start()
+                except Exception:
+                    pass
                 return data
         except Exception as e:
             print(f"⚠️  TPEX 基本資料下載失敗：{e}", flush=True)
@@ -271,56 +279,83 @@ def prewarm_cache():
 
 # ── mis.twse.com.tw 即時補充資料 ─────────────────────────────────
 
+def _parse_mis_entry(m: dict) -> dict:
+    """將 MIS msgArray 單筆 dict 解析為統一格式"""
+    def _v(k):
+        val = m.get(k, "")
+        return val if val and val not in ("-", "--") else ""
+
+    live = _v("z")
+    prev = _v("y")
+
+    def _parse_book(price_str: str, vol_str: str) -> list[tuple[str, str]]:
+        ps = [p for p in price_str.split("_") if p and p not in ("-", "--")]
+        vs = [v for v in vol_str.split("_")   if v and v not in ("-", "--")]
+        return list(zip(ps[:5], vs[:5]))
+
+    bid_book = _parse_book(_v("b"), _v("g"))
+    ask_book = _parse_book(_v("a"), _v("f"))
+
+    return {
+        "price":      live or prev,
+        "prev_close": prev,
+        "open":       _v("o"),
+        "high":       _v("h"),
+        "low":        _v("l"),
+        "volume":     _v("v"),
+        "bid":        bid_book[0][0] if bid_book else "",
+        "ask":        ask_book[0][0] if ask_book else "",
+        "bid_vol":    bid_book[0][1] if bid_book else "",
+        "ask_vol":    ask_book[0][1] if ask_book else "",
+        "bid_book":   bid_book,
+        "ask_book":   ask_book,
+        "name":       m.get("n", ""),
+        "is_live":    bool(live),
+    }
+
+
+def _fetch_mis_batch(code_exchange_pairs: list[tuple[str, str]]) -> dict[str, dict]:
+    """
+    批量取得 MIS 即時行情（一次 HTTP 請求取多筆）。
+    code_exchange_pairs: [(code, exchange), ...]  exchange="tw" 或 "otc"
+    回傳 {code: mis_dict}，最多建議 40 支/批。
+    """
+    if not code_exchange_pairs:
+        return {}
+    result: dict = {}
+    BATCH = 40
+    for start in range(0, len(code_exchange_pairs), BATCH):
+        batch = code_exchange_pairs[start : start + BATCH]
+        ex_ch = "|".join(f"{ex}_{c}.tw" for c, ex in batch)
+        try:
+            r = requests.get(
+                "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+                f"?ex_ch={ex_ch}&json=1&delay=0",
+                headers=HEADERS, timeout=12,
+            )
+            if r.status_code == 200:
+                for m in r.json().get("msgArray", []):
+                    c = m.get("c", "")
+                    if c:
+                        result[c] = _parse_mis_entry(m)
+        except Exception as e:
+            print(f"MIS 批量錯誤：{e}", flush=True)
+    return result
+
+
 def _fetch_mis(code: str, exchange: str = "tw") -> dict:
     """
-    從 mis.twse.com.tw 取得即時行情（含五檔委買/委賣）
-    非交易時間 z="-"，自動退回昨收 y
+    取得單支股票/權證的 MIS 即時行情。
     exchange: "tw"（上市）或 "otc"（上櫃 TPEX）
+    非交易時間 z="-"，自動退回昨收 y。
     """
-    try:
-        r = requests.get(
-            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-            f"?ex_ch={exchange}_{code}.tw&json=1&delay=0",
-            headers=HEADERS, timeout=8,
-        )
-        if r.status_code == 200:
-            msgs = r.json().get("msgArray", [])
-            if msgs:
-                m = msgs[0]
-                def _v(k):
-                    val = m.get(k, "")
-                    return val if val and val not in ("-", "--") else ""
-
-                live = _v("z")
-                prev = _v("y")
-
-                # 解析五檔（MIS 用 "_" 分隔）
-                def _parse_book(price_str: str, vol_str: str) -> list[tuple[str, str]]:
-                    ps = [p for p in price_str.split("_") if p and p not in ("-", "--")]
-                    vs = [v for v in vol_str.split("_")   if v and v not in ("-", "--")]
-                    return list(zip(ps[:5], vs[:5]))
-
-                bid_book = _parse_book(_v("b"), _v("g"))
-                ask_book = _parse_book(_v("a"), _v("f"))
-
-                return {
-                    "price":      live or prev,
-                    "prev_close": prev,
-                    "open":       _v("o"),
-                    "high":       _v("h"),
-                    "low":        _v("l"),
-                    "volume":     _v("v"),
-                    "bid":        bid_book[0][0] if bid_book else "",   # 最佳買價
-                    "ask":        ask_book[0][0] if ask_book else "",   # 最佳賣價
-                    "bid_vol":    bid_book[0][1] if bid_book else "",
-                    "ask_vol":    ask_book[0][1] if ask_book else "",
-                    "bid_book":   bid_book,   # [(price, vol), ...]
-                    "ask_book":   ask_book,
-                    "name":       m.get("n", ""),
-                    "is_live":    bool(live),
-                }
-    except Exception as e:
-        print(f"MIS 錯誤（{code}）：{e}", flush=True)
+    result = _fetch_mis_batch([(code, exchange)])
+    if result.get(code):
+        return result[code]
+    # TWSE 嘗試失敗時自動試另一個交易所
+    if exchange == "tw":
+        result2 = _fetch_mis_batch([(code, "otc")])
+        return result2.get(code, {})
     return {}
 
 
@@ -690,19 +725,21 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
     is_live  = mis.get("is_live", False)
 
     # ── Black-Scholes 計算（IV / Greeks）────────────────────────
-    delta_s      = _delta(row)   # API 欄位（通常空白）
+    delta_s      = _delta(row)
     iv_s         = _iv(row)
     theta_s      = ""
     gamma_s      = ""
-    lev_s        = ""            # 初始化（Bug-fix：BS 成功但缺 key 時不 NameError）
+    lev_s        = ""
     prem_s       = ""
-    iv_pct_s     = ""            # IV Percentile
+    iv_pct_s     = ""
+    grade_s      = ""
     bs_ok        = False
     anomaly_flag = ""
+    bs           = {}
 
     if stock_price > 0 and curr_p and strike_s and ratio_f > 0:
         try:
-            from warrant_bs import full_calc
+            from warrant_bs import full_calc, calc_grade
             w_p = float(curr_p)
             k   = float(strike_s)
             d_i = int(days) if isinstance(days, int) else 0
@@ -711,17 +748,19 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
                 bs = full_calc(stock_price, k, d_i, w_p, ratio_f, is_call)
                 if bs:
                     if "iv" in bs:
-                        iv_s    = f"{bs['iv']:.1f}"
-                        bs_ok   = True
-                    if "delta"  in bs: delta_s = str(bs["delta"])
-                    if "theta"  in bs: theta_s = str(bs["theta"])
-                    if "gamma"  in bs: gamma_s = str(bs["gamma"])
-                    if "leverage" in bs:
-                        lev_s = f"{bs['leverage']:.2f}"
+                        iv_s  = f"{bs['iv']:.1f}"
+                        bs_ok = True
+                    if "delta"    in bs: delta_s = str(bs["delta"])
+                    if "theta"    in bs: theta_s = str(bs["theta"])
+                    if "gamma"    in bs: gamma_s = str(bs["gamma"])
+                    if "leverage" in bs: lev_s   = f"{bs['leverage']:.2f}"
                     if bs.get("premium_pct") is not None:
                         prem_s = f"{bs['premium_pct']:.2f}"
                     anomaly_flag = bs.get("anomaly", "")
-                    # IV Percentile（需歷史累積才有意義）
+                    # 綜合評級
+                    _g, _gl = calc_grade(bs, d_i)
+                    grade_s = f"{_g} {_gl}"
+                    # IV Percentile
                     if bs_ok:
                         try:
                             from warrant_db import calc_iv_percentile
@@ -793,8 +832,9 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
             a = ask_book[i] if i < len(ask_book) else ("—", "—")
             orderbook_lines.append(f"  {b[0]}×{b[1]}張  |  {a[0]}×{a[1]}張")
 
+    grade_tag = f"  【評級 {grade_s}】" if grade_s else ""
     lines = [
-        f"{prefix}**{name}**（{code}） — {wt}{status_tag}",
+        f"{prefix}**{name}**（{code}） — {wt}{status_tag}{grade_tag}",
         f"  標的：{und_n}（{und_c}）",
     ]
     if sp_str:
@@ -895,10 +935,20 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
                     key=lambda r: _score(r, vol_map, bs_cache_map),
                     reverse=True)[:top_n]
 
-    # ── 取得標的股票即時價格（tw_ 先試，無資料再試 otc_）
-    mis_s = _fetch_mis(code, exchange="tw")
+    # ── 批量 MIS：一次取標的股票 + 所有上榜權證的即時報價 ─────
+    warrant_pairs = [
+        (r.get("權證代號", ""), "otc" if r.get("_source") == "tpex" else "tw")
+        for r in ranked
+    ]
+    all_pairs = [(code, "tw")] + warrant_pairs
+    mis_batch = _fetch_mis_batch(all_pairs)
+
+    # 若上市查不到股票，補試上櫃
+    mis_s = mis_batch.get(code, {})
     if not mis_s.get("price"):
-        mis_s = _fetch_mis(code, exchange="otc")
+        otc_batch = _fetch_mis_batch([(code, "otc")])
+        mis_s = otc_batch.get(code, {})
+
     stock_price = 0.0
     try:
         stock_price = float(mis_s.get("price", 0) or 0)
@@ -907,7 +957,10 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
 
     lines = [f"**{zh_name}（{code}）認購權證前{len(ranked)}名**\n"]
     for i, row in enumerate(ranked, 1):
+        w_code = row.get("權證代號", "")
+        mis_w  = mis_batch.get(w_code, {})
         lines.append(_fmt_warrant(row, vol_map, rank=i,
+                                  mis_data=mis_w,
                                   stock_price=stock_price, stock_mis=mis_s))
         lines.append("")
     return "\n".join(lines)

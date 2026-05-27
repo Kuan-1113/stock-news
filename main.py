@@ -212,37 +212,78 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
 
 def _update_warrant_prices_bg():
     """
-    每日收盤後（16:30）批量更新曾被查詢的權證收盤價。
-    累積後可供 Delta 歷史估算使用。
+    每日收盤後（16:30）批量更新曾被查詢的權證收盤價並計算 BS。
+    使用批量 MIS 大幅降低 HTTP 請求數。
     """
-    from warrant import _fetch_basic_all
-    tracked = warrant_db.get_tracked_warrants(limit=200)
+    from warrant import _fetch_basic_all, _fetch_basic_all_tpex, _fetch_mis_batch
+    from warrant import _ratio as _get_ratio, _strike, _expiry, _wtype, _days_to_expiry
+    from warrant_bs import full_calc
+    tracked = warrant_db.get_tracked_warrants(limit=300)
     if not tracked:
         print("⏰ 收盤更新：無追蹤權證", flush=True)
         return
 
-    basic_all = _fetch_basic_all()
+    basic_all = _fetch_basic_all() + _fetch_basic_all_tpex()
     basic_map = {r.get("權證代號", ""): r for r in basic_all}
 
-    print(f"⏰ 批量更新收盤價：{len(tracked)} 檔…", flush=True)
-    ok_cnt = fail_cnt = 0
+    # 收集所有需查詢的代號（權證 + 標的）
+    warrant_pairs: list[tuple[str, str]] = []
+    stock_pairs:   list[tuple[str, str]] = []
+    seen_stocks: set = set()
+    for item in tracked:
+        code     = item["code"]
+        und_code = item["und_code"]
+        row      = basic_map.get(code, {})
+        exchange = "otc" if row.get("_source") == "tpex" else "tw"
+        warrant_pairs.append((code, exchange))
+        if und_code and und_code not in seen_stocks:
+            seen_stocks.add(und_code)
+            stock_pairs.append((und_code, "tw"))
+
+    print(f"⏰ 批量更新收盤價：{len(tracked)} 檔（批量 MIS）…", flush=True)
+    mis_w_map = _fetch_mis_batch(warrant_pairs)
+    mis_s_map = _fetch_mis_batch(stock_pairs)
+
+    ok_cnt = bs_cnt = fail_cnt = 0
     for item in tracked:
         code     = item["code"]
         und_code = item["und_code"]
         ratio_f  = item["ratio_f"] or 1.0
         try:
-            mis_w = _fetch_mis(code)
-            mis_s = _fetch_mis(und_code) if und_code else {}
+            mis_w = mis_w_map.get(code, {})
+            mis_s = mis_s_map.get(und_code, {}) if und_code else {}
             w_p = float(mis_w.get("price") or 0)
             s_p = float(mis_s.get("price") or 0)
-            if w_p > 0:
-                warrant_db.record_price(code, und_code, w_p, s_p, ratio_f)
-                ok_cnt += 1
+            if w_p <= 0:
+                fail_cnt += 1
+                continue
+
+            # 計算 BS 並存入快取
+            bs_rec: dict = {}
+            row = basic_map.get(code, {})
+            if s_p > 0 and row:
+                try:
+                    strike_s = _strike(row)
+                    days_r   = _days_to_expiry(_expiry(row))
+                    is_call  = "購" in _wtype(row)
+                    if strike_s and days_r > 0:
+                        bs_rec = full_calc(s_p, float(strike_s), days_r, w_p, ratio_f, is_call)
+                        if bs_rec:
+                            warrant_db.save_bs_cache(code, bs_rec)
+                            bs_cnt += 1
+                except Exception:
+                    pass
+
+            warrant_db.record_price(
+                code, und_code, w_p, s_p, ratio_f,
+                iv_bs=bs_rec.get("iv"), delta_bs=bs_rec.get("delta"),
+                premium_pct=bs_rec.get("premium_pct"),
+            )
+            ok_cnt += 1
         except Exception:
             fail_cnt += 1
-        time.sleep(0.3)   # 避免打爆 MIS
 
-    print(f"⏰ 收盤更新完成：成功 {ok_cnt} / 失敗 {fail_cnt}", flush=True)
+    print(f"⏰ 收盤更新完成：價格 {ok_cnt} / BS快取 {bs_cnt} / 失敗 {fail_cnt}", flush=True)
 
 
 def _daily_scheduler():
@@ -381,7 +422,7 @@ def _do_warrant_search(stock_input: str) -> str:
 **🏆 推薦排名分析**
 對每一檔逐一說明，直接帶入實際數值：
 
-**第 N 名　代號 ／ 名稱**
+**第 N 名　代號 ／ 名稱**（若有【評級】請顯示）
 > 剩 X 天　溢價 X%　槓桿 X 倍　今日成交 XXX 張
 - ✅ 優勢：（最吸引人的 2 個具體理由，帶數值）
 - ⚠️ 注意：（1-2 個風險點，帶數值）
@@ -454,7 +495,7 @@ def _do_warrant_analyze(warrant_code: str) -> str:
 （若無）直接說明「目前市場無其他同標的認購權證可供比較」，**不要製作空表格**
 
 **⭐ 綜合評級**
-以 A ／ B ／ C ／ D 四級評定此權證，並一句話說明評定理由。
+若資料顯示了【評級 A+/A/B/C/D】，直接引用並說明評定依據；否則根據以上數據自行評定 A／B／C／D，並一句話說明理由。
 
 > ⚠️ AI 生成，不構成投資建議。"""
 
