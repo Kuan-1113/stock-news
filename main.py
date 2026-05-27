@@ -47,7 +47,7 @@ def now_str():
 
 # ── 分析核心 ──────────────────────────────────────────────────
 
-def _claude_call(prompt: str, max_tokens: int = 1400) -> str:
+def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
     if not ANTHROPIC_API_KEY:
         return "⚠️ 未設定 ANTHROPIC_API_KEY"
     try:
@@ -59,11 +59,11 @@ def _claude_call(prompt: str, max_tokens: int = 1400) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=90,
+            timeout=120,
         )
         if r.status_code == 200:
             return r.json()["content"][0]["text"].strip()

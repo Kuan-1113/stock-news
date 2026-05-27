@@ -12,25 +12,31 @@ import datetime
 import requests
 
 TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/opendata"
+TPEX_OPENAPI = "https://www.tpex.org.tw/openapi/v1"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ── 快取（附 Lock 避免同時下載）──────────────────────────────────
-_basic_cache: dict   = {"data": None, "ts": 0}
-_daily_cache: dict   = {"data": None, "ts": 0}
-_vol_map_cache: dict = {"data": None, "ts": 0}   # vol_map 單獨快取
-_basic_lock          = threading.Lock()
-_daily_lock          = threading.Lock()
+_basic_cache: dict      = {"data": None, "ts": 0}
+_daily_cache: dict      = {"data": None, "ts": 0}
+_vol_map_cache: dict    = {"data": None, "ts": 0}   # vol_map 單獨快取
+_tpex_basic_cache: dict = {"data": None, "ts": 0}
+_tpex_daily_cache: dict = {"data": None, "ts": 0}
+_basic_lock             = threading.Lock()
+_daily_lock             = threading.Lock()
+_tpex_lock              = threading.Lock()
 
 
 def _get_vol_map(daily: list | None = None) -> dict:
     """
-    取得 {code: daily_row} 的 vol_map，快取 30min 避免每次重建。
+    取得 {code: daily_row} 的 vol_map（TWSE+TPEX），快取 30min 避免每次重建。
     """
     now = time.time()
     if _vol_map_cache["data"] is not None and (now - _vol_map_cache["ts"]) < 1800:
         return _vol_map_cache["data"]
-    src = daily if daily is not None else _fetch_daily()
-    vm  = {r.get("權證代號", ""): r for r in src}
+    twse_daily = daily if daily is not None else _fetch_daily()
+    tpex_daily = _fetch_daily_tpex()
+    vm = {r.get("權證代號", ""): r for r in twse_daily}
+    vm.update({r.get("權證代號", ""): r for r in tpex_daily})
     _vol_map_cache["data"] = vm
     _vol_map_cache["ts"]   = time.time()
     return vm
@@ -172,27 +178,109 @@ def _fetch_daily() -> list:
     return _daily_cache["data"] or []
 
 
+# ── TPEX（上櫃）資料 ──────────────────────────────────────────────
+
+def _normalize_tpex_basic(row: dict) -> dict:
+    """將 TPEX 權證發行基本資料正規化為 TWSE 相容格式"""
+    ratio_raw = (row.get("LatestExerciseRatio")
+                 or row.get("Latest ExerciseRatio", ""))
+    try:
+        ratio_per_k = str(round(float(ratio_raw) * 1000, 4))
+    except Exception:
+        ratio_per_k = ""
+    return {
+        "權證代號":                            row.get("Code", ""),
+        "權證簡稱":                            row.get("Name", ""),
+        "最後交易日":                          row.get("ExpiryDate", ""),
+        "最新履約價格(元)/履約指數":            row.get("LatestExercisePrice", ""),
+        "最新標的的履約配發數量(每仟單位權證)": ratio_per_k,
+        "標的證券/指數":                       row.get("UnderlyingStockCode", ""),
+        "權證類型":                            row.get("Type", ""),
+        "發行單位數量(仟單位)":                str(row.get("InitialIssuance", "")),
+        "_source":                            "tpex",
+    }
+
+
+def _normalize_tpex_daily(row: dict) -> dict:
+    """將 TPEX 每日成交資料正規化為 TWSE 相容格式"""
+    return {
+        "權證代號": row.get("Code", ""),
+        "成交張數": row.get("TradeVol.", row.get("TradeVol", "")),
+        "收盤價":   row.get("Close", ""),
+        "_source":  "tpex",
+    }
+
+
+def _fetch_basic_all_tpex() -> list:
+    """載入 TPEX 上櫃權證基本資料（記憶體快取 1h）"""
+    now = time.time()
+    if _tpex_basic_cache["data"] is not None and (now - _tpex_basic_cache["ts"]) < 3600:
+        return _tpex_basic_cache["data"]
+    with _tpex_lock:
+        if _tpex_basic_cache["data"] is not None and (time.time() - _tpex_basic_cache["ts"]) < 3600:
+            return _tpex_basic_cache["data"]
+        try:
+            r = requests.get(
+                f"{TPEX_OPENAPI}/tpex_warrant_issue",
+                headers=HEADERS, timeout=60,
+            )
+            if r.status_code == 200:
+                raw  = r.json()
+                data = [_normalize_tpex_basic(row) for row in raw if row.get("Code")]
+                _tpex_basic_cache["data"] = data
+                _tpex_basic_cache["ts"]   = time.time()
+                print(f"✅ TPEX 上櫃權證基本資料已載入 {len(data)} 筆", flush=True)
+                return data
+        except Exception as e:
+            print(f"⚠️  TPEX 基本資料下載失敗：{e}", flush=True)
+    return _tpex_basic_cache["data"] or []
+
+
+def _fetch_daily_tpex() -> list:
+    """載入 TPEX 上櫃權證每日成交資料（記憶體快取 30min）"""
+    now = time.time()
+    if _tpex_daily_cache["data"] is not None and (now - _tpex_daily_cache["ts"]) < 1800:
+        return _tpex_daily_cache["data"]
+    try:
+        r = requests.get(
+            f"{TPEX_OPENAPI}/tpex_warrant_daily_quts",
+            headers=HEADERS, timeout=30,
+        )
+        if r.status_code == 200:
+            raw  = r.json()
+            data = [_normalize_tpex_daily(row) for row in raw if row.get("Code")]
+            _tpex_daily_cache["data"] = data
+            _tpex_daily_cache["ts"]   = time.time()
+            return data
+    except Exception as e:
+        print(f"⚠️  TPEX 日成交下載失敗：{e}", flush=True)
+    return _tpex_daily_cache["data"] or []
+
+
 def prewarm_cache():
     """Bot 啟動時在背景預先下載，確保第一個使用者不需等待"""
     def _task():
         print("🔄 預熱權證快取中…", flush=True)
         _fetch_basic_all()
         _fetch_daily()
-        print("✅ 權證快取預熱完成", flush=True)
+        _fetch_basic_all_tpex()
+        _fetch_daily_tpex()
+        print("✅ 權證快取預熱完成（TWSE+TPEX）", flush=True)
     threading.Thread(target=_task, daemon=True).start()
 
 
 # ── mis.twse.com.tw 即時補充資料 ─────────────────────────────────
 
-def _fetch_mis(code: str) -> dict:
+def _fetch_mis(code: str, exchange: str = "tw") -> dict:
     """
     從 mis.twse.com.tw 取得即時行情（含五檔委買/委賣）
     非交易時間 z="-"，自動退回昨收 y
+    exchange: "tw"（上市）或 "otc"（上櫃 TPEX）
     """
     try:
         r = requests.get(
             "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-            f"?ex_ch=tw_{code}.tw&json=1&delay=0",
+            f"?ex_ch={exchange}_{code}.tw&json=1&delay=0",
             headers=HEADERS, timeout=8,
         )
         if r.status_code == 200:
@@ -756,9 +844,9 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     except Exception:
         pass
 
-    # Fallback：記憶體全量過濾（DB 尚未建立時）
+    # Fallback：記憶體全量過濾（DB 尚未建立時，含 TPEX）
     if not matched:
-        basic_all = _fetch_basic_all()
+        basic_all = _fetch_basic_all() + _fetch_basic_all_tpex()
         if not basic_all:
             return "❌ 無法取得權證基本資料，請稍後再試"
         matched = [
@@ -770,10 +858,10 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     def _wname(r):
         return r.get("權證簡稱", r.get("權證名稱", ""))
 
-    # 中文名稱 fallback（前3字）
+    # 中文名稱 fallback（前3字，含 TPEX）
     if not matched and re.search(r"[一-鿿]", zh_name):
         short = zh_name[:3]
-        basic_all = _fetch_basic_all()
+        basic_all = _fetch_basic_all() + _fetch_basic_all_tpex()
         matched = [
             r for r in basic_all
             if short in _wname(r)
@@ -807,8 +895,10 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
                     key=lambda r: _score(r, vol_map, bs_cache_map),
                     reverse=True)[:top_n]
 
-    # ── 取得標的股票即時價格（Bug-fix：讓 _fmt_warrant 能跑 BS）
-    mis_s       = _fetch_mis(code)
+    # ── 取得標的股票即時價格（tw_ 先試，無資料再試 otc_）
+    mis_s = _fetch_mis(code, exchange="tw")
+    if not mis_s.get("price"):
+        mis_s = _fetch_mis(code, exchange="otc")
     stock_price = 0.0
     try:
         stock_price = float(mis_s.get("price", 0) or 0)
@@ -827,24 +917,31 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
 
 def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     wc        = warrant_code.strip().upper()
-    basic_all = _fetch_basic_all()
+    twse_all  = _fetch_basic_all()
+    tpex_all  = _fetch_basic_all_tpex()
+    basic_all = twse_all + tpex_all
     daily     = _fetch_daily()
 
     target = next(
         (r for r in basic_all if r.get("權證代號", "").upper() == wc), None
     )
     if not target:
-        return f"❌ 找不到權證代號 `{wc}`（已查詢 {len(basic_all)} 筆）", ""
+        return (f"❌ 找不到權證代號 `{wc}`"
+                f"（已查詢 {len(twse_all)} 筆上市 + {len(tpex_all)} 筆上櫃）"), ""
 
     vol_map  = _get_vol_map(daily)
     und_code = _underlying_code(target)
 
-    # 補充即時資料：取目標權證和標的股票的 MIS 資料
-    mis_w       = _fetch_mis(wc)
+    # 補充即時資料：TPEX 用 otc_ 前綴，TWSE 用 tw_
+    w_exchange = "otc" if target.get("_source") == "tpex" else "tw"
+    mis_w       = _fetch_mis(wc, exchange=w_exchange)
     mis_s: dict = {}
     stock_price = 0.0
     if und_code:
-        mis_s = _fetch_mis(und_code)
+        # 標的股票先嘗試 tw_；若無資料再試 otc_（上櫃股）
+        mis_s = _fetch_mis(und_code, exchange="tw")
+        if not mis_s.get("price"):
+            mis_s = _fetch_mis(und_code, exchange="otc")
         sp    = mis_s.get("price", "")
         try:
             stock_price = float(sp)
