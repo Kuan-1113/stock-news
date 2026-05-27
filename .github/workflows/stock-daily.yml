@@ -12,7 +12,7 @@ on:
     # 允許手動觸發（測試用）
 
 concurrency:
-  group: stock-daily-${{ github.event.schedule || github.run_id }}
+  group: stock-daily
   cancel-in-progress: false
 
 permissions:

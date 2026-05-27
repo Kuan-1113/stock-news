@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: podcast-${{ github.event.schedule || github.run_id }}
+  group: podcast
   cancel-in-progress: false
 
 permissions:
