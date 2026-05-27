@@ -31,6 +31,8 @@ print("=== Discord Bot starting ===", flush=True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 from warrant import search_warrants, analyze_warrant, lookup_stock, prewarm_cache
+from warrant import _fetch_mis, _ratio
+import warrant_db
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -200,11 +202,44 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
 
 # ── 定時觸發日報（Railway 永遠在線，取代不可靠的 GitHub cron）────
 
+def _update_warrant_prices_bg():
+    """
+    每日收盤後（16:30）批量更新曾被查詢的權證收盤價。
+    累積後可供 Delta 歷史估算使用。
+    """
+    from warrant import _fetch_basic_all
+    tracked = warrant_db.get_tracked_warrants(limit=200)
+    if not tracked:
+        print("⏰ 收盤更新：無追蹤權證", flush=True)
+        return
+
+    basic_all = _fetch_basic_all()
+    basic_map = {r.get("權證代號", ""): r for r in basic_all}
+
+    print(f"⏰ 批量更新收盤價：{len(tracked)} 檔…", flush=True)
+    ok_cnt = fail_cnt = 0
+    for item in tracked:
+        code     = item["code"]
+        und_code = item["und_code"]
+        ratio_f  = item["ratio_f"] or 1.0
+        try:
+            mis_w = _fetch_mis(code)
+            mis_s = _fetch_mis(und_code) if und_code else {}
+            w_p = float(mis_w.get("price") or 0)
+            s_p = float(mis_s.get("price") or 0)
+            if w_p > 0:
+                warrant_db.record_price(code, und_code, w_p, s_p, ratio_f)
+                ok_cnt += 1
+        except Exception:
+            fail_cnt += 1
+        time.sleep(0.3)   # 避免打爆 MIS
+
+    print(f"⏰ 收盤更新完成：成功 {ok_cnt} / 失敗 {fail_cnt}", flush=True)
+
+
 def _daily_scheduler():
-    """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報"""
+    """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報；16:30 更新權證收盤價"""
     _triggered = set()
-    # 日報：08:00 / 15:00 / 22:00 TW
-    # Podcast：09:00 / 21:00 TW
     DAILY_HOURS   = {8: "morning", 15: "afternoon", 22: "evening"}
     PODCAST_HOURS = {9, 21}
     while True:
@@ -220,6 +255,13 @@ def _daily_scheduler():
                     ok, err = _trigger_workflow("podcast.yml", {})
                     print(f"⏰ 觸發Podcast追蹤 {'✅' if ok else f'❌ {err}'}", flush=True)
                     _triggered.add(key)
+
+            # 16:30 收盤後批量更新權證價格（Delta 累積）
+            price_key = f"price-{now.strftime('%Y-%m-%d')}"
+            if now.hour == 16 and 30 <= now.minute < 35 and price_key not in _triggered:
+                _triggered.add(price_key)
+                threading.Thread(target=_update_warrant_prices_bg, daemon=True).start()
+
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
                 _triggered.clear()
@@ -452,7 +494,8 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    prewarm_cache()  # 背景預熱權證快取，避免第一次使用者等太久
+    warrant_db.init_db()   # 建立/確認資料庫表格
+    prewarm_cache()        # 背景預熱快取（優先用 DB，DB 過期才打 API）
 
 if not DISCORD_BOT_TOKEN:
     print("❌ 未設定 DISCORD_BOT_TOKEN，Bot 無法啟動", flush=True)

@@ -22,14 +22,36 @@ _daily_lock          = threading.Lock()
 
 
 def _fetch_basic_all() -> list:
-    """下載並快取 t187ap37_L（全部權證基本資料）"""
+    """
+    載入全部權證基本資料，優先順序：
+    1. 記憶體快取（1h）
+    2. SQLite DB（24h 內更新）
+    3. TWSE API（下載後存入 DB）
+    4. SQLite DB（過期但有資料，作最後備援）
+    """
     now = time.time()
     if _basic_cache["data"] is not None and (now - _basic_cache["ts"]) < 3600:
         return _basic_cache["data"]
     with _basic_lock:
-        # 再次確認（另一個 thread 可能已下載完）
         if _basic_cache["data"] is not None and (time.time() - _basic_cache["ts"]) < 3600:
             return _basic_cache["data"]
+
+        # 嘗試從 DB 載入（24h 內更新視為有效）
+        try:
+            from warrant_db import load_basic_all, basic_age_hours, basic_count
+            age = basic_age_hours()
+            cnt = basic_count()
+            if age < 24 and cnt > 0:
+                db_data = load_basic_all()
+                if db_data:
+                    _basic_cache["data"] = db_data
+                    _basic_cache["ts"]   = time.time()
+                    print(f"✅ 從資料庫載入 {len(db_data)} 筆基本資料（{age:.1f}h 前更新）", flush=True)
+                    return db_data
+        except Exception as e:
+            print(f"⚠️  讀取DB基本資料失敗：{e}", flush=True)
+
+        # 向 TWSE API 下載
         try:
             r = requests.get(
                 f"{TWSE_OPENAPI}/t187ap37_L",
@@ -39,32 +61,75 @@ def _fetch_basic_all() -> list:
                 data = r.json()
                 _basic_cache["data"] = data
                 _basic_cache["ts"]   = time.time()
-                # 第一次載入時印出欄位名稱（用於除錯）
                 if data:
                     print(f"✅ 權證基本資料已載入 {len(data)} 筆", flush=True)
                     print(f"🔍 全部欄位：{list(data[0].keys())}", flush=True)
+                    # 存入 DB（背景執行避免阻塞）
+                    try:
+                        from warrant_db import save_basic
+                        threading.Thread(target=save_basic, args=(data,), daemon=True).start()
+                    except Exception:
+                        pass
                 return _basic_cache["data"]
         except Exception as e:
             print(f"⚠️  t187ap37_L 下載失敗：{e}", flush=True)
+
+        # 最後備援：DB 過期資料也總比沒有好
+        try:
+            from warrant_db import load_basic_all
+            stale = load_basic_all()
+            if stale:
+                print(f"⚠️  使用過期 DB 資料（{len(stale)} 筆）", flush=True)
+                _basic_cache["data"] = stale
+                _basic_cache["ts"]   = time.time()
+                return stale
+        except Exception:
+            pass
+
     return _basic_cache["data"] or []
 
 
 def _fetch_daily() -> list:
-    """下載並快取 t187ap42_L（當日成交資料）"""
+    """
+    載入每日成交資料，優先順序：
+    1. 記憶體快取（30min）
+    2. SQLite DB（4h 內更新）
+    3. TWSE API（下載後存入 DB）
+    """
     now = time.time()
     if _daily_cache["data"] is not None and (now - _daily_cache["ts"]) < 1800:
         return _daily_cache["data"]
     with _daily_lock:
         if _daily_cache["data"] is not None and (time.time() - _daily_cache["ts"]) < 1800:
             return _daily_cache["data"]
+
+        # 嘗試從 DB 載入（4h 內視為有效）
+        try:
+            from warrant_db import load_daily_today, daily_age_hours
+            if daily_age_hours() < 4:
+                db_data = load_daily_today()
+                if db_data:
+                    _daily_cache["data"] = db_data
+                    _daily_cache["ts"]   = time.time()
+                    return db_data
+        except Exception:
+            pass
+
+        # 向 TWSE API 下載
         try:
             r = requests.get(
                 f"{TWSE_OPENAPI}/t187ap42_L",
                 headers=HEADERS, timeout=30,
             )
             if r.status_code == 200:
-                _daily_cache["data"] = r.json()
+                data = r.json()
+                _daily_cache["data"] = data
                 _daily_cache["ts"]   = time.time()
+                try:
+                    from warrant_db import save_daily
+                    threading.Thread(target=save_daily, args=(data,), daemon=True).start()
+                except Exception:
+                    pass
                 return _daily_cache["data"]
         except Exception as e:
             print(f"⚠️  t187ap42_L 下載失敗：{e}", flush=True)
@@ -434,9 +499,18 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
     mis_vol  = mis.get("volume", "")
     is_live  = mis.get("is_live", False)
 
-    # Delta / IV — TWSE API 不提供，通常為空
+    # Delta / IV — TWSE API 不提供；嘗試從歷史資料庫估算
     delta_s = _delta(row)
     iv_s    = _iv(row)
+    if not delta_s:
+        try:
+            from warrant_db import calc_delta, get_history_days
+            est = calc_delta(code)
+            if est is not None:
+                days_hist = get_history_days(code)
+                delta_s = f"≈{est:.3f}（{days_hist}日估算）"
+        except Exception:
+            pass
 
     # 溢價率：優先 API，其次自算
     prem_s = _premium(row)
@@ -602,6 +676,17 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
 
     print(f"🔍 分析權證 {wc}: und_code={und_code}, stock_price={stock_price}, "
           f"warrant_price={mis_w.get('price','?')}", flush=True)
+
+    # 記錄價格快照（供 Delta 估算累積）
+    try:
+        ratio_s = _ratio(target)
+        ratio_f_rec = float(ratio_s) / 1000.0 if ratio_s else 1.0
+        w_p = float(mis_w.get("price", 0) or 0)
+        if w_p > 0 and stock_price > 0 and und_code:
+            from warrant_db import record_price
+            record_price(wc, und_code, w_p, stock_price, ratio_f_rec)
+    except Exception:
+        pass
 
     target_summary = _fmt_warrant(target, vol_map,
                                   mis_data=mis_w, stock_price=stock_price,
