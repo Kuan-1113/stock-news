@@ -57,7 +57,9 @@ JIN10_TOKEN       = os.environ.get("JIN10_TOKEN", "")
 REPORT_SESSION    = os.environ.get("REPORT_SESSION", "auto")   # morning / afternoon / evening / auto
 RUN_STATE_FILE    = "run_state.json"
 # Claude 模型名稱（可透過環境變數覆寫，避免 Anthropic 改版時需動程式碼）
-CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL",      "claude-sonnet-4-6")
+# 輕量任務（選股決策、金十摘要）使用 Haiku，費用約 1/5
+CLAUDE_MINI_MODEL = os.environ.get("CLAUDE_MINI_MODEL", "claude-haiku-4-5-20251001")
 
 DISCORD_TW       = os.environ.get("DISCORD_TW",       "https://discord.com/api/webhooks/1507952802662449152/8iumIv-Bs5PTRVlMpFXbE7wH_uzHJlLtmybTHaj1zUDxksQBZwRAOs7v69tvSOezmWnW")
 DISCORD_US       = os.environ.get("DISCORD_US",       "https://discord.com/api/webhooks/1508308789537800242/y6l377lQUOovmgh19He7wn5DlPN2_k19B2ksGVpmErCV46K-o7XSRnoXM97DDkpmglOP")
@@ -189,23 +191,28 @@ def now_str() -> str:
 # Claude AI
 # ─────────────────────────────────────────────────────────────
 
-def claude_call(prompt: str, max_tokens: int = 1500) -> str:
+def claude_call(prompt: str, max_tokens: int = 1200, model: str = None) -> str:
+    """
+    model=None        → 使用 CLAUDE_MODEL（Sonnet，深度分析）
+    model=CLAUDE_MINI → 使用 CLAUDE_MINI_MODEL（Haiku，簡單任務）
+    """
+    use_model = model or CLAUDE_MODEL
     if not ANTHROPIC_API_KEY:
         return "⚠️ 未設定 ANTHROPIC_API_KEY，AI 分析無法使用。"
     try:
-        headers = {
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": CLAUDE_MODEL,
-            "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-        }
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers=headers, json=payload, timeout=60,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": use_model,
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
         )
         if r.status_code == 200:
             return r.json()["content"][0]["text"].strip()
@@ -592,13 +599,19 @@ def fetch_us_sectors() -> list:
 
 
 def format_sectors_text(sectors: list) -> str:
-    """排序後格式化為 prompt 用文字"""
+    """排序後格式化：前3強 + 後2弱，節省 prompt token"""
     if not sectors:
         return "（數據未取得）"
-    return "\n".join(
-        f"  {s['emoji']} {s['name']}（{s['symbol']}）：{s['pct']}"
-        for s in sectors
-    )
+    top    = sectors[:3]
+    bottom = sectors[-2:] if len(sectors) > 3 else []
+    rows   = top + (["---"] if bottom else []) + bottom
+    lines  = []
+    for s in rows:
+        if s == "---":
+            lines.append("  …")
+        else:
+            lines.append(f"  {s['emoji']} {s['name']}：{s['pct']}")
+    return "\n".join(lines)
 
 # ─────────────────────────────────────────────────────────────
 # AI & AI Agent 全球新聞
@@ -638,33 +651,18 @@ def analyze_ai_news(articles: list, session_info: dict) -> str:
     """AI & AI Agent 全球動態分析"""
     if not articles:
         return ""
-    prompt = f"""你是一位 AI 科技趨勢分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
-
-【本時段 AI & AI Agent 全球最新動態】
+    prompt = f"""AI科技趨勢分析師。{now_str()}，「{session_info['label']}」。
+【AI全球動態】
 {build_news_text(articles)}
 
-**撰寫規則（必須遵守）：**
-- 必須說出具體公司名稱、產品名稱、技術名稱，不可說「某AI公司」
-- 每個分析點說明「這代表什麼、對誰有什麼具體影響、影響程度如何」
-- 禁止泛說「AI持續進步」，要說「哪個具體能力提升、可做到什麼新事情」
-- 台灣受益股必須帶代號與具體邏輯，不只是舉例
+以繁體中文寫（600字內），必帶具體公司/產品名稱，禁泛說「AI持續進步」：
 
-請以繁體中文撰寫（700字以內）：
-
-## 🚀 今日重大突破 / 新發布
-（最重要 1-3 個技術突破或產品發布：是什麼、技術意義、實際應用影響各一句）
-
-## 🤖 AI Agent 最新動態
-（Agent 新能力或部署進展；重點說明「能做到之前做不到的什麼事」）
-
-## 💼 商業化 & 產業衝擊
-（最快受益的公司或產業；哪些需求被創造、哪些被取代，要具體）
-
-## 📈 台灣科技股啟示
-（直接點出最受益的台灣相關股票，帶代號，一句話說明受益邏輯）
-
+## 🚀 重大突破/新發布（1-3個：是什麼、技術意義、應用影響各一句）
+## 🤖 AI Agent 動態（新能力或部署進展，說明能做到什麼新事）
+## 💼 商業化衝擊（受益/受衝擊的具體公司或產業）
+## 📈 台灣科技股啟示（帶代號，一句說明受益邏輯）
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1200)
+    return claude_call(prompt, max_tokens=900)
 
 RSS_FEEDS = {
     "tw": [
@@ -756,52 +754,40 @@ def fetch_all_news(category: str, session_info: dict) -> list:
 # Claude 分析 — 台股 / 美股 / 國際
 # ─────────────────────────────────────────────────────────────
 
-def build_news_text(articles: list, limit: int = 12) -> str:
+def build_news_text(articles: list, limit: int = 8) -> str:
+    """新聞條列（僅標題+時間，不帶摘要，節省 input token）"""
     lines = []
     for i, a in enumerate(articles[:limit], 1):
         pub  = a["pub_dt"].strftime("%m/%d %H:%M") if a["pub_dt"] else ""
-        line = f"{i}. [{pub}] {a['title']}"
-        if a.get("summary"):
-            line += f"\n   摘要：{a['summary'][:100]}"
-        lines.append(line)
+        lines.append(f"{i}. [{pub}] {a['title']}")
     return "\n".join(lines) if lines else "（本時段暫無新聞）"
 
 def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = "") -> str:
     twii = market_data.get("twii", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
     sector_block = f"\n【台股類股今日強弱（代表股漲跌，由強至弱）】\n{tw_sectors_text}" if tw_sectors_text else ""
-    prompt = f"""你是一位資深台股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{wknd}
+    prompt = f"""台股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
 
-【台灣加權指數】{fmt_quote(twii) if twii else 'N/A'}
+【加權指數】{fmt_quote(twii) if twii else 'N/A'}
 {sector_block}
-
-【本時段台股重大新聞】
+【台股新聞（本時段）】
 {build_news_text(articles)}
 
-**撰寫規則（必須遵守）：**
-- 每個論點必須帶具體數字（漲跌幅、成交量、價格、日期）或特定事件（法說、財報、政策）
-- 領漲/領跌族群必須直接引用上方類股的實際漲跌幅數據，不可用臆測取代
-- 禁止空話（「市場情緒偏多」「資金面寬鬆」等不帶數字的模糊說法不被接受）
-- 個股表格每欄都要有實質內容，不可留白或寫「待觀察」
+以繁體中文寫台股日報（800字內），每個論點必帶具體數字或事件，禁空話：
 
-請以繁體中文撰寫台股分析日報（1000字以內）：
+**📊 大盤概況** — 一句點出量能與核心驅動
 
-**📊 大盤概況**
-加權指數 {fmt_quote(twii) if twii else 'N/A'}，一句點出量能狀況與今日核心驅動事件。
+**💹 領漲/領跌族群** — 直接引用上方類股漲跌幅
+• 強勢（前2-3）：族群＋漲幅＋驅動一句
+• 弱勢（後1-2）：族群＋跌幅＋壓力一句
 
-**💹 領漲 / 領跌族群**（依上方類股漲跌幅排序）
-• 🏆 強勢族群（前 2-3 名）：族群名稱 ＋ 漲幅 ＋ 一句說明核心驅動
-• 📉 弱勢族群（後 1-2 名）：族群名稱 ＋ 跌幅 ＋ 一句說明壓力來源
+**📌 重點個股**（Markdown 表格，4-5檔）
+| 個股（代號） | 今日表現 | 關鍵事件 | 評估🟢🔴⚪ |
 
-**📌 重點個股分析**（Markdown 表格）
-| 個股（代號） | 今日表現 | 關鍵事件 | 影響評估（利多🟢／利空🔴／中性⚪） |
-（至少 4-5 檔，直接引用新聞中的具體事件與數字）
+**💡 操作建議**（3點，含標的/進場條件/目標/停損）
 
-**💡 操作建議**（3點，每點以 • 開頭）
-每點需包含：適用標的 ／ 進場條件 ／ 目標 ／ 停損參考
-
-**⚠️ 主要風險**（1-2句，說明具體的觸發條件，不是泛泛說「注意風險」）"""
-    return claude_call(prompt, max_tokens=1800)
+**⚠️ 主要風險**（1-2句，具體觸發條件）"""
+    return claude_call(prompt, max_tokens=1200)
 
 def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "") -> str:
     dji  = market_data.get("dji",  {})
@@ -809,40 +795,28 @@ def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = 
     gspc = market_data.get("gspc", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
     sector_block = f"\n【S&P 500 板塊 ETF 今日漲跌（由強至弱）】\n{us_sectors_text}" if us_sectors_text else ""
-    prompt = f"""你是一位資深美股分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{wknd}
+    prompt = f"""美股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
 
-【美股三大指數】
-道瓊：{fmt_quote(dji) if dji else 'N/A'} ／ 納斯達克：{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P 500：{fmt_quote(gspc) if gspc else 'N/A'}
+【三大指數】道瓊{fmt_quote(dji) if dji else 'N/A'} ／ 納指{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P{fmt_quote(gspc) if gspc else 'N/A'}
 {sector_block}
-
-【本時段美股重大新聞】
+【美股新聞（本時段）】
 {build_news_text(articles)}
 
-**撰寫規則（必須遵守）：**
-- 板塊輪動分析必須直接引用上方板塊 ETF 的實際漲跌幅，不可只說「科技股上漲」
-- 每個論點帶具體數字（財報EPS、指數點位、漲跌幅、Fed利率點陣圖數字等）
-- 個股分析必須有具體事件驅動（不接受「基本面良好」這類空話）
-- 帶數字的操作建議：目標價位 or 關鍵技術支撐
+以繁體中文寫美股日報（800字內），每論點帶數字/具體事件：
 
-請以繁體中文撰寫美股分析日報（1000字以內）：
+**📊 大盤概況** — 三大指數＋核心驅動一句
 
-**📊 大盤概況**
-三大指數今日表現，一句說明核心驅動事件（是財報、Fed、地緣、技術突破還是其他）。
+**🏆 領漲/領跌板塊** — 直接引用上方 ETF 漲跌幅
+• 強勢（前2-3）：板塊（代號 X%）＋驅動一句
+• 弱勢（後1-2）：板塊（代號 X%）＋壓力一句
 
-**🏆 領漲 / 領跌板塊**（依上方板塊 ETF 漲跌幅排序）
-• 強勢板塊（前 2-3 名）：板塊名稱（ETF代號 X%）＋ 一句說明核心驅動
-• 弱勢板塊（後 1-2 名）：板塊名稱（ETF代號 X%）＋ 一句說明壓力來源
+**📌 重點個股**（Markdown 表格，4-5檔）
+| 個股（代號） | 今日表現 | 關鍵事件 | 評估🟢🔴 |
 
-**📌 重點個股分析**（Markdown 表格）
-| 個股（代號） | 今日表現 | 關鍵事件（財報/消息/政策） | 影響評估（利多🟢／利空🔴） |
-（至少 4-5 檔，每欄填具體內容）
+**🏦 Fed & 總經** — 結合新聞，說明哪個數據/聲明驅動定價
 
-**🏦 Fed & 總經觀察**
-（必須結合最新新聞，不可憑空說「市場預期降息」，要說「哪個數據/聲明導致市場重新定價」）
-
-**💡 操作建議**（3點，每點以 • 開頭）
-每點需包含：適用板塊或個股 ／ 進場觸發條件 ／ 目標或停損"""
-    return claude_call(prompt, max_tokens=1800)
+**💡 操作建議**（3點，含板塊/個股/觸發條件/目標/停損）"""
+    return claude_call(prompt, max_tokens=1200)
 
 def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
     vix   = market_data.get("vix",   {})
@@ -854,47 +828,33 @@ def analyze_global_news(articles, session_info, market_data, jin10_text: str = "
     btc   = crypto.get("BTC", {})
     eth   = crypto.get("ETH", {})
     wknd  = "\n⚠️ 今日為週末，部分指標為上次交易日數值。" if is_weekend() else ""
-    prompt = f"""你是一位資深國際財經分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。{wknd}
+    prompt = f"""國際財經分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
 
-【全球關鍵指標】
-- VIX：{fmt_quote(vix) if vix else 'N/A'}
-- 美債10Y：{fmt_quote(us10y) if us10y else 'N/A'}
-- 美元指數DXY：{fmt_quote(dxy) if dxy else 'N/A'}
-- 黃金：{fmt_quote(gold) if gold else 'N/A'}
-- 原油(WTI)：{fmt_quote(oil) if oil else 'N/A'}
-- BTC：{btc.get('emoji','') + ' ' + btc.get('price','N/A') + ' (' + btc.get('pct','N/A') + ')' if btc else 'N/A'}
-- ETH：{eth.get('emoji','') + ' ' + eth.get('price','N/A') + ' (' + eth.get('pct','N/A') + ')' if eth else 'N/A'}
-
-【本時段國際重大新聞（RSS）】
+【關鍵指標】VIX {fmt_quote(vix) if vix else 'N/A'} ／ 美債10Y {fmt_quote(us10y) if us10y else 'N/A'} ／ DXY {fmt_quote(dxy) if dxy else 'N/A'} ／ 黃金 {fmt_quote(gold) if gold else 'N/A'} ／ 原油 {fmt_quote(oil) if oil else 'N/A'} ／ BTC {btc.get('price','N/A')}({btc.get('pct','')}) ／ ETH {eth.get('price','N/A')}({eth.get('pct','')})
+【國際新聞】
 {build_news_text(articles)}
-
 {jin10_text if jin10_text else ''}
 
-請以繁體中文撰寫國際財經分析日報（優先參考金十即時快訊，再結合 RSS 新聞）：
-1. **全球市場情緒**（2-3句）
-2. **重大地緣政治與總經事件**（表格：| 事件 | 影響資產 | 利多/利空 | 影響程度 |，至少 3-5 個）
-3. **大宗商品與加密貨幣**（表格：| 品項 | 價格 | 漲跌 | 關鍵驅動 |）
-4. **對台股/亞股的影響**（2-3點，每點以 • 開頭）
-5. **本週重要財經數據預告**（若有，結合行事曆資料）"""
-    return claude_call(prompt, max_tokens=2000)
+以繁體中文寫國際財經日報（800字內，優先參考金十快訊）：
+1. **全球市場情緒**（2句）
+2. **重大事件**（表格：| 事件 | 影響資產 | 利多🟢/利空🔴 | 影響程度 |，3-5個）
+3. **大宗商品與加密**（表格：| 品項 | 價格 | 漲跌 | 驅動 |）
+4. **對台股/亞股影響**（3點，• 開頭）
+5. **本週重要財經數據**（若有）"""
+    return claude_call(prompt, max_tokens=1500)
 
 def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
     """針對金十數據進行專屬 AI 分析"""
     if not flash and not calendar:
         return ""
     jin10_text = build_jin10_text(flash, calendar)
-    prompt = f"""你是一位資深國際財經分析師。現在是台灣時間 {now_str()}，本次為「{session_info['label']}」（{session_info['period']}）。
-
-以下為金十數據最新即時快訊與財經行事曆：
-
+    prompt = f"""根據以下金十數據，以繁體中文寫摘要（400字內）：
 {jin10_text}
-
-請以**繁體中文**撰寫金十數據分析摘要（500字以內）：
-1. **重大事件解讀**（針對最重要的2-3個事件，分析其市場影響）
-2. **市場情緒判斷**（整體市場情緒方向，並說明原因）
-3. **對台股／亞股影響**（2-3點，每點以 • 開頭）
-4. **今日需關注財經數據**（若行事曆有重要數據請標出時間）"""
-    return claude_call(prompt, max_tokens=900)
+1. **重大事件**（2-3個，說明市場影響）
+2. **市場情緒**（方向+原因一句）
+3. **台股/亞股影響**（2點，• 開頭）
+4. **今日重要數據時間**（若有）"""
+    return claude_call(prompt, max_tokens=600, model=CLAUDE_MINI_MODEL)
 
 # ─────────────────────────────────────────────────────────────
 # 自選股分析（22:00 執行）
@@ -936,8 +896,8 @@ def fetch_stock_news(symbol: str, name: str) -> str:
 def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "") -> str:
     closes = quote.get("closes", [])
     price_history = ""
-    if len(closes) >= 5:
-        price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
+    if len(closes) >= 3:
+        price_history = "近3日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-3:]])
 
     stale_note = "⚠️ 注意：今日為週末，以下為上次交易日收盤數據。\n" if quote.get("stale") else ""
 
@@ -946,75 +906,47 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
 
-    prompt = f"""你是一位資深股票分析師，請根據以下**實際數據**進行深度分析。
+    prompt = f"""資深股票分析師。根據以下實際數據分析，每項指標必帶實際數值，禁空話。
+{stale_note}
+{name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
 
-{stale_note}【股票基本資訊】
-名稱：{name}（{symbol}）
-現價：{quote.get('price', 'N/A')} {quote.get('currency', '')}　漲跌：{quote.get('change', 'N/A')}（{quote.get('pct', 'N/A')}）
-{price_history}
-
-【技術指標（實際計算值，請直接引用這些數值進行分析，不可泛泛而談）】
+【技術指標】
 {indicators_text}
+【新聞】
+{news_ctx if news_ctx else '（暫無）'}
 
-【近期相關新聞】
-{news_ctx if news_ctx else '（暫無相關新聞）'}
+繁體中文，700字內：
 
-**撰寫規則（必須遵守）：**
-- 技術指標分析每一項都要帶入上方的**實際數值**，例如「RSI = 68.3，接近超買」而非「RSI偏高」
-- 目標價與停損點必須說明依據（例如前高/前低/均線位置/壓力支撐）
-- 每個論點禁止使用空話（「基本面良好」「市場看好」這類不帶數據的描述不被接受）
-- 新聞分析要說明「這個消息對本股的具體影響方向與幅度」
-
-請以繁體中文撰寫（800字以內）：
-
-**📊 近期走勢**（2句：目前價格位置 + 最近5日方向變化）
-
-**🔍 技術面解析**（每項必須帶指標實際數值）
-• 均線：MA5 / MA20 數值比較 → 多空排列現況與趨勢方向
-• MACD：MACD 線 / 訊號線 / 柱狀體數值 → 動能擴散或收斂
-• RSI：實際數值 → 超買（>70）/ 超賣（<30）/ 中性，信號意涵
-• KD：K 值 / D 值 → 是否黃金/死亡交叉，位置判讀
-• 成交量：今日量能 vs 均量 → 放量/縮量 + 量價配合度
-• 法人/融資（台股）：三大法人買賣超方向、融資增減趨勢
-
-**📰 消息面重點**（條列 1-3 則最相關新聞，說明對本股的具體影響）
-
-**🎯 短期展望（1-2週）**
-• 多方情境：目標 XXX 元（依據：XXX 技術位 / XXX 均線）
-• 空方情境：跌破 XXX 元需留意（依據：XXX 支撐 / XXX 訊號）
-
-**💡 操作建議**
-• 積極進場：觸發條件 XXX，目標 XXX 元
-• 停損設置：XXX 元（依據：前低 / 均線 / 關鍵支撐）
-
-> ⚠️ AI 生成，僅供參考，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1500)
+**📊 近期走勢**（2句：價格位置＋方向）
+**🔍 技術面**（每項帶實際數值）
+• 均線 MA5/MA20 → 多空排列
+• MACD 線/訊號線/柱 → 動能方向
+• RSI 數值 → 超買/超賣/中性
+• KD K/D值 → 黃金/死亡交叉
+• 成交量 vs 均量 → 量價配合
+**📰 消息面**（1-3則，說明具體影響方向）
+**🎯 短期展望**
+• 多方：目標價（依據）
+• 空方：跌破位（依據）
+**💡 操作建議**（積極進場條件/目標/停損）
+> ⚠️ AI 生成，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1000)
 
 def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:
     """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔"""
-    cand_list = "\n".join([f"- {s['name']}（{s['symbol']}）" for s in candidates])
-    prompt = f"""你是一位台股選股專家。現在是台灣時間 {now_str()}。
+    cand_list = "\n".join([f"{s['name']}（{s['symbol']}）" for s in candidates])
+    prompt = f"""台股選股，{now_str()}。從候選股選2-3檔今日最值得追蹤的個股。
+優先：①今日有催化劑（法說/財報/訂單）②技術關鍵位 ③當日主旋律龍頭
 
-【今日盤面概況（0050/00878 成分股快照）】
+【今日行情】
 {market_ctx}
-
-【候選股清單（0050 / 00878 重要成分股）】
+【候選股】
 {cand_list}
 
-任務：從上方清單挑選今日最值得深度追蹤的 **2-3 檔** 個股。
-
-選股優先順序：
-1. 今日有明顯題材或催化劑（法說、財報、重大新聞、訂單）
-2. 技術面處於關鍵突破或回測位置
-3. 與當日市場主旋律最相關的族群領頭羊
-
-**只輸出以下格式，不加任何其他文字：**
-PICK:代號|原因（一句話，帶具體數字或事件）
-
-範例：
-PICK:2330.TW|CoWoS需求持續爆單，本周站穩1000元關鍵支撐
-PICK:2382.TW|GB200出貨加速，AI伺服器族群今日領漲3.2%"""
-    response = claude_call(prompt, max_tokens=300)
+只輸出格式，不加其他文字：
+PICK:代號|原因（一句話帶具體數字）
+範例：PICK:2330.TW|CoWoS爆單，本周站穩1000元"""
+    response = claude_call(prompt, max_tokens=200, model=CLAUDE_MINI_MODEL)
     picks = []
     for line in response.split("\n"):
         line = line.strip()
@@ -1266,9 +1198,14 @@ def run_report():
     us_sectors_text = format_sectors_text(us_sectors)
     print(f"  台股類股：{len(tw_sectors)} 個 | 美股板塊：{len(us_sectors)} 個")
 
-    # 3d. AI & AI Agent 全球新聞
-    print("\n🤖 抓取 AI & AI Agent 全球新聞...")
-    ai_news = fetch_ai_news(session_info)
+    # 3d. AI & AI Agent 全球新聞（早報 08:00 跳過：凌晨 AI 動態稀少，節省 API 費用）
+    is_morning = session_info["label"] == "盤前早報"
+    ai_news = []
+    if not is_morning:
+        print("\n🤖 抓取 AI & AI Agent 全球新聞...")
+        ai_news = fetch_ai_news(session_info)
+    else:
+        print("\n⏭️ 早報：跳過 AI 新聞（凌晨動態稀少，節省 token 費用）")
 
     # 4. Claude 分析
     print("\n🤖 Claude AI 分析中...")
