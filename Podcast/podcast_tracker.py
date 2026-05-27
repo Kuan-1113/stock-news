@@ -175,7 +175,7 @@ def claude_call(prompt: str, max_tokens: int = 1600) -> str:
             headers={"x-api-key": ANTHROPIC_API_KEY,
                      "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-opus-4-5",
+            json={"model": "claude-sonnet-4-6",
                   "max_tokens": max_tokens,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=90,
