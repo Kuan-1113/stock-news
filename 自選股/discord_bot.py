@@ -235,15 +235,25 @@ def _split_messages(text: str, limit: int = 1900) -> list[str]:
 )
 async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = ""):
     print(f"⚡ /查股 收到：{symbol}", flush=True)
+
+    # ── 第一步：立即 defer（必須在 3 秒內完成，否則互動作廢）──
     try:
-        print(f"⚡ 準備 defer...", flush=True)
         await interaction.response.defer()
         print(f"⚡ defer 成功", flush=True)
-        sym = symbol.strip().upper()
-        # 在背景執行緒中跑全部同步分析，不阻塞 event loop
-        loop   = asyncio.get_running_loop()
+    except discord.errors.NotFound:
+        # 互動 token 已逾時（3 秒超過），Discord 自動顯示「應用程式沒有回應」
+        # 不要再嘗試送任何訊息，靜默略過即可
+        print(f"⚠️ /查股 互動已逾時（token 過期），略過：{symbol}")
+        return
+    except Exception as e:
+        print(f"❌ /查股 defer 失敗：{e}")
+        return
+
+    # ── 第二步：執行分析並回傳結果 ──
+    try:
+        sym  = symbol.strip().upper()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _do_analysis, sym, name.strip())
-        # 分段傳送（Discord 單則訊息上限 2000 字）
         chunks = _split_messages(result)
         for i, chunk in enumerate(chunks):
             if i == 0:
@@ -251,7 +261,7 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
             else:
                 await interaction.channel.send(chunk)
     except Exception as e:
-        print(f"❌ /查股 例外：{e}")
+        print(f"❌ /查股 分析例外：{e}")
         try:
             await interaction.followup.send(f"❌ 查詢失敗：{str(e)[:150]}")
         except Exception:
@@ -259,10 +269,20 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
 
 @tree.command(name="自選股", description="觸發完整自選股分析（結果約 2 分鐘後出現）")
 async def cmd_自選股(interaction: discord.Interaction):
+    # ── 第一步：立即 defer ──
     try:
         await interaction.response.defer()
-        loop          = asyncio.get_running_loop()
-        ok, errmsg    = await loop.run_in_executor(None, _trigger_workflow, "query_watchlist.yml", {})
+    except discord.errors.NotFound:
+        print("⚠️ /自選股 互動已逾時，略過")
+        return
+    except Exception as e:
+        print(f"❌ /自選股 defer 失敗：{e}")
+        return
+
+    # ── 第二步：觸發 workflow ──
+    try:
+        loop       = asyncio.get_running_loop()
+        ok, errmsg = await loop.run_in_executor(None, _trigger_workflow, "query_watchlist.yml", {})
         if ok:
             await interaction.followup.send("⏳ 自選股分析啟動！約 **2 分鐘**後報告會出現在自選股頻道。")
         elif not GITHUB_PAT:
