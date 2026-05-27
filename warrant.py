@@ -86,7 +86,7 @@ def prewarm_cache():
 def _fetch_mis(code: str) -> dict:
     """
     從 mis.twse.com.tw 取得即時行情（權證或股票均適用）
-    回傳欄位：price, prev_close, open, high, low, volume, bid, ask, name
+    非交易時間 z="-"，自動退回昨收 y
     """
     try:
         r = requests.get(
@@ -98,19 +98,25 @@ def _fetch_mis(code: str) -> dict:
             msgs = r.json().get("msgArray", [])
             if msgs:
                 m = msgs[0]
+                def _v(k):
+                    val = m.get(k, "")
+                    return val if val and val not in ("-", "--") else ""
+                live = _v("z")   # 盤中最新成交（休市時為 "-"）
+                prev = _v("y")   # 昨收（隨時可用）
                 return {
-                    "price":      m.get("z", ""),   # 最新成交
-                    "prev_close": m.get("y", ""),   # 昨收
-                    "open":       m.get("o", ""),   # 開盤
-                    "high":       m.get("h", ""),   # 最高
-                    "low":        m.get("l", ""),   # 最低
-                    "volume":     m.get("v", ""),   # 成交量（張）
-                    "bid":        m.get("b", ""),   # 最佳買進
-                    "ask":        m.get("a", ""),   # 最佳賣出
-                    "name":       m.get("n", ""),   # 名稱
+                    "price":      live or prev,   # 盤中用即時，休市用昨收
+                    "prev_close": prev,
+                    "open":       _v("o"),
+                    "high":       _v("h"),
+                    "low":        _v("l"),
+                    "volume":     _v("v"),
+                    "bid":        _v("b"),
+                    "ask":        _v("a"),
+                    "name":       m.get("n", ""),
+                    "is_live":    bool(live),     # True = 盤中即時價
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"MIS 錯誤（{code}）：{e}", flush=True)
     return {}
 
 
@@ -394,11 +400,13 @@ def _na(v: str) -> str:
 
 def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
                  mis_data: dict | None = None,
-                 stock_price: float = 0.0) -> str:
+                 stock_price: float = 0.0,
+                 stock_mis: dict | None = None) -> str:
     """
     格式化單筆權證。
-    mis_data  — _fetch_mis() 的結果（補充即時價格）
+    mis_data   — 權證的 _fetch_mis() 結果
     stock_price — 標的股票現價（用於計算溢價率/槓桿）
+    stock_mis  — 標的股票的 _fetch_mis() 結果（顯示股價）
     """
     code   = row.get("權證代號", "?")
     name   = row.get("權證簡稱", row.get("權證名稱", "?"))
@@ -411,21 +419,22 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
 
     # 履約價 & 行使比例（靜態資料）
     strike_s = _strike(row)
-    ratio_s  = _ratio(row)          # 每千單位可換幾股（原始欄位值）
+    ratio_s  = _ratio(row)
     try:
-        ratio_f = float(ratio_s) / 1000.0   # 每1單位權證換股數
+        ratio_f = float(ratio_s) / 1000.0
     except Exception:
         ratio_f = 0.0
 
-    # 昨收：優先用 MIS 即時資料，fallback API
+    # 權證昨收/現價
     mis      = mis_data or {}
     close    = mis.get("prev_close") or _prev_close(row) or "—"
-    curr_p   = mis.get("price") or close   # 盤中最新價
+    curr_p   = mis.get("price") or close
     bid      = mis.get("bid", "")
     ask      = mis.get("ask", "")
     mis_vol  = mis.get("volume", "")
+    is_live  = mis.get("is_live", False)
 
-    # Delta / IV — API 欄位（若有）
+    # Delta / IV — TWSE API 不提供，通常為空
     delta_s = _delta(row)
     iv_s    = _iv(row)
 
@@ -454,21 +463,39 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
                 lev_s = _calc_leverage(w, s, d, r)
         except Exception:
             pass
+    # Delta 不可得時，用價格槓桿（intrinsic）估算
+    if not lev_s and stock_price > 0:
+        try:
+            w = float(curr_p)
+            if w > 0 and ratio_f > 0:
+                il = stock_price * ratio_f / w
+                lev_s = f"≈{il:.1f}（估算，非有效槓桿）"
+        except Exception:
+            pass
 
     vol    = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
     prefix = f"#{rank} " if rank else ""
 
+    # 標的股票價格（從 stock_mis 取）
+    s_mis    = stock_mis or {}
+    sp_str   = s_mis.get("price", "")
+    sp_live  = s_mis.get("is_live", False)
+    sp_label = "現價" if sp_live else "昨收"
+
     lines = [
         f"{prefix}**{name}**（{code}） — {wt}",
         f"  標的：{und_n}（{und_c}）",
-        f"  昨收：{close} 元",
     ]
-    if curr_p and curr_p != close:
-        lines.append(f"  現價：{curr_p} 元  買：{bid}  賣：{ask}")
+    if sp_str:
+        lines.append(f"  標的{sp_label}：{sp_str} 元")
+    w_label = "現價" if is_live else "昨收"
+    lines.append(f"  權證{w_label}：{close if not is_live else curr_p} 元")
+    if is_live and curr_p != close:
+        lines.append(f"  權證現價：{curr_p} 元  買：{bid}  賣：{ask}")
     lines += [
         f"  到期日：{exp}（剩 {days} 天）",
         f"  履約價：{_na(strike_s)} 元 | 行使比例：{_na(ratio_s)} 股/千單位",
-        f"  Delta：{_na(delta_s)} | IV：{_na(iv_s)}% | 溢價率：{_na(prem_s)}% | 實際槓桿：{_na(lev_s)}x",
+        f"  溢價率：{_na(prem_s)}% | 實際槓桿：{_na(lev_s)} | Delta：{_na(delta_s)} | IV：{_na(iv_s)}",
         f"  發行量：{issued} 仟單位 | 今日成交張數：{vol}",
     ]
     return "\n".join(lines)
@@ -526,9 +553,17 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     if not calls:
         calls = matched
 
-    daily     = _fetch_daily()
-    vol_map   = {r.get("權證代號", ""): r for r in daily}
-    ranked    = sorted(calls, key=lambda r: _score(r, vol_map), reverse=True)[:top_n]
+    daily   = _fetch_daily()
+    vol_map = {r.get("權證代號", ""): r for r in daily}
+
+    # 成交量篩選：優先選今日有成交的；全無成交才退回所有（避免完全沒結果）
+    MIN_VOL = 1000   # 最低成交張數門檻
+    liquid  = [r for r in calls
+               if int(vol_map.get(r.get("權證代號",""), {}).get("成交張數", 0) or 0) >= MIN_VOL]
+    if liquid:
+        calls = liquid
+
+    ranked = sorted(calls, key=lambda r: _score(r, vol_map), reverse=True)[:top_n]
 
     lines = [f"**{zh_name}（{code}）認購權證前{len(ranked)}名**\n"]
     for i, row in enumerate(ranked, 1):
@@ -555,17 +590,22 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
 
     # 補充即時資料：取目標權證和標的股票的 MIS 資料
     mis_w       = _fetch_mis(wc)
+    mis_s: dict = {}
     stock_price = 0.0
     if und_code:
-        mis_s       = _fetch_mis(und_code)
-        sp          = mis_s.get("price") or mis_s.get("prev_close", "")
+        mis_s = _fetch_mis(und_code)
+        sp    = mis_s.get("price", "")
         try:
             stock_price = float(sp)
         except Exception:
             pass
 
+    print(f"🔍 分析權證 {wc}: und_code={und_code}, stock_price={stock_price}, "
+          f"warrant_price={mis_w.get('price','?')}", flush=True)
+
     target_summary = _fmt_warrant(target, vol_map,
-                                  mis_data=mis_w, stock_price=stock_price)
+                                  mis_data=mis_w, stock_price=stock_price,
+                                  stock_mis=mis_s)
 
     # 從名稱推出標的前3字（例：台積電凱基→台積電）
     t_name    = target.get("權證簡稱", target.get("權證名稱", ""))
@@ -580,13 +620,20 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
         if r.get("權證代號", "").upper() != wc
         and (
             (und_code and _underlying_code(r) == und_code)
-            or (und_short and und_short in _wname2(r))
+            or (und_short and len(und_short) >= 2 and und_short in _wname2(r))
         )
         and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
-        and ("購" in _wtype(r) or "購" in _wname2(r))
+        and "售" not in _wtype(r)   # 排除認售
     ]
 
-    ranked_sim = sorted(similar, key=lambda r: _score(r, vol_map), reverse=True)[:3]
+    # 成交量篩選（同標的比較選項）
+    MIN_VOL = 1000
+    liquid_sim = [r for r in similar
+                  if int(vol_map.get(r.get("權證代號",""), {}).get("成交張數", 0) or 0) >= MIN_VOL]
+    similar_filtered = liquid_sim if liquid_sim else similar   # 無流動則退回所有
+
+    print(f"🔍 {wc}: und_short={und_short!r}, 同標的候選={len(similar)}, 有成交量={len(liquid_sim)}", flush=True)
+    ranked_sim = sorted(similar_filtered, key=lambda r: _score(r, vol_map), reverse=True)[:3]
 
     if ranked_sim:
         sim_lines = ["**同標的推薦認購權證**\n"]
