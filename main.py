@@ -143,13 +143,12 @@ def _do_analysis(symbol: str, name: str) -> str:
     price_history = ""
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
-    prompt = f"""你是一位資深股票分析師，請對以下股票進行深度分析。
+    prompt = f"""你是一位資深股票分析師，請根據以下真實數據撰寫分析報告。
 
-【股票資訊】
-- 名稱：{display_name}（{symbol}）
-- 最新價格：{quote['price']} {quote.get('currency', '')}
-- 漲跌：{quote['change']} ({quote['pct']})
-- {price_history}
+【股票基本資訊】
+代碼：{symbol}　名稱：{display_name}
+現價：{quote['price']} {quote.get('currency', '')}　漲跌：{quote['change']}（{quote['pct']}）
+{price_history}
 
 【技術指標（實際計算值）】
 {ind_text}
@@ -157,27 +156,36 @@ def _do_analysis(symbol: str, name: str) -> str:
 【近期相關新聞】
 {news}
 
-請以繁體中文撰寫分析報告（900字以內）：
+---
+請以繁體中文撰寫，總字數控制在 800 字內，格式如下：
 
-📊 **近期走勢**（2-3句）
+**📊 近期走勢**
+（2-3句概述最近行情與關鍵變化，直接點出漲跌原因）
 
-🔍 **技術面分析**
-- 均線多空排列、MACD 動能、RSI 位置、KDJ 訊號、乖離率、成交量
+**🔍 技術面解析**
+• 均線：多空排列現況與趨勢方向
+• MACD：動能方向，是否出現背離或交叉訊號
+• RSI / KD：目前位置，是否超買或超賣
+• 成交量：量能是否配合行情
 
-📰 **基本面亮點**（結合新聞，2-3點）
+**📰 消息面重點**
+（條列 1-3 則與股價最相關的新聞，說明對後市的潛在影響）
 
-🎯 **短期預測（1-2週）**
-- 目標價區間、可能走向
+**🎯 短期展望（1-2 週）**
+• 多方情境：目標價位 ／ 觸發上漲的關鍵條件
+• 空方情境：關鍵支撐位 ／ 可能下跌的風險因素
 
-💡 **操作建議**
-- 進場條件、觀望條件、停損參考
+**💡 操作建議**
+• 積極策略：建議進場時機 ／ 目標價 ／ 停損參考
+• 保守策略：觀望條件與等待訊號
 
-⚠️ 本報告由 AI 生成，不構成投資建議。"""
-    analysis = _claude_call(prompt)
+> ⚠️ 本報告由 AI 生成，僅供參考，不構成任何投資建議。"""
+    analysis = _claude_call(prompt, max_tokens=1600)
     header = (
-        f"## {quote['emoji']} **{display_name}（{symbol}）** 即時查股 | {now_str()}\n"
-        f"💰 **{quote['price']}** {quote.get('currency','')}　"
-        f"{quote['change']} ({quote['pct']})\n\n"
+        f"## {quote['emoji']} **{display_name}（{symbol}）** | {now_str()}\n"
+        f"**現價：{quote['price']} {quote.get('currency','')}**　"
+        f"漲跌：{quote['change']}（{quote['pct']}）\n"
+        f"{'─' * 28}\n\n"
     )
     return header + analysis
 
@@ -302,7 +310,13 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
     print(f"⚡ /查股 收到：{symbol}", flush=True)
     try:
         await interaction.response.defer()
-        print(f"⚡ defer 成功", flush=True)
+    except discord.errors.NotFound:
+        print("⚠️ /查股 互動已過期（10062），忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /查股 defer 失敗：{e}", flush=True)
+        return
+    try:
         loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _do_analysis, symbol.strip().upper(), name.strip())
         chunks = _split_messages(result)
@@ -323,6 +337,13 @@ async def cmd_自選股(interaction: discord.Interaction):
     print("⚡ /自選股 收到", flush=True)
     try:
         await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /自選股 互動已過期（10062），忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /自選股 defer 失敗：{e}", flush=True)
+        return
+    try:
         loop       = asyncio.get_running_loop()
         ok, errmsg = await loop.run_in_executor(None, _trigger_workflow, "query_watchlist.yml", {})
         if ok:
@@ -349,28 +370,35 @@ def _do_warrant_search(stock_input: str) -> str:
     if summary.startswith("❌"):
         return summary
 
-    prompt = f"""你是一位台灣權證專家，以下是 {zh_name}（{code}）的認購權證候選清單（已依綜合評分排序，全部 >90 天到期）。
-**請直接引用各權證的實際數值進行比較，不要泛泛而談。**
+    prompt = f"""你是一位台灣認購權證專家。以下是 {zh_name}（{code}）目前市場上的認購權證候選清單，已依綜合評分由高到低排序，全部剩餘天數 > 90 天。
+請直接引用各權證的實際數值，不要泛泛而談。
 
-【候選認購權證清單】
+【認購權證候選清單】
 {summary}
 
-請以繁體中文撰寫（800字以內）：
+請以繁體中文撰寫分析報告（750字以內），格式如下：
 
-🏆 **各檔評比**
-對每一檔說明（直接帶數值）：
-**#排名 名稱（代號）**
-- ✅ 優勢：（帶具體數字，如「剩X天、溢價率X%、槓桿X倍」）
-- ⚠️ 注意：（帶具體風險）
+**🏆 推薦排名分析**
+對每一檔逐一說明，直接帶入實際數值：
 
-💡 **綜合推薦**
-第一優先選哪一檔？為什麼（到期時間、溢價率、流動性、槓桿綜合考量）？
-適合什麼操作策略（短波段/中波段）？
+**第 N 名　代號 ／ 名稱**
+> 剩 X 天　溢價 X%　槓桿 X 倍　今日成交 XXX 張
+- ✅ 優勢：（最吸引人的 2 個具體理由，帶數值）
+- ⚠️ 注意：（1-2 個風險點，帶數值）
 
-⚠️ AI 生成，不構成投資建議。"""
+**💡 綜合建議**
+• **首選**：第幾名？原因（綜合到期時間、溢價率、流動性、槓桿）
+• **短線操作（1-2 週）**：推薦哪檔？理由
+• **中線操作（1 個月以上）**：推薦哪檔？理由
+• **進場提示**：進場前應確認的關鍵條件（溢價率、流動性、停損設置）
+
+> ⚠️ AI 生成，不構成投資建議。實際交易前請自行確認最新報價。"""
 
     analysis = _claude_call(prompt, max_tokens=2000)
-    header = f"## 🔍 {zh_name}（{code}）認購權證推薦 | {now_str()}\n\n"
+    header = (
+        f"## 🔍 {zh_name}（{code}）認購權證推薦 | {now_str()}\n"
+        f"{'─' * 28}\n\n"
+    )
     return header + analysis
 
 
@@ -379,7 +407,7 @@ def _do_warrant_analyze(warrant_code: str) -> str:
     if target_summary.startswith("❌"):
         return target_summary
 
-    prompt = f"""你是一位台灣權證專家，請根據以下實際數據對權證進行逐項評估。
+    prompt = f"""你是一位台灣認購權證專家，請根據以下實際數據進行逐項評估。
 
 【目標權證資料】
 {target_summary}
@@ -388,47 +416,53 @@ def _do_warrant_analyze(warrant_code: str) -> str:
 {similar_summary}
 
 ---
-**撰寫規則（務必遵守）：**
-1. 每個評估項目格式固定：「此權證的XXX為【實際數值】→ 評估結論（偏高/合理/偏低 + 原因）」
-2. 若資料顯示「—」才寫「資料不足」，有數值絕對不能省略
-3. 禁止只給範圍而不說本權證實際數值
+**撰寫規則（必須遵守）：**
+- 每項評估格式：「實際數值 → 評估結論（好／普通／差 + 一句理由）」
+- 有數值就帶入，不可省略；僅資料顯示「—」才寫「資料不足」
+- 禁止只給範圍說明而不帶本權證的實際數值
 
-請以繁體中文撰寫（900字以內）：
+請以繁體中文撰寫（850字以內）：
 
-📋 **逐項數據評估**
+**📋 逐項數據評估**
 
 **① 剩餘天數**
-此權證到期日為【填入到期日】，距今剩【填入天數】天。→ [充裕/普通/偏少，時間價值衰退風險說明]
+到期日【填入】，距今【填入】天 → 評估時間充裕度與時間價值衰退風險
 
-**② 履約價 vs 標的現價**
-此權證履約價為【填入履約價】元，標的昨收（或現價）為【填入股價】元。→ [目前價內X%/價外X%，達到獲利需要標的漲幅]
+**② 價內外狀態**
+履約價【填入】元 vs 標的現價【填入】元 → 目前價內 X% ／ 價外 X%，需要標的漲 X% 才獲利
 
 **③ 溢價率**
-此權證溢價率為【填入計算值】%（若顯示「—」則寫「無法計算，缺少即時報價」）。→ [合理範圍3-8%；偏高代表需標的漲更多才能回本，偏低可能有套利機會]
+溢價率【填入】%（若無法計算請說明原因） → 合理範圍 3-8%；偏高代表需更多漲幅才能回本
 
 **④ 槓桿倍數**
-此權證槓桿為【填入值，若為估算請標注「估算」】倍。→ [5-15倍為甜蜜點；偏高風險集中，偏低效率差]
+槓桿【填入】倍（若為估算請標注） → 5-15 倍為甜蜜點；評估報酬風險比
 
-**⑤ 成交張數（流動性）**
-今日成交【填入張數】張。→ [流動性佳（>50萬）/普通（5-50萬）/差（<5萬），出場買賣差影響]
+**⑤ 流動性（成交量）**
+今日成交【填入】張 → 佳（>50 萬張）／普通（5-50 萬張）／差（<5 萬張）；說明出場難易度
 
-**⑥ 發行量**
-發行量為【填入】仟單位。→ [供應充足/一般，影響長期流動性]
+**⑥ 發行規模**
+發行量【填入】仟單位 → 評估長期供應充足度
 
-> ⚠️ **Delta / IV / 有效槓桿**：TWSE 公開資料不提供，需向發行商（統一、凱基、元大等）報價系統查詢。
+> ⚠️ Delta ／ IV ／ 有效槓桿：TWSE 公開資料未提供，需向發行商（元大、凱基、統一等）查詢報價系統
 
-✅ **綜合優點**（2-3點，每點帶實際數值）
+**✅ 主要優勢**（2-3 點，每點帶實際數值）
 
-⚠️ **風險提示**（2-3點，每點帶實際數值）
+**⚠️ 主要風險**（2-3 點，每點帶實際數值）
 
-🔄 **同標的替代選項比較**
-- 若有其他同標的認購權證：製作表格列出「代號 | 到期日 | 剩餘天數 | 履約價 | 溢價率 | 成交張數」並說明各檔優劣
-- 若無其他同標的有效認購權證：直接說明「目前市場無其他同標的認購權證可供比較」，**不要製作空表格**
+**🔄 同標的選項比較**
+（若有其他同標的認購權證）列出簡表：代號 ｜ 到期日 ｜ 剩餘天數 ｜ 溢價率 ｜ 成交張數，並說明各檔優劣
+（若無）直接說明「目前市場無其他同標的認購權證可供比較」，**不要製作空表格**
 
-⚠️ AI 生成，不構成投資建議。"""
+**⭐ 綜合評級**
+以 A ／ B ／ C ／ D 四級評定此權證，並一句話說明評定理由。
+
+> ⚠️ AI 生成，不構成投資建議。"""
 
     analysis = _claude_call(prompt, max_tokens=2200)
-    header = f"## 🎯 權證 `{warrant_code.upper()}` 深度分析 | {now_str()}\n\n"
+    header = (
+        f"## 🎯 權證 `{warrant_code.upper()}` 深度分析 | {now_str()}\n"
+        f"{'─' * 28}\n\n"
+    )
     return header + analysis
 
 
