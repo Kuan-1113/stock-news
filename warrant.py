@@ -350,7 +350,7 @@ def _fetch_mis_batch(code_exchange_pairs: list[tuple[str, str]]) -> dict[str, di
             r = requests.get(
                 "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
                 f"?ex_ch={ex_ch}&json=1&delay=0",
-                headers=HEADERS, timeout=12,
+                headers=HEADERS, timeout=5,   # 5s — MIS 通常 <1s，超時就放棄
             )
             if r.status_code == 200:
                 for m in r.json().get("msgArray", []):
@@ -364,18 +364,11 @@ def _fetch_mis_batch(code_exchange_pairs: list[tuple[str, str]]) -> dict[str, di
 
 def _fetch_mis(code: str, exchange: str = "tw") -> dict:
     """
-    取得單支股票/權證的 MIS 即時行情。
-    exchange: "tw"（上市）或 "otc"（上櫃 TPEX）
-    非交易時間 z="-"，自動退回昨收 y。
+    取得單支股票/權證的 MIS 即時行情（不自動 retry 另一交易所）。
+    需要 fallback 的呼叫方請自行用 _fetch_mis_batch 批量處理。
     """
     result = _fetch_mis_batch([(code, exchange)])
-    if result.get(code):
-        return result[code]
-    # TWSE 嘗試失敗時自動試另一個交易所
-    if exchange == "tw":
-        result2 = _fetch_mis_batch([(code, "otc")])
-        return result2.get(code, {})
-    return {}
+    return result.get(code, {})
 
 
 def _calc_premium(warrant_price: float, stock_price: float,
@@ -1047,16 +1040,21 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     vol_map  = _get_vol_map(daily)
     und_code = _underlying_code(target)
 
-    # 補充即時資料：TPEX 用 otc_ 前綴，TWSE 用 tw_
+    # 補充即時資料：一次批次呼叫取得權證 + 標的股票價格
     w_exchange = "otc" if target.get("_source") == "tpex" else "tw"
-    mis_w       = _fetch_mis(wc, exchange=w_exchange)
+    pairs: list[tuple[str, str]] = [(wc, w_exchange)]
+    if und_code:
+        pairs.append((und_code, "tw"))
+    mis_batch   = _fetch_mis_batch(pairs)
+    mis_w       = mis_batch.get(wc, {})
     mis_s: dict = {}
     stock_price = 0.0
     if und_code:
-        # MIS tw → MIS otc → Yahoo Finance（最後防線）
-        mis_s = _fetch_mis(und_code, exchange="tw")
+        mis_s = mis_batch.get(und_code, {})
+        # otc fallback（上櫃標的）
         if not mis_s.get("price"):
-            mis_s = _fetch_mis(und_code, exchange="otc")
+            otc_b = _fetch_mis_batch([(und_code, "otc")])
+            mis_s = otc_b.get(und_code, {})
         try:
             stock_price = float(mis_s.get("price", 0) or 0)
         except Exception:

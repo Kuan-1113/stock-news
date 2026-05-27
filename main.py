@@ -538,13 +538,13 @@ async def cmd_查權證(interaction: discord.Interaction, stock: str):
         print(f"❌ /查權證 defer 失敗：{e}", flush=True)
         return
     try:
-        loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _do_warrant_search, stock.strip())
-        for i, chunk in enumerate(_split_messages(result)):
-            if i == 0:
-                await interaction.followup.send(chunk)
-            else:
-                await interaction.channel.send(chunk)
+        loop         = asyncio.get_running_loop()
+        progress_msg = await interaction.followup.send("🔍 正在蒐集資料，請稍候…")
+        result       = await loop.run_in_executor(None, _do_warrant_search, stock.strip())
+        chunks       = _split_messages(result)
+        await progress_msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
     except Exception as e:
         print(f"❌ /查權證 執行失敗：{e}", flush=True)
         try:
@@ -570,13 +570,13 @@ async def cmd_分析權證(interaction: discord.Interaction, code: str):
         print(f"❌ /分析權證 defer 失敗：{e}", flush=True)
         return
     try:
-        loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _do_warrant_analyze, code.strip())
-        for i, chunk in enumerate(_split_messages(result)):
-            if i == 0:
-                await interaction.followup.send(chunk)
-            else:
-                await interaction.channel.send(chunk)
+        loop         = asyncio.get_running_loop()
+        progress_msg = await interaction.followup.send("🔍 正在分析中，請稍候…")
+        result       = await loop.run_in_executor(None, _do_warrant_analyze, code.strip())
+        chunks       = _split_messages(result)
+        await progress_msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
     except Exception as e:
         print(f"❌ /分析權證 執行失敗：{e}", flush=True)
         try:
