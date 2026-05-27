@@ -10,6 +10,7 @@ import time
 import threading
 import datetime
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TWSE_OPENAPI = "https://openapi.twse.com.tw/v1/opendata"
 TPEX_OPENAPI = "https://www.tpex.org.tw/openapi/v1"
@@ -287,12 +288,22 @@ def _fetch_daily_tpex() -> list:
 def prewarm_cache():
     """Bot 啟動時在背景預先下載，確保第一個使用者不需等待"""
     def _task():
-        print("🔄 預熱權證快取中…", flush=True)
-        _fetch_basic_all()
-        _fetch_daily()
-        _fetch_basic_all_tpex()
-        _fetch_daily_tpex()
-        print("✅ 權證快取預熱完成（TWSE+TPEX）", flush=True)
+        print("🔄 預熱權證快取中…（4 個 API 平行下載）", flush=True)
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {
+                ex.submit(_fetch_basic_all):      "TWSE basic",
+                ex.submit(_fetch_daily):          "TWSE daily",
+                ex.submit(_fetch_basic_all_tpex): "TPEX basic",
+                ex.submit(_fetch_daily_tpex):     "TPEX daily",
+            }
+            for f in as_completed(futures):
+                label = futures[f]
+                try:
+                    f.result()
+                    print(f"  ✅ {label} 預熱完成", flush=True)
+                except Exception as e:
+                    print(f"  ⚠️ {label} 預熱失敗：{e}", flush=True)
+        print("✅ 權證快取預熱全部完成", flush=True)
     threading.Thread(target=_task, daemon=True).start()
 
 
@@ -915,9 +926,15 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     except Exception:
         pass
 
+    def _wname(r):
+        return r.get("權證簡稱", r.get("權證名稱", ""))
+
     # Fallback：記憶體全量過濾（DB 尚未建立時，含 TPEX）
     if not matched:
-        basic_all = _fetch_basic_all() + _fetch_basic_all_tpex()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(_fetch_basic_all)
+            f2 = ex.submit(_fetch_basic_all_tpex)
+        basic_all = f1.result() + f2.result()
         if not basic_all:
             return "❌ 無法取得權證基本資料，請稍後再試"
         matched = [
@@ -926,13 +943,13 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
             and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
         ]
 
-    def _wname(r):
-        return r.get("權證簡稱", r.get("權證名稱", ""))
-
     # 中文名稱 fallback（前3字，含 TPEX）
     if not matched and re.search(r"[一-鿿]", zh_name):
         short = zh_name[:3]
-        basic_all = _fetch_basic_all() + _fetch_basic_all_tpex()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(_fetch_basic_all)
+            f2 = ex.submit(_fetch_basic_all_tpex)
+        basic_all = f1.result() + f2.result()
         matched = [
             r for r in basic_all
             if short in _wname(r)
@@ -1024,11 +1041,16 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
 # ── 分析指定權證 ─────────────────────────────────────────────
 
 def analyze_warrant(warrant_code: str) -> tuple[str, str]:
-    wc        = warrant_code.strip().upper()
-    twse_all  = _fetch_basic_all()
-    tpex_all  = _fetch_basic_all_tpex()
+    wc = warrant_code.strip().upper()
+    # 三個 API 平行下載，冷快取時間從 ~60s → ~20s
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_twse  = ex.submit(_fetch_basic_all)
+        f_tpex  = ex.submit(_fetch_basic_all_tpex)
+        f_daily = ex.submit(_fetch_daily)
+    twse_all  = f_twse.result()
+    tpex_all  = f_tpex.result()
+    daily     = f_daily.result()
     basic_all = twse_all + tpex_all
-    daily     = _fetch_daily()
 
     target = next(
         (r for r in basic_all if r.get("權證代號", "").upper() == wc), None
