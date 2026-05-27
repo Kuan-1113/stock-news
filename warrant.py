@@ -150,7 +150,7 @@ def prewarm_cache():
 
 def _fetch_mis(code: str) -> dict:
     """
-    從 mis.twse.com.tw 取得即時行情（權證或股票均適用）
+    從 mis.twse.com.tw 取得即時行情（含五檔委買/委賣）
     非交易時間 z="-"，自動退回昨收 y
     """
     try:
@@ -166,19 +166,34 @@ def _fetch_mis(code: str) -> dict:
                 def _v(k):
                     val = m.get(k, "")
                     return val if val and val not in ("-", "--") else ""
-                live = _v("z")   # 盤中最新成交（休市時為 "-"）
-                prev = _v("y")   # 昨收（隨時可用）
+
+                live = _v("z")
+                prev = _v("y")
+
+                # 解析五檔（MIS 用 "_" 分隔）
+                def _parse_book(price_str: str, vol_str: str) -> list[tuple[str, str]]:
+                    ps = [p for p in price_str.split("_") if p and p not in ("-", "--")]
+                    vs = [v for v in vol_str.split("_")   if v and v not in ("-", "--")]
+                    return list(zip(ps[:5], vs[:5]))
+
+                bid_book = _parse_book(_v("b"), _v("g"))
+                ask_book = _parse_book(_v("a"), _v("f"))
+
                 return {
-                    "price":      live or prev,   # 盤中用即時，休市用昨收
+                    "price":      live or prev,
                     "prev_close": prev,
                     "open":       _v("o"),
                     "high":       _v("h"),
                     "low":        _v("l"),
                     "volume":     _v("v"),
-                    "bid":        _v("b"),
-                    "ask":        _v("a"),
+                    "bid":        bid_book[0][0] if bid_book else "",   # 最佳買價
+                    "ask":        ask_book[0][0] if ask_book else "",   # 最佳賣價
+                    "bid_vol":    bid_book[0][1] if bid_book else "",
+                    "ask_vol":    ask_book[0][1] if ask_book else "",
+                    "bid_book":   bid_book,   # [(price, vol), ...]
+                    "ask_book":   ask_book,
                     "name":       m.get("n", ""),
-                    "is_live":    bool(live),     # True = 盤中即時價
+                    "is_live":    bool(live),
                 }
     except Exception as e:
         print(f"MIS 錯誤（{code}）：{e}", flush=True)
@@ -186,15 +201,18 @@ def _fetch_mis(code: str) -> dict:
 
 
 def _calc_premium(warrant_price: float, stock_price: float,
-                  strike: float, ratio: float) -> str:
+                  strike: float, ratio: float, is_call: bool = True) -> str:
     """
-    計算溢價率（認購）：
-    溢價率 = (權證價/行使比例 + 履約價 - 股價) / 股價 × 100
+    溢價率 = (W/ratio + K - S) / S × 100  （認購）
+           = (W/ratio + S - K) / S × 100  （認售）
     """
     try:
         if ratio <= 0 or stock_price <= 0:
             return ""
-        prem = (warrant_price / ratio + strike - stock_price) / stock_price * 100
+        if is_call:
+            prem = (warrant_price / ratio + strike - stock_price) / stock_price * 100
+        else:
+            prem = (warrant_price / ratio + stock_price - strike) / stock_price * 100
         return f"{prem:.2f}"
     except Exception:
         return ""
@@ -202,14 +220,31 @@ def _calc_premium(warrant_price: float, stock_price: float,
 
 def _calc_leverage(warrant_price: float, stock_price: float,
                    delta: float, ratio: float) -> str:
-    """實際槓桿 = Delta × 股價 / (權證價 × 行使比例 × 1000 / 1000)"""
+    """有效槓桿 = |Delta| × 股價 / (W / ratio)"""
     try:
         if warrant_price <= 0 or ratio <= 0:
             return ""
-        lev = delta * stock_price / (warrant_price / ratio)
+        lev = abs(delta) * stock_price / (warrant_price / ratio)
         return f"{lev:.2f}"
     except Exception:
         return ""
+
+
+# ── 生命週期狀態 ──────────────────────────────────────────────────
+
+def _warrant_status(row: dict) -> str:
+    """
+    回傳 'active' / 'near_expiry'（≤30天）/ 'expired'
+    """
+    exp = _expiry(row)
+    if not exp:
+        return "unknown"
+    days = _days_to_expiry(exp)
+    if days <= 0:
+        return "expired"
+    if days <= 30:
+        return "near_expiry"
+    return "active"
 
 
 # ── 股票代號 / 中文名稱查詢 ───────────────────────────────────────
@@ -413,10 +448,12 @@ def _score(row: dict, vol_map: dict) -> float:
     score = 0.0
     code  = row.get("權證代號", "")
 
-    # 剩餘天數：要求 >90 天
-    exp  = _expiry(row)
-    days = _days_to_expiry(exp) if exp else 0
-    if days < 90:           # 少於 90 天直接排除
+    # 生命週期：到期/近到期排除
+    status = _warrant_status(row)
+    if status == "expired":
+        return -999.0
+    days = _days_to_expiry(_expiry(row)) if _expiry(row) else 0
+    if days < 90:
         return -999.0
     if   90 <= days <= 180: score += 30.0
     elif days > 180:        score += 20.0
@@ -427,30 +464,34 @@ def _score(row: dict, vol_map: dict) -> float:
     elif vol > 500_000:   score += 20.0
     elif vol > 100_000:   score += 10.0
     elif vol > 0:         score +=  2.0
+    else:                 score -= 10.0   # 零成交流動性扣分
 
     # 溢價率（低為佳）
     try:
         prem = float(_premium(row).replace("%", ""))
-        if   prem < 3:   score += 20.0
+        if   prem < 0:   score -= 30.0   # 折價異常
+        elif prem < 3:   score += 20.0
         elif prem < 6:   score += 12.0
         elif prem < 10:  score +=  5.0
-        elif prem >= 15: score -=  5.0
+        elif prem < 20:  pass
+        else:            score -= 15.0   # 溢價過高
     except Exception:
         pass
 
     # Delta（認購 0.3~0.6 最佳）
     try:
         delta = abs(float(_delta(row)))
-        if   0.3 <= delta <= 0.6:          score += 15.0
-        elif 0.2 <= delta < 0.3 or 0.6 < delta <= 0.75: score += 8.0
+        if   0.3 <= delta <= 0.6:                        score += 15.0
+        elif 0.2 <= delta < 0.3 or 0.6 < delta <= 0.75: score +=  8.0
     except Exception:
         pass
 
-    # 實際槓桿（5~15 倍最佳）
+    # 有效槓桿（5~15 倍最佳）
     try:
         lev = float(_leverage(row))
-        if   5 <= lev <= 15:             score += 15.0
+        if   5 <= lev <= 15:              score += 15.0
         elif 3 <= lev < 5 or 15 < lev <= 25: score +=  7.0
+        elif lev > 25:                    score -=  5.0   # 槓桿過高風險
     except Exception:
         pass
 
@@ -499,79 +540,125 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
     mis_vol  = mis.get("volume", "")
     is_live  = mis.get("is_live", False)
 
-    # Delta / IV — TWSE API 不提供；嘗試從歷史資料庫估算
-    delta_s = _delta(row)
+    # ── Black-Scholes 計算（IV / Greeks）────────────────────────
+    delta_s = _delta(row)   # API 欄位（通常空白）
     iv_s    = _iv(row)
-    if not delta_s:
+    theta_s = ""
+    gamma_s = ""
+    bs_ok   = False
+    anomaly_flag = ""
+
+    if stock_price > 0 and curr_p and strike_s and ratio_f > 0:
         try:
-            from warrant_db import calc_delta, get_history_days
-            est = calc_delta(code)
-            if est is not None:
-                days_hist = get_history_days(code)
-                delta_s = f"≈{est:.3f}（{days_hist}日估算）"
+            from warrant_bs import full_calc
+            w_p = float(curr_p)
+            k   = float(strike_s)
+            d_i = int(days) if isinstance(days, int) else 0
+            if w_p > 0 and k > 0 and d_i > 0:
+                is_call = "購" in wt
+                bs = full_calc(stock_price, k, d_i, w_p, ratio_f, is_call)
+                if bs:
+                    if "iv" in bs:
+                        iv_s    = f"{bs['iv']:.1f}"
+                        bs_ok   = True
+                    if "delta"  in bs: delta_s = str(bs["delta"])
+                    if "theta"  in bs: theta_s = str(bs["theta"])
+                    if "gamma"  in bs: gamma_s = str(bs["gamma"])
+                    if "leverage" in bs:
+                        lev_s = f"{bs['leverage']:.2f}"
+                    if bs.get("premium_pct") is not None:
+                        prem_s = f"{bs['premium_pct']:.2f}"
+                    anomaly_flag = bs.get("anomaly", "")
         except Exception:
             pass
 
-    # 溢價率：優先 API，其次自算
-    prem_s = _premium(row)
-    if not prem_s:
-        try:
-            w  = float(curr_p)
-            k  = float(strike_s)
-            s  = stock_price
-            r  = ratio_f
-            if w > 0 and k > 0 and s > 0 and r > 0:
-                prem_s = _calc_premium(w, s, k, r)
-        except Exception:
-            pass
+    # Fallback：若 BS 算不出（缺股價等），嘗試舊版手算
+    if not bs_ok:
+        # 溢價率：API 或手算
+        prem_s = _premium(row)
+        if not prem_s:
+            try:
+                w = float(curr_p); k = float(strike_s)
+                if w > 0 and k > 0 and stock_price > 0 and ratio_f > 0:
+                    is_call = "購" in wt
+                    prem_s = _calc_premium(w, stock_price, k, ratio_f, is_call)
+            except Exception:
+                pass
 
-    # 實際槓桿：優先 API，其次自算（需 Delta）
-    lev_s = _leverage(row)
-    if not lev_s and delta_s:
-        try:
-            w = float(curr_p)
-            s = stock_price
-            d = abs(float(delta_s))
-            r = ratio_f
-            if w > 0 and r > 0:
-                lev_s = _calc_leverage(w, s, d, r)
-        except Exception:
-            pass
-    # Delta 不可得時，用價格槓桿（intrinsic）估算
-    if not lev_s and stock_price > 0:
-        try:
-            w = float(curr_p)
-            if w > 0 and ratio_f > 0:
-                il = stock_price * ratio_f / w
-                lev_s = f"≈{il:.1f}（估算，非有效槓桿）"
-        except Exception:
-            pass
+        # Delta：歷史資料庫估算
+        if not delta_s:
+            try:
+                from warrant_db import calc_delta as db_calc_delta, get_history_days
+                est = db_calc_delta(code)
+                if est is not None:
+                    h_days = get_history_days(code)
+                    delta_s = f"≈{est:.3f}（{h_days}日歷史估算）"
+            except Exception:
+                pass
+
+        # 槓桿：有 Delta 用有效槓桿，否則用價格槓桿
+        lev_s = _leverage(row)
+        if not lev_s:
+            try:
+                w = float(curr_p)
+                d = abs(float(str(delta_s).split("（")[0].replace("≈", ""))) if delta_s else 0
+                if d > 0 and w > 0 and ratio_f > 0:
+                    lev_s = _calc_leverage(w, stock_price, d, ratio_f)
+                elif w > 0 and ratio_f > 0 and stock_price > 0:
+                    il = stock_price * ratio_f / w
+                    lev_s = f"≈{il:.1f}（價格槓桿）"
+            except Exception:
+                pass
 
     vol    = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
     prefix = f"#{rank} " if rank else ""
+    status = _warrant_status(row)
+    status_tag = " ⚠️即將到期" if status == "near_expiry" else ""
 
-    # 標的股票價格（從 stock_mis 取）
+    # 標的股票價格
     s_mis    = stock_mis or {}
     sp_str   = s_mis.get("price", "")
     sp_live  = s_mis.get("is_live", False)
     sp_label = "現價" if sp_live else "昨收"
 
+    # 五檔造市商資訊（盤中才顯示）
+    bid_book = mis.get("bid_book", [])
+    ask_book = mis.get("ask_book", [])
+    orderbook_lines = []
+    if is_live and (bid_book or ask_book):
+        orderbook_lines.append("  【五檔】  賣 ← 買")
+        for i in range(max(len(bid_book), len(ask_book))):
+            b = bid_book[i] if i < len(bid_book) else ("—", "—")
+            a = ask_book[i] if i < len(ask_book) else ("—", "—")
+            orderbook_lines.append(f"  {b[0]}×{b[1]}張  |  {a[0]}×{a[1]}張")
+
     lines = [
-        f"{prefix}**{name}**（{code}） — {wt}",
+        f"{prefix}**{name}**（{code}） — {wt}{status_tag}",
         f"  標的：{und_n}（{und_c}）",
     ]
     if sp_str:
         lines.append(f"  標的{sp_label}：{sp_str} 元")
+
     w_label = "現價" if is_live else "昨收"
-    lines.append(f"  權證{w_label}：{close if not is_live else curr_p} 元")
+    w_display = curr_p if is_live else close
+    lines.append(f"  權證{w_label}：{w_display} 元")
+
     if is_live and curr_p != close:
-        lines.append(f"  權證現價：{curr_p} 元  買：{bid}  賣：{ask}")
+        bid_disp = f"{bid}×{mis.get('bid_vol','')}張" if bid else "—"
+        ask_disp = f"{ask}×{mis.get('ask_vol','')}張" if ask else "—"
+        lines.append(f"  買：{bid_disp}  賣：{ask_disp}")
+
+    lines += orderbook_lines
+
     lines += [
         f"  到期日：{exp}（剩 {days} 天）",
         f"  履約價：{_na(strike_s)} 元 | 行使比例：{_na(ratio_s)} 股/千單位",
-        f"  溢價率：{_na(prem_s)}% | 實際槓桿：{_na(lev_s)} | Delta：{_na(delta_s)} | IV：{_na(iv_s)}",
-        f"  發行量：{issued} 仟單位 | 今日成交張數：{vol}",
+        f"  IV：{_na(iv_s)}%{'(BS)' if bs_ok else ''} | Delta：{_na(delta_s)} | Theta：{_na(theta_s)}/日",
+        f"  溢價率：{_na(prem_s)}% | 有效槓桿：{_na(lev_s)}倍",
+        f"  發行量：{issued} 仟 | 今日成交：{vol} 張",
     ]
+    if anomaly_flag:
+        lines.append(f"  ⚠️ 異常警示：{anomaly_flag}")
     return "\n".join(lines)
 
 
@@ -677,14 +764,32 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     print(f"🔍 分析權證 {wc}: und_code={und_code}, stock_price={stock_price}, "
           f"warrant_price={mis_w.get('price','?')}", flush=True)
 
-    # 記錄價格快照（供 Delta 估算累積）
+    # 記錄價格快照（供 Delta 估算、IV 歷史、BS 快取）
     try:
-        ratio_s = _ratio(target)
-        ratio_f_rec = float(ratio_s) / 1000.0 if ratio_s else 1.0
+        ratio_s_rec = _ratio(target)
+        ratio_f_rec = float(ratio_s_rec) / 1000.0 if ratio_s_rec else 1.0
         w_p = float(mis_w.get("price", 0) or 0)
-        if w_p > 0 and stock_price > 0 and und_code:
-            from warrant_db import record_price
-            record_price(wc, und_code, w_p, stock_price, ratio_f_rec)
+        if w_p > 0 and und_code:
+            from warrant_bs import full_calc
+            from warrant_db import record_price, save_bs_cache
+            is_call_rec = "購" in _wtype(target)
+            strike_rec  = _strike(target)
+            days_rec    = _days_to_expiry(_expiry(target))
+            bs_rec: dict = {}
+            if stock_price > 0 and strike_rec and days_rec > 0:
+                try:
+                    k_rec = float(strike_rec)
+                    bs_rec = full_calc(stock_price, k_rec, days_rec,
+                                       w_p, ratio_f_rec, is_call_rec)
+                    if bs_rec:
+                        save_bs_cache(wc, bs_rec)
+                except Exception:
+                    pass
+            record_price(
+                wc, und_code, w_p, stock_price, ratio_f_rec,
+                iv_bs=bs_rec.get("iv"), delta_bs=bs_rec.get("delta"),
+                premium_pct=bs_rec.get("premium_pct"),
+            )
     except Exception:
         pass
 

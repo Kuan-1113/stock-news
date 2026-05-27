@@ -50,6 +50,8 @@ def init_db():
                     wtype       TEXT,
                     und_code    TEXT,
                     expiry      TEXT,
+                    status      TEXT DEFAULT 'active',
+                    is_anomaly  INTEGER DEFAULT 0,
                     raw         TEXT NOT NULL,
                     updated_at  TEXT
                 );
@@ -57,6 +59,8 @@ def init_db():
                     ON warrant_basic(und_code);
                 CREATE INDEX IF NOT EXISTS idx_basic_exp
                     ON warrant_basic(expiry);
+                CREATE INDEX IF NOT EXISTS idx_basic_status
+                    ON warrant_basic(status);
 
                 CREATE TABLE IF NOT EXISTS warrant_daily (
                     code        TEXT,
@@ -74,16 +78,43 @@ def init_db():
                     recorded_at TEXT NOT NULL,
                     w_price     REAL,
                     s_price     REAL,
-                    ratio_f     REAL
+                    ratio_f     REAL,
+                    iv_bs       REAL,
+                    delta_bs    REAL,
+                    premium_pct REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_ph_code
                     ON price_history(code, recorded_at DESC);
+
+                CREATE TABLE IF NOT EXISTS bs_cache (
+                    code        TEXT PRIMARY KEY,
+                    cached_at   TEXT,
+                    iv          REAL,
+                    delta       REAL,
+                    theta       REAL,
+                    gamma       REAL,
+                    leverage    REAL,
+                    premium_pct REAL,
+                    anomaly     TEXT
+                );
 
                 CREATE TABLE IF NOT EXISTS db_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT
                 );
             """)
+            # 遷移：舊表缺少欄位時補上（相容既有 DB）
+            for migration in [
+                "ALTER TABLE warrant_basic ADD COLUMN status TEXT DEFAULT 'active'",
+                "ALTER TABLE warrant_basic ADD COLUMN is_anomaly INTEGER DEFAULT 0",
+                "ALTER TABLE price_history ADD COLUMN iv_bs REAL",
+                "ALTER TABLE price_history ADD COLUMN delta_bs REAL",
+                "ALTER TABLE price_history ADD COLUMN premium_pct REAL",
+            ]:
+                try:
+                    c.execute(migration)
+                except Exception:
+                    pass   # 欄位已存在
     print(f"✅ 權證資料庫就緒：{DB_PATH}", flush=True)
 
 
@@ -230,10 +261,12 @@ def daily_age_hours() -> float:
 # ── 歷史價格快照 ──────────────────────────────────────────────────
 
 def record_price(code: str, und_code: str,
-                 w_price: float, s_price: float, ratio_f: float):
+                 w_price: float, s_price: float, ratio_f: float,
+                 iv_bs: float = None, delta_bs: float = None,
+                 premium_pct: float = None):
     """
     記錄一次價格快照（同一天已有記錄則跳過）。
-    每天呼叫一次即可；收盤後由排程批量更新。
+    包含 BS 計算結果（IV / Delta / 溢價率）方便長期趨勢分析。
     """
     if w_price <= 0:
         return
@@ -248,14 +281,16 @@ def record_price(code: str, und_code: str,
                 return
             c.execute("""
                 INSERT INTO price_history
-                    (code, und_code, recorded_at, w_price, s_price, ratio_f)
-                VALUES (?,?,?,?,?,?)
+                    (code, und_code, recorded_at, w_price, s_price, ratio_f,
+                     iv_bs, delta_bs, premium_pct)
+                VALUES (?,?,?,?,?,?,?,?,?)
             """, (
                 code, und_code,
                 datetime.datetime.now().isoformat(),
                 w_price,
                 s_price if s_price > 0 else None,
                 ratio_f if ratio_f > 0 else None,
+                iv_bs, delta_bs, premium_pct,
             ))
 
 
@@ -307,9 +342,7 @@ def get_history_days(code: str) -> int:
 
 
 def get_tracked_warrants(limit: int = 200) -> list[dict]:
-    """
-    回傳最近有記錄的權證清單（供排程批量更新）
-    """
+    """回傳最近有記錄的權證清單（供排程批量更新）"""
     with _conn() as c:
         rows = c.execute("""
             SELECT code, und_code,
@@ -324,3 +357,136 @@ def get_tracked_warrants(limit: int = 200) -> list[dict]:
         {"code": r["code"], "und_code": r["und_code"] or "", "ratio_f": r["ratio_f"] or 1.0}
         for r in rows
     ]
+
+
+# ── 生命週期狀態同步 ──────────────────────────────────────────────
+
+def sync_warrant_status():
+    """
+    依據到期日將 warrant_basic 的 status 欄位更新：
+    - expired     : expiry <= today
+    - near_expiry : expiry <= today + 30 days
+    - active      : otherwise
+    此函式在每日排程時呼叫一次即可。
+    """
+    today   = datetime.date.today()
+    near_dt = today + datetime.timedelta(days=30)
+    today_s = today.isoformat().replace("-", "")
+    near_s  = near_dt.isoformat().replace("-", "")
+
+    with _lock:
+        with _conn() as c:
+            c.execute("""
+                UPDATE warrant_basic SET status='expired'
+                WHERE expiry != '' AND expiry <= ?
+            """, (today_s,))
+            c.execute("""
+                UPDATE warrant_basic SET status='near_expiry'
+                WHERE expiry > ? AND expiry <= ? AND status != 'expired'
+            """, (today_s, near_s))
+            c.execute("""
+                UPDATE warrant_basic SET status='active'
+                WHERE expiry > ? AND status NOT IN ('expired','near_expiry')
+            """, (near_s,))
+            expired_cnt = c.execute(
+                "SELECT COUNT(*) FROM warrant_basic WHERE status='expired'"
+            ).fetchone()[0]
+            near_cnt = c.execute(
+                "SELECT COUNT(*) FROM warrant_basic WHERE status='near_expiry'"
+            ).fetchone()[0]
+    print(f"✅ 狀態同步：已到期 {expired_cnt}，即將到期 {near_cnt}", flush=True)
+
+
+# ── 異常標記 ──────────────────────────────────────────────────────
+
+def mark_anomaly(code: str, is_anomaly: bool = True):
+    """標記單一權證為異常（溢價過高/零成交等）"""
+    with _lock:
+        with _conn() as c:
+            c.execute(
+                "UPDATE warrant_basic SET is_anomaly=? WHERE code=?",
+                (1 if is_anomaly else 0, code),
+            )
+
+
+def get_anomaly_codes() -> set[str]:
+    """回傳所有已標記異常的代號集合"""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT code FROM warrant_basic WHERE is_anomaly=1"
+        ).fetchall()
+    return {r["code"] for r in rows}
+
+
+# ── BS 快取（避免重複計算）────────────────────────────────────────
+
+def save_bs_cache(code: str, bs_result: dict):
+    """儲存 Black-Scholes 計算結果（用於排行 / 比較）"""
+    now = datetime.datetime.now().isoformat()
+    with _lock:
+        with _conn() as c:
+            c.execute("""
+                INSERT OR REPLACE INTO bs_cache
+                    (code, cached_at, iv, delta, theta, gamma, leverage, premium_pct, anomaly)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                code, now,
+                bs_result.get("iv"),
+                bs_result.get("delta"),
+                bs_result.get("theta"),
+                bs_result.get("gamma"),
+                bs_result.get("leverage"),
+                bs_result.get("premium_pct"),
+                bs_result.get("anomaly", ""),
+            ))
+
+
+def get_bs_cache(code: str, max_age_hours: float = 6.0) -> Optional[dict]:
+    """讀取快取的 BS 計算結果（超過 max_age_hours 則視為過期）"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM bs_cache WHERE code=?", (code,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        cached_dt = datetime.datetime.fromisoformat(row["cached_at"])
+        age = (datetime.datetime.now() - cached_dt).total_seconds() / 3600
+        if age > max_age_hours:
+            return None
+    except Exception:
+        return None
+    return dict(row)
+
+
+# ── IV 歷史趨勢 ────────────────────────────────────────────────────
+
+def get_iv_history(code: str, days: int = 30) -> list[dict]:
+    """
+    回傳最近 N 天的 IV 歷史（供 IV Percentile 計算）
+    """
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT DATE(recorded_at) AS dt, iv_bs, premium_pct
+            FROM price_history
+            WHERE code=? AND iv_bs IS NOT NULL AND recorded_at >= ?
+            ORDER BY recorded_at
+        """, (code, cutoff)).fetchall()
+    return [{"date": r["dt"], "iv": r["iv_bs"], "premium": r["premium_pct"]} for r in rows]
+
+
+def calc_iv_percentile(code: str) -> Optional[float]:
+    """
+    計算當前 IV 相對歷史的百分位（0-100），
+    用於判斷現在 IV 是偏高還是偏低。
+    """
+    hist = get_iv_history(code, days=90)
+    if len(hist) < 5:
+        return None
+    ivs = [h["iv"] for h in hist if h["iv"]]
+    if not ivs:
+        return None
+    current_iv = ivs[-1]
+    below = sum(1 for v in ivs if v <= current_iv)
+    return round(below / len(ivs) * 100, 1)

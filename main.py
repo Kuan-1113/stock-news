@@ -256,11 +256,13 @@ def _daily_scheduler():
                     print(f"⏰ 觸發Podcast追蹤 {'✅' if ok else f'❌ {err}'}", flush=True)
                     _triggered.add(key)
 
-            # 16:30 收盤後批量更新權證價格（Delta 累積）
+            # 16:30 收盤後：批量更新價格 + 同步生命週期狀態
             price_key = f"price-{now.strftime('%Y-%m-%d')}"
             if now.hour == 16 and 30 <= now.minute < 35 and price_key not in _triggered:
                 _triggered.add(price_key)
                 threading.Thread(target=_update_warrant_prices_bg, daemon=True).start()
+                # 同步到期狀態（排除已到期權證，加速後續查詢）
+                threading.Thread(target=warrant_db.sync_warrant_status, daemon=True).start()
 
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
