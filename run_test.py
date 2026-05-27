@@ -11,6 +11,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="repla
 
 # 設定 API Key（從環境變數讀取）
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 print("=" * 60)
 print("股市日報系統 - 功能測試")
@@ -36,7 +37,7 @@ else:
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         msg = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=CLAUDE_MODEL,
             max_tokens=50,
             messages=[{"role": "user", "content": "請用繁體中文回覆：連線測試成功"}],
         )

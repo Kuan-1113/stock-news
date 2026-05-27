@@ -16,6 +16,7 @@ import os, sys, json, re, time, datetime, tempfile, warnings, requests, feedpars
 warnings.filterwarnings("ignore")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 DISCORD_PODCAST   = os.environ.get("DISCORD_PODCAST",
     "https://discord.com/api/webhooks/1508482881864077312/Vd42Ytajzz80KYyHZHwX_EzjfctiW5ZBWq5CccuLHRnElqET5U_qli_1uis31nuvyYVQ")
 
@@ -175,7 +176,7 @@ def claude_call(prompt: str, max_tokens: int = 1600) -> str:
             headers={"x-api-key": ANTHROPIC_API_KEY,
                      "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6",
+            json={"model": CLAUDE_MODEL,
                   "max_tokens": max_tokens,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=90,

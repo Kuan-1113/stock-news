@@ -56,6 +56,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 JIN10_TOKEN       = os.environ.get("JIN10_TOKEN", "")
 REPORT_SESSION    = os.environ.get("REPORT_SESSION", "auto")   # morning / afternoon / evening / auto
 RUN_STATE_FILE    = "run_state.json"
+# Claude 模型名稱（可透過環境變數覆寫，避免 Anthropic 改版時需動程式碼）
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 DISCORD_TW       = os.environ.get("DISCORD_TW",       "https://discord.com/api/webhooks/1507952802662449152/8iumIv-Bs5PTRVlMpFXbE7wH_uzHJlLtmybTHaj1zUDxksQBZwRAOs7v69tvSOezmWnW")
 DISCORD_US       = os.environ.get("DISCORD_US",       "https://discord.com/api/webhooks/1508308789537800242/y6l377lQUOovmgh19He7wn5DlPN2_k19B2ksGVpmErCV46K-o7XSRnoXM97DDkpmglOP")
@@ -197,7 +199,7 @@ def claude_call(prompt: str, max_tokens: int = 1500) -> str:
             "content-type": "application/json",
         }
         payload = {
-            "model": "claude-sonnet-4-6",
+            "model": CLAUDE_MODEL,
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }

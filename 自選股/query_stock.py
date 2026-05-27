@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL       = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 DISCORD_WATCHLIST  = os.environ.get("DISCORD_WATCHLIST", "")
 SYMBOL             = os.environ.get("STOCK_SYMBOL", "2330.TW").strip().upper()
 NAME               = os.environ.get("STOCK_NAME", "").strip()
@@ -40,7 +41,7 @@ def claude_call(prompt: str, max_tokens: int = 1200) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": CLAUDE_MODEL,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },

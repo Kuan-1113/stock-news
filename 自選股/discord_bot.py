@@ -31,6 +31,7 @@ from technical_indicators import get_full_indicators, format_indicators_for_prom
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 GITHUB_PAT        = os.environ.get("GITHUB_PAT", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPO", "Kuan-1113/stock-news")
 
@@ -56,7 +57,7 @@ def _claude_call(prompt: str, max_tokens: int = 1400) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": CLAUDE_MODEL,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },

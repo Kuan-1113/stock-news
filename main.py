@@ -42,6 +42,8 @@ GITHUB_REPO       = os.environ.get("GITHUB_REPO", "Kuan-1113/stock-news")
 # 設定方法：Discord 開啟開發者模式 → 右鍵頻道 → 複製頻道 ID → 填入 QUERY_CHANNEL_ID
 # 留空 = 所有頻道都開放查詢
 QUERY_CHANNEL_ID  = os.environ.get("QUERY_CHANNEL_ID", "")
+# Claude 模型名稱（可透過環境變數覆寫，避免 Anthropic 改版時需動程式碼）
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 import pytz
 TW_TZ = pytz.timezone("Asia/Taipei")
@@ -63,7 +65,7 @@ def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": CLAUDE_MODEL,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
