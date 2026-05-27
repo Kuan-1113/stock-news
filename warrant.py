@@ -17,8 +17,43 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 # ── 快取（附 Lock 避免同時下載）──────────────────────────────────
 _basic_cache: dict   = {"data": None, "ts": 0}
 _daily_cache: dict   = {"data": None, "ts": 0}
+_vol_map_cache: dict = {"data": None, "ts": 0}   # vol_map 單獨快取
 _basic_lock          = threading.Lock()
 _daily_lock          = threading.Lock()
+
+
+def _get_vol_map(daily: list | None = None) -> dict:
+    """
+    取得 {code: daily_row} 的 vol_map，快取 30min 避免每次重建。
+    """
+    now = time.time()
+    if _vol_map_cache["data"] is not None and (now - _vol_map_cache["ts"]) < 1800:
+        return _vol_map_cache["data"]
+    src = daily if daily is not None else _fetch_daily()
+    vm  = {r.get("權證代號", ""): r for r in src}
+    _vol_map_cache["data"] = vm
+    _vol_map_cache["ts"]   = time.time()
+    return vm
+
+
+def _load_bs_cache_bulk(codes: list[str]) -> dict:
+    """
+    批量從 warrant_db.bs_cache 取資料，回傳 {code: row_dict}。
+    避免在 _score() 裡逐筆查 DB。
+    """
+    if not codes:
+        return {}
+    try:
+        from warrant_db import _conn as db_conn
+        placeholders = ",".join("?" * len(codes))
+        with db_conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM bs_cache WHERE code IN ({placeholders})",
+                codes,
+            ).fetchall()
+        return {r["code"]: dict(r) for r in rows}
+    except Exception:
+        return {}
 
 
 def _fetch_basic_all() -> list:
@@ -130,6 +165,7 @@ def _fetch_daily() -> list:
                     threading.Thread(target=save_daily, args=(data,), daemon=True).start()
                 except Exception:
                     pass
+                _vol_map_cache["ts"] = 0   # 讓 vol_map 跟著失效重建
                 return _daily_cache["data"]
         except Exception as e:
             print(f"⚠️  t187ap42_L 下載失敗：{e}", flush=True)
@@ -444,7 +480,12 @@ def _wtype(row: dict) -> str:
 
 # ── 評分 ──────────────────────────────────────────────────────
 
-def _score(row: dict, vol_map: dict) -> float:
+def _score(row: dict, vol_map: dict,
+           bs_cache_map: dict | None = None) -> float:
+    """
+    bs_cache_map: {code: bs_cache_row} 可選傳入，避免重複查 DB。
+    若不傳，嘗試從 warrant_db 單筆查詢（較慢，搜尋時建議批量預載）。
+    """
     score = 0.0
     code  = row.get("權證代號", "")
 
@@ -464,23 +505,39 @@ def _score(row: dict, vol_map: dict) -> float:
     elif vol > 500_000:   score += 20.0
     elif vol > 100_000:   score += 10.0
     elif vol > 0:         score +=  2.0
-    else:                 score -= 10.0   # 零成交流動性扣分
+    else:                 score -= 10.0
+
+    # BS 快取（含溢價率、Delta、槓桿）— 優先使用，fallback TWSE 欄位
+    bs = None
+    if bs_cache_map is not None:
+        bs = bs_cache_map.get(code)
+    else:
+        try:
+            from warrant_db import get_bs_cache
+            bs = get_bs_cache(code)
+        except Exception:
+            pass
+
+    prem_raw  = (bs["premium_pct"] if bs and bs.get("premium_pct") is not None
+                 else _premium(row).replace("%", "") if _premium(row) else None)
+    delta_raw = (bs["delta"]    if bs and bs.get("delta")    is not None else _delta(row))
+    lev_raw   = (bs["leverage"] if bs and bs.get("leverage") is not None else _leverage(row))
 
     # 溢價率（低為佳）
     try:
-        prem = float(_premium(row).replace("%", ""))
-        if   prem < 0:   score -= 30.0   # 折價異常
+        prem = float(prem_raw)
+        if   prem < 0:   score -= 30.0
         elif prem < 3:   score += 20.0
         elif prem < 6:   score += 12.0
         elif prem < 10:  score +=  5.0
         elif prem < 20:  pass
-        else:            score -= 15.0   # 溢價過高
+        else:            score -= 15.0
     except Exception:
         pass
 
     # Delta（認購 0.3~0.6 最佳）
     try:
-        delta = abs(float(_delta(row)))
+        delta = abs(float(delta_raw))
         if   0.3 <= delta <= 0.6:                        score += 15.0
         elif 0.2 <= delta < 0.3 or 0.6 < delta <= 0.75: score +=  8.0
     except Exception:
@@ -488,12 +545,16 @@ def _score(row: dict, vol_map: dict) -> float:
 
     # 有效槓桿（5~15 倍最佳）
     try:
-        lev = float(_leverage(row))
+        lev = float(lev_raw)
         if   5 <= lev <= 15:              score += 15.0
         elif 3 <= lev < 5 or 15 < lev <= 25: score +=  7.0
-        elif lev > 25:                    score -=  5.0   # 槓桿過高風險
+        elif lev > 25:                    score -=  5.0
     except Exception:
         pass
+
+    # 異常警示（BS 已標記的）
+    if bs and bs.get("anomaly"):
+        score -= 20.0
 
     return score
 
@@ -541,11 +602,14 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
     is_live  = mis.get("is_live", False)
 
     # ── Black-Scholes 計算（IV / Greeks）────────────────────────
-    delta_s = _delta(row)   # API 欄位（通常空白）
-    iv_s    = _iv(row)
-    theta_s = ""
-    gamma_s = ""
-    bs_ok   = False
+    delta_s      = _delta(row)   # API 欄位（通常空白）
+    iv_s         = _iv(row)
+    theta_s      = ""
+    gamma_s      = ""
+    lev_s        = ""            # 初始化（Bug-fix：BS 成功但缺 key 時不 NameError）
+    prem_s       = ""
+    iv_pct_s     = ""            # IV Percentile
+    bs_ok        = False
     anomaly_flag = ""
 
     if stock_price > 0 and curr_p and strike_s and ratio_f > 0:
@@ -569,6 +633,15 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
                     if bs.get("premium_pct") is not None:
                         prem_s = f"{bs['premium_pct']:.2f}"
                     anomaly_flag = bs.get("anomaly", "")
+                    # IV Percentile（需歷史累積才有意義）
+                    if bs_ok:
+                        try:
+                            from warrant_db import calc_iv_percentile
+                            pct = calc_iv_percentile(code)
+                            if pct is not None:
+                                iv_pct_s = f"{pct:.0f}%ile"
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -653,7 +726,7 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
     lines += [
         f"  到期日：{exp}（剩 {days} 天）",
         f"  履約價：{_na(strike_s)} 元 | 行使比例：{_na(ratio_s)} 股/千單位",
-        f"  IV：{_na(iv_s)}%{'(BS)' if bs_ok else ''} | Delta：{_na(delta_s)} | Theta：{_na(theta_s)}/日",
+        f"  IV：{_na(iv_s)}%{'(BS)' if bs_ok else ''}{'  '+iv_pct_s if iv_pct_s else ''} | Delta：{_na(delta_s)} | Theta：{_na(theta_s)}/日",
         f"  溢價率：{_na(prem_s)}% | 有效槓桿：{_na(lev_s)}倍",
         f"  發行量：{issued} 仟 | 今日成交：{vol} 張",
     ]
@@ -666,69 +739,86 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
 
 def search_warrants(stock_input: str, top_n: int = 5) -> str:
     code, zh_name = lookup_stock(stock_input)
-
-    basic_all = _fetch_basic_all()
-    if not basic_all:
-        return "❌ 無法取得權證基本資料，請稍後再試"
-
     today = datetime.date.today()
+    today_s = today.strftime("%Y%m%d")
 
-    # 方式1：用標的代號過濾
-    matched = [
-        r for r in basic_all
-        if _underlying_code(r) == code
-        and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
-    ]
+    # ── 優先用 SQL 查詢（快取DB中已有索引的 und_code 欄位）──────
+    matched: list = []
+    try:
+        from warrant_db import _conn as db_conn
+        import json as _json
+        with db_conn() as c:
+            rows = c.execute(
+                "SELECT raw FROM warrant_basic WHERE und_code=? AND expiry > ? AND status != 'expired'",
+                (code, today_s),
+            ).fetchall()
+            matched = [_json.loads(r["raw"]) for r in rows]
+    except Exception:
+        pass
+
+    # Fallback：記憶體全量過濾（DB 尚未建立時）
+    if not matched:
+        basic_all = _fetch_basic_all()
+        if not basic_all:
+            return "❌ 無法取得權證基本資料，請稍後再試"
+        matched = [
+            r for r in basic_all
+            if _underlying_code(r) == code
+            and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
+        ]
 
     def _wname(r):
         return r.get("權證簡稱", r.get("權證名稱", ""))
 
-    # 方式2：用中文名稱過濾（前3字）
+    # 中文名稱 fallback（前3字）
     if not matched and re.search(r"[一-鿿]", zh_name):
         short = zh_name[:3]
+        basic_all = _fetch_basic_all()
         matched = [
             r for r in basic_all
             if short in _wname(r)
             and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
         ]
 
-    # 方式3：從 t187ap42_L 裡用名稱找代號，再查 t187ap37_L
-    if not matched and re.search(r"[一-鿿]", zh_name):
-        short = zh_name[:3]
-        daily = _fetch_daily()
-        daily_codes = {
-            r["權證代號"] for r in daily
-            if short in r.get("權證名稱", r.get("權證簡稱", ""))
-        }
-        matched = [
-            r for r in basic_all
-            if r.get("權證代號", "") in daily_codes
-            and _parse_date(_expiry(r)) and _parse_date(_expiry(r)) > today
-        ]
-
     if not matched:
-        return f"❌ 找不到 {zh_name}（{code}）的有效認購權證（共查 {len(basic_all)} 筆）"
+        return f"❌ 找不到 {zh_name}（{code}）的有效認購權證"
 
-    # 只取認購（>90 天在 _score 已排除）
+    # 只取認購
     calls = [r for r in matched if "購" in _wtype(r) or "購" in _wname(r)]
     if not calls:
         calls = matched
 
+    # ── vol_map：使用快取，避免每次重建 ─────────────────────────
     daily   = _fetch_daily()
-    vol_map = {r.get("權證代號", ""): r for r in daily}
+    vol_map = _get_vol_map(daily)
 
-    # 成交量篩選：優先選今日有成交的；全無成交才退回所有（避免完全沒結果）
-    MIN_VOL = 1000   # 最低成交張數門檻
+    # 成交量篩選
+    MIN_VOL = 1000
     liquid  = [r for r in calls
                if int(vol_map.get(r.get("權證代號",""), {}).get("成交張數", 0) or 0) >= MIN_VOL]
     if liquid:
         calls = liquid
 
-    ranked = sorted(calls, key=lambda r: _score(r, vol_map), reverse=True)[:top_n]
+    # ── 批量載入 BS Cache（Bug-fix：_score 需要 BS 資料評分）──
+    all_codes = [r.get("權證代號", "") for r in calls]
+    bs_cache_map = _load_bs_cache_bulk(all_codes)
+
+    ranked = sorted(calls,
+                    key=lambda r: _score(r, vol_map, bs_cache_map),
+                    reverse=True)[:top_n]
+
+    # ── 取得標的股票即時價格（Bug-fix：讓 _fmt_warrant 能跑 BS）
+    mis_s       = _fetch_mis(code)
+    stock_price = 0.0
+    try:
+        stock_price = float(mis_s.get("price", 0) or 0)
+    except Exception:
+        pass
 
     lines = [f"**{zh_name}（{code}）認購權證前{len(ranked)}名**\n"]
     for i, row in enumerate(ranked, 1):
-        lines.append(_fmt_warrant(row, vol_map, rank=i))
+        lines.append(_fmt_warrant(row, vol_map, rank=i,
+                                  stock_price=stock_price, stock_mis=mis_s))
         lines.append("")
     return "\n".join(lines)
 
@@ -746,7 +836,7 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     if not target:
         return f"❌ 找不到權證代號 `{wc}`（已查詢 {len(basic_all)} 筆）", ""
 
-    vol_map  = {r.get("權證代號", ""): r for r in daily}
+    vol_map  = _get_vol_map(daily)
     und_code = _underlying_code(target)
 
     # 補充即時資料：取目標權證和標的股票的 MIS 資料
