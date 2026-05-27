@@ -261,6 +261,41 @@ def load_daily_today() -> list:
     return result
 
 
+def get_vol5d_map() -> dict:
+    """
+    批量計算各權證近 7 個日曆日（≈5 交易日）的平均日成交張數。
+    回傳 {code: avg_vol_float}，用於流動性過濾與評分。
+    機器剛啟動無歷史時回傳空 dict（呼叫方應 fallback 至今日量）。
+    """
+    cutoff = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+    try:
+        with _conn() as c:
+            rows = c.execute("""
+                SELECT code,
+                       AVG(
+                           CAST(
+                               REPLACE(
+                                   COALESCE(json_extract(raw, '$.成交張數'), '0'),
+                                   ',', ''
+                               ) AS REAL
+                           )
+                       ) AS avg_vol
+                FROM warrant_daily
+                WHERE trade_date >= ?
+                  AND CAST(
+                          REPLACE(
+                              COALESCE(json_extract(raw, '$.成交張數'), '0'),
+                              ',', ''
+                          ) AS REAL
+                      ) > 0
+                GROUP BY code
+            """, (cutoff,)).fetchall()
+        return {r["code"]: float(r["avg_vol"] or 0) for r in rows}
+    except Exception as e:
+        print(f"⚠️ get_vol5d_map 失敗：{e}", flush=True)
+        return {}
+
+
 def daily_age_hours() -> float:
     return _meta_age_hours("daily_updated_at")
 

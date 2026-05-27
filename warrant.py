@@ -19,6 +19,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 _basic_cache: dict      = {"data": None, "ts": 0}
 _daily_cache: dict      = {"data": None, "ts": 0}
 _vol_map_cache: dict    = {"data": None, "ts": 0}   # vol_map 單獨快取
+_vol5d_cache: dict      = {"data": None, "ts": 0}   # 5日均量快取（1h）
 _tpex_basic_cache: dict = {"data": None, "ts": 0}
 _tpex_daily_cache: dict = {"data": None, "ts": 0}
 _basic_lock             = threading.Lock()
@@ -40,6 +41,24 @@ def _get_vol_map(daily: list | None = None) -> dict:
     _vol_map_cache["data"] = vm
     _vol_map_cache["ts"]   = time.time()
     return vm
+
+
+def _get_vol5d_map() -> dict[str, float]:
+    """
+    取得 {code: 5日平均日成交張數}，快取 1h。
+    從 warrant_daily DB 的歷史記錄計算；機器剛啟動無歷史時回傳空 dict。
+    """
+    now = time.time()
+    if _vol5d_cache["data"] is not None and (now - _vol5d_cache["ts"]) < 3600:
+        return _vol5d_cache["data"]
+    try:
+        from warrant_db import get_vol5d_map
+        vm = get_vol5d_map()
+        _vol5d_cache["data"] = vm
+        _vol5d_cache["ts"]   = time.time()
+        return vm
+    except Exception:
+        return {}
 
 
 def _load_bs_cache_bulk(codes: list[str]) -> dict:
@@ -604,10 +623,11 @@ def _wtype(row: dict) -> str:
 # ── 評分 ──────────────────────────────────────────────────────
 
 def _score(row: dict, vol_map: dict,
-           bs_cache_map: dict | None = None) -> float:
+           bs_cache_map: dict | None = None,
+           vol5d_map: dict | None = None) -> float:
     """
     bs_cache_map: {code: bs_cache_row} 可選傳入，避免重複查 DB。
-    若不傳，嘗試從 warrant_db 單筆查詢（較慢，搜尋時建議批量預載）。
+    vol5d_map   : {code: avg_5d_vol}   可選傳入，5日均量優先於今日量評分。
     """
     score = 0.0
     code  = row.get("權證代號", "")
@@ -622,13 +642,16 @@ def _score(row: dict, vol_map: dict,
     if   90 <= days <= 180: score += 30.0
     elif days > 180:        score += 20.0
 
-    # 成交張數（流動性）
-    vol = int(vol_map.get(code, {}).get("成交張數", 0) or 0)
-    if   vol > 1_000_000: score += 30.0
-    elif vol > 500_000:   score += 20.0
-    elif vol > 100_000:   score += 10.0
-    elif vol > 0:         score +=  2.0
-    else:                 score -= 10.0
+    # 流動性：優先用 5日均量，無則用今日量
+    vol5d    = float(vol5d_map.get(code, 0)) if vol5d_map else 0.0
+    vol_today = int(vol_map.get(code, {}).get("成交張數", 0) or 0)
+    vol = vol5d if vol5d > 0 else float(vol_today)
+
+    if   vol > 500_000: score += 30.0   # 超高流動
+    elif vol > 100_000: score += 20.0   # 高流動
+    elif vol > 20_000:  score += 10.0   # 中流動
+    elif vol > 1_000:   score +=  2.0   # 低流動
+    else:               score -= 10.0   # 無/極低流動
 
     # BS 快取（含溢價率、Delta、槓桿）— 優先使用，fallback TWSE 欄位
     bs = None
@@ -716,13 +739,20 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
         ratio_f = 0.0
 
     # 權證昨收/現價
-    mis      = mis_data or {}
-    close    = mis.get("prev_close") or _prev_close(row) or "—"
-    curr_p   = mis.get("price") or close
-    bid      = mis.get("bid", "")
-    ask      = mis.get("ask", "")
-    mis_vol  = mis.get("volume", "")
-    is_live  = mis.get("is_live", False)
+    # fallback 鏈：MIS昨收 → t187ap42_L收盤價 → TWSE靜態欄位
+    mis         = mis_data or {}
+    daily_row   = vol_map.get(code, {})
+    daily_close = str(daily_row.get("收盤價", "") or "").strip()
+    close       = mis.get("prev_close") or daily_close or _prev_close(row) or "—"
+    curr_p      = mis.get("price") or close
+    bid         = mis.get("bid", "")
+    ask         = mis.get("ask", "")
+    mis_vol     = mis.get("volume", "")
+    is_live     = mis.get("is_live", False)
+
+    # 5日均量（模組快取，不影響外部傳參）
+    vol5d_map_inner = _get_vol5d_map()
+    vol5d_val       = vol5d_map_inner.get(code, 0.0)
 
     # ── Black-Scholes 計算（IV / Greeks）────────────────────────
     delta_s      = _delta(row)
@@ -810,7 +840,8 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
             except Exception:
                 pass
 
-    vol    = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
+    # vol_today_disp 在後面的 lines 裡計算，此行廢棄但保留 vol for _score fallback
+    vol = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
     prefix = f"#{rank} " if rank else ""
     status = _warrant_status(row)
     status_tag = " ⚠️即將到期" if status == "near_expiry" else ""
@@ -851,12 +882,19 @@ def _fmt_warrant(row: dict, vol_map: dict, rank: int | None = None,
 
     lines += orderbook_lines
 
+    # 成交量顯示：今日 + 5日均量（若有）
+    vol_today_disp = mis_vol or vol_map.get(code, {}).get("成交張數", "N/A")
+    if vol5d_val and vol5d_val > 0:
+        vol_disp = f"{vol_today_disp}張（5日均量 {vol5d_val:,.0f}張）"
+    else:
+        vol_disp = f"{vol_today_disp}張"
+
     lines += [
         f"  到期日：{exp}（剩 {days} 天）",
         f"  履約價：{_na(strike_s)} 元 | 行使比例：{_na(ratio_s)} 股/千單位",
         f"  IV：{_na(iv_s)}%{'(BS)' if bs_ok else ''}{'  '+iv_pct_s if iv_pct_s else ''} | Delta：{_na(delta_s)} | Theta：{_na(theta_s)}/日",
         f"  溢價率：{_na(prem_s)}% | 有效槓桿：{_na(lev_s)}倍",
-        f"  發行量：{issued} 仟 | 今日成交：{vol} 張",
+        f"  發行量：{issued} 仟 | 今日成交：{vol_disp}",
     ]
     if anomaly_flag:
         lines.append(f"  ⚠️ 異常警示：{anomaly_flag}")
@@ -920,22 +958,30 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     daily   = _fetch_daily()
     vol_map = _get_vol_map(daily)
 
-    # 成交量篩選
-    MIN_VOL = 1000
-    liquid  = [r for r in calls
-               if int(vol_map.get(r.get("權證代號",""), {}).get("成交張數", 0) or 0) >= MIN_VOL]
+    # ── 5日均量篩選（優先），fallback 今日量 ──────────────────
+    vol5d_map = _get_vol5d_map()
+    MIN_VOL5D = 500    # 5日均量 >= 500張/日
+    MIN_VOL1D = 1000   # 或今日量 >= 1000張
+
+    def _has_liquidity(r):
+        c5 = r.get("權證代號", "")
+        v5 = vol5d_map.get(c5, 0.0)
+        v1 = int(vol_map.get(c5, {}).get("成交張數", 0) or 0)
+        return v5 >= MIN_VOL5D or v1 >= MIN_VOL1D
+
+    liquid = [r for r in calls if _has_liquidity(r)]
     if liquid:
         calls = liquid
 
-    # ── 批量載入 BS Cache（Bug-fix：_score 需要 BS 資料評分）──
+    # ── 批量載入 BS Cache（_score 需要 BS 資料評分）───────────
     all_codes = [r.get("權證代號", "") for r in calls]
     bs_cache_map = _load_bs_cache_bulk(all_codes)
 
     ranked = sorted(calls,
-                    key=lambda r: _score(r, vol_map, bs_cache_map),
+                    key=lambda r: _score(r, vol_map, bs_cache_map, vol5d_map),
                     reverse=True)[:top_n]
 
-    # ── 批量 MIS：一次取標的股票 + 所有上榜權證的即時報價 ─────
+    # ── 批量 MIS：標的股票 + 所有上榜權證即時報價 ─────────────
     warrant_pairs = [
         (r.get("權證代號", ""), "otc" if r.get("_source") == "tpex" else "tw")
         for r in ranked
@@ -943,7 +989,7 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
     all_pairs = [(code, "tw")] + warrant_pairs
     mis_batch = _fetch_mis_batch(all_pairs)
 
-    # 若上市查不到股票，補試上櫃
+    # 股票價格：MIS tw → MIS otc → Yahoo Finance（最後防線）
     mis_s = mis_batch.get(code, {})
     if not mis_s.get("price"):
         otc_batch = _fetch_mis_batch([(code, "otc")])
@@ -954,6 +1000,22 @@ def search_warrants(stock_input: str, top_n: int = 5) -> str:
         stock_price = float(mis_s.get("price", 0) or 0)
     except Exception:
         pass
+
+    if stock_price <= 0:
+        try:
+            yf = requests.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{code}.TW"
+                "?interval=1d&range=3d",
+                headers=HEADERS, timeout=8,
+            )
+            if yf.status_code == 200:
+                closes = yf.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                c = next((x for x in reversed(closes) if x), None)
+                if c:
+                    stock_price = float(c)
+                    mis_s = {"price": f"{c:.2f}", "is_live": False}
+        except Exception:
+            pass
 
     lines = [f"**{zh_name}（{code}）認購權證前{len(ranked)}名**\n"]
     for i, row in enumerate(ranked, 1):
@@ -991,15 +1053,30 @@ def analyze_warrant(warrant_code: str) -> tuple[str, str]:
     mis_s: dict = {}
     stock_price = 0.0
     if und_code:
-        # 標的股票先嘗試 tw_；若無資料再試 otc_（上櫃股）
+        # MIS tw → MIS otc → Yahoo Finance（最後防線）
         mis_s = _fetch_mis(und_code, exchange="tw")
         if not mis_s.get("price"):
             mis_s = _fetch_mis(und_code, exchange="otc")
-        sp    = mis_s.get("price", "")
         try:
-            stock_price = float(sp)
+            stock_price = float(mis_s.get("price", 0) or 0)
         except Exception:
             pass
+        if stock_price <= 0:
+            try:
+                yf = requests.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{und_code}.TW"
+                    "?interval=1d&range=3d",
+                    headers=HEADERS, timeout=8,
+                )
+                if yf.status_code == 200:
+                    closes = yf.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    c = next((x for x in reversed(closes) if x), None)
+                    if c:
+                        stock_price = float(c)
+                        mis_s = {"price": f"{c:.2f}", "is_live": False,
+                                 "prev_close": f"{c:.2f}"}
+            except Exception:
+                pass
 
     print(f"🔍 分析權證 {wc}: und_code={und_code}, stock_price={stock_price}, "
           f"warrant_price={mis_w.get('price','?')}", flush=True)
