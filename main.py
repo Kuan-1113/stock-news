@@ -292,21 +292,42 @@ def _update_warrant_prices_bg():
 
 def _daily_scheduler():
     """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報；16:30 更新權證收盤價"""
-    _triggered = set()
+    _triggered   = set()
+    _trigger_ts  = {}   # key → datetime，防止重啟後雙實例在 10 分鐘內重複觸發
     DAILY_HOURS   = {8: "morning", 15: "afternoon", 22: "evening"}
     PODCAST_HOURS = {9, 21}
+
+    # ── 啟動保護：隨機等待 0-8 秒，避免重啟時兩個實例同時觸發 ──
+    import random
+    time.sleep(random.uniform(0, 8))
+
     while True:
         try:
-            now  = datetime.datetime.now(TW_TZ)
-            key  = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
+            now = datetime.datetime.now(TW_TZ)
+            key = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
+
             if now.minute < 5 and key not in _triggered:
-                if now.hour in DAILY_HOURS and GITHUB_PAT:
-                    ok, err = _trigger_workflow("stock-daily.yml", {})
-                    print(f"⏰ 觸發{DAILY_HOURS[now.hour]}日報 {'✅' if ok else f'❌ {err}'}", flush=True)
-                    _triggered.add(key)
-                elif now.hour in PODCAST_HOURS and GITHUB_PAT:
-                    ok, err = _trigger_workflow("podcast.yml", {})
-                    print(f"⏰ 觸發Podcast追蹤 {'✅' if ok else f'❌ {err}'}", flush=True)
+                # 額外保護：同一 key 10 分鐘內不重複觸發（防重啟雙實例）
+                last_ts = _trigger_ts.get(key)
+                too_soon = last_ts and (now - last_ts).total_seconds() < 600
+
+                if not too_soon:
+                    if now.hour in DAILY_HOURS and GITHUB_PAT:
+                        ok, err = _trigger_workflow("stock-daily.yml", {})
+                        status  = '✅' if ok else f'❌ {err}'
+                        print(f"⏰ 觸發{DAILY_HOURS[now.hour]}日報 {status}", flush=True)
+                        _triggered.add(key)
+                        if ok:
+                            _trigger_ts[key] = now
+                    elif now.hour in PODCAST_HOURS and GITHUB_PAT:
+                        ok, err = _trigger_workflow("podcast.yml", {})
+                        status  = '✅' if ok else f'❌ {err}'
+                        print(f"⏰ 觸發Podcast追蹤 {status}", flush=True)
+                        _triggered.add(key)
+                        if ok:
+                            _trigger_ts[key] = now
+                else:
+                    print(f"⏰ 排程：{key} 10分鐘內已觸發，跳過（防重啟雙送）", flush=True)
                     _triggered.add(key)
 
             # 16:30 收盤後：批量更新價格 + 同步生命週期狀態
@@ -314,12 +335,12 @@ def _daily_scheduler():
             if now.hour == 16 and 30 <= now.minute < 35 and price_key not in _triggered:
                 _triggered.add(price_key)
                 threading.Thread(target=_update_warrant_prices_bg, daemon=True).start()
-                # 同步到期狀態（排除已到期權證，加速後續查詢）
                 threading.Thread(target=warrant_db.sync_warrant_status, daemon=True).start()
 
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
                 _triggered.clear()
+                _trigger_ts.clear()
         except Exception as e:
             print(f"⚠️ 排程例外：{e}", flush=True)
         time.sleep(30)

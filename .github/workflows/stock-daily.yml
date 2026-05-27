@@ -45,14 +45,19 @@ jobs:
           python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
           SCHEDULE="${{ github.event.schedule }}"
           if [ "$SCHEDULE" = "10 0 * * *" ]; then
-            echo "REPORT_SESSION=morning"   >> $GITHUB_ENV
+            echo "REPORT_SESSION=morning"             >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤前早報"      >> $GITHUB_ENV
           elif [ "$SCHEDULE" = "10 7 * * *" ]; then
-            echo "REPORT_SESSION=afternoon" >> $GITHUB_ENV
+            echo "REPORT_SESSION=afternoon"           >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤中午報"      >> $GITHUB_ENV
           elif [ "$SCHEDULE" = "10 14 * * *" ]; then
-            echo "REPORT_SESSION=evening"   >> $GITHUB_ENV
+            echo "REPORT_SESSION=evening"             >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤後晚報"      >> $GITHUB_ENV
           else
-            echo "REPORT_SESSION=auto"      >> $GITHUB_ENV
+            echo "REPORT_SESSION=auto"                >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL="              >> $GITHUB_ENV
           fi
+          python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('TODAY_DATE='+datetime.now(tz).strftime('%Y-%m-%d'))" >> $GITHUB_ENV
 
       - name: 🚀 執行台股日報
         env:
@@ -68,7 +73,28 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 先 fetch 最新版，再用 Python 合併寫入（避免並行競速覆蓋）
+          git fetch origin main
+          git checkout origin/main -- run_state.json 2>/dev/null || true
+          python3 - <<'EOF'
+          import json, os, sys
+          f = "run_state.json"
+          state = json.load(open(f, encoding="utf-8")) if os.path.exists(f) else {}
+          today   = os.environ.get("TODAY_DATE", "")
+          session = os.environ.get("REPORT_SESSION_LABEL", "")
+          if today and session:
+              state.setdefault(today, [])
+              if session not in state[today]:
+                  state[today].append(session)
+          # 保留最近 7 天
+          from datetime import datetime, timedelta
+          import pytz
+          cutoff = (datetime.now(pytz.timezone("Asia/Taipei")) - timedelta(days=7)).strftime("%Y-%m-%d")
+          state  = {k: v for k, v in state.items() if k >= cutoff}
+          json.dump(state, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print(f"run_state updated: {session} @ {today}")
+          EOF
           git add run_state.json
           git diff --staged --quiet || git commit -m "chore: update run state [skip ci]"
           git pull --rebase origin main
-          git push
+          git push || (git pull --rebase origin main && git push)
