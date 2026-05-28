@@ -146,17 +146,20 @@ CANDIDATE_STOCKS = [
 # ─────────────────────────────────────────────────────────────
 
 def get_session_info() -> dict:
+    now   = datetime.datetime.now(TW_TZ)
+    today = now.strftime("%m/%d")
+    prev  = (now - datetime.timedelta(days=1)).strftime("%m/%d")
+
     _sessions = {
-        "morning":   {"label": "盤前早報", "period": "前日 22:00 ～ 今日 08:00", "emoji": "🌅", "start_h": 22, "end_h": 8},
-        "afternoon": {"label": "盤中午報", "period": "今日 08:00 ～ 15:00",       "emoji": "☀️", "start_h": 8,  "end_h": 15},
-        "evening":   {"label": "盤後晚報", "period": "今日 15:00 ～ 22:00",       "emoji": "🌙", "start_h": 15, "end_h": 22},
+        "morning":   {"label": "盤前早報", "period": f"{prev} 22:00 ～ {today} 08:00", "emoji": "🌅", "start_h": 22, "end_h": 8},
+        "afternoon": {"label": "盤中午報", "period": f"{today} 08:00 ～ {today} 15:00", "emoji": "☀️", "start_h": 8,  "end_h": 15},
+        "evening":   {"label": "盤後晚報", "period": f"{today} 15:00 ～ {today} 22:00", "emoji": "🌙", "start_h": 15, "end_h": 22},
     }
-    # Workflow 明確傳入時段 → 直接使用（不受延遲影響）
+    # Workflow 明確傳入時段 → 直接使用
     if REPORT_SESSION in _sessions:
         return _sessions[REPORT_SESSION]
     # 自動偵測（手動觸發 / 本機測試）
-    # 加寬邊界：每個時段各有 ±1h 緩衝，避免 GitHub Actions 延遲誤判
-    h = datetime.datetime.now(TW_TZ).hour
+    h = now.hour
     if 7 <= h < 14:
         return _sessions["morning"]
     elif 14 <= h < 21:
@@ -1329,11 +1332,27 @@ def build_market_table(market_data: dict) -> str:
 def run_report():
     print("=" * 65)
     session_info  = get_session_info()
-    today         = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    now_dt        = datetime.datetime.now(TW_TZ)
+    today         = now_dt.strftime("%Y-%m-%d")
+    h             = now_dt.hour
     run_state     = load_run_state()
 
-    print(f"[INIT] REPORT_SESSION={REPORT_SESSION!r}  →  時段={session_info['label']!r}  today={today}")
+    print(f"[INIT] REPORT_SESSION={REPORT_SESSION!r}  →  時段={session_info['label']!r}  today={today}  hour={h:02d}")
     print(f"[INIT] run_state 今日已執行：{run_state.get(today, [])}")
+
+    # ── 時間安全閘（auto 模式下防止在錯誤時段執行）───────────
+    # 僅在 REPORT_SESSION=auto（手動觸發）時生效；cron 觸發時 REPORT_SESSION 已明確設定
+    if REPORT_SESSION == "auto":
+        _valid_hours = {
+            "盤前早報":  set(range(7, 12)),                              # 07-11時
+            "盤中午報":  set(range(14, 18)),                             # 14-17時
+            "盤後晚報":  set(range(21, 24)) | set(range(0, 3)),          # 21-02時
+        }
+        valid = _valid_hours.get(session_info["label"], set(range(0, 24)))
+        if h not in valid:
+            print(f"⏭️  [時間安全閘] 現在 {h:02d}:xx 不在 {session_info['label']} 有效時窗內，略過執行")
+            print("=" * 65)
+            return
 
     # 防重複：同一時段當天已成功執行過就跳過
     if session_info["label"] in run_state.get(today, []):

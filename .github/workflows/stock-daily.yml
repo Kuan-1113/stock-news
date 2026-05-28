@@ -44,18 +44,24 @@ jobs:
         run: |
           python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
           SCHEDULE="${{ github.event.schedule }}"
-          if [ "$SCHEDULE" = "10 0 * * *" ]; then
-            echo "REPORT_SESSION=morning"             >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤前早報"      >> $GITHUB_ENV
-          elif [ "$SCHEDULE" = "10 7 * * *" ]; then
-            echo "REPORT_SESSION=afternoon"           >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤中午報"      >> $GITHUB_ENV
-          elif [ "$SCHEDULE" = "10 14 * * *" ]; then
-            echo "REPORT_SESSION=evening"             >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤後晚報"      >> $GITHUB_ENV
+          echo "DEBUG schedule='$SCHEDULE'"
+          # grep 比對（容許空白差異，比 = 精確比對更穩定）
+          if   echo "$SCHEDULE" | grep -qE '^10\s+0\s';  then
+            echo "REPORT_SESSION=morning"   >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤前早報" >> $GITHUB_ENV
+            echo "✅ 時段 → morning（盤前早報 08:10）"
+          elif echo "$SCHEDULE" | grep -qE '^10\s+7\s';  then
+            echo "REPORT_SESSION=afternoon" >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤中午報" >> $GITHUB_ENV
+            echo "✅ 時段 → afternoon（盤中午報 15:10）"
+          elif echo "$SCHEDULE" | grep -qE '^10\s+14\s'; then
+            echo "REPORT_SESSION=evening"   >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL=盤後晚報" >> $GITHUB_ENV
+            echo "✅ 時段 → evening（盤後晚報 22:10）"
           else
-            echo "REPORT_SESSION=auto"                >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL="              >> $GITHUB_ENV
+            echo "REPORT_SESSION=auto"      >> $GITHUB_ENV
+            echo "REPORT_SESSION_LABEL="    >> $GITHUB_ENV
+            echo "⚠️  手動觸發，使用 auto 時段偵測"
           fi
           python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('TODAY_DATE='+datetime.now(tz).strftime('%Y-%m-%d'))" >> $GITHUB_ENV
 

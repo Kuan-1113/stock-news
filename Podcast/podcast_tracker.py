@@ -342,11 +342,14 @@ def main():
         # 判斷最新集是否為今天發布（判斷台北時間日期）
         today_updated = bool(latest_pub and latest_pub.date() == now_tw.date())
 
-        # 找出未分析過的集數（不再限制發布日期，避免 00:xx 發布的集數被漏掉）
+        # 找出近 48 小時內發布且未分析過的集數
+        # 48 小時視窗：能捕捉到昨夜發布的集數，又不會把超過 2 天的舊集送出去
+        recent_cutoff = now_tw - datetime.timedelta(hours=48)
         new_eps  = []
-        for entry in entries[:10]:   # 只掃前 10 集，避免重處理舊集
-            ep_id = get_episode_id(entry)
-            if ep_id and ep_id not in seen:
+        for entry in entries[:10]:
+            ep_id  = get_episode_id(entry)
+            pub_dt = parse_entry_date(entry)
+            if ep_id and ep_id not in seen and pub_dt and pub_dt >= recent_cutoff:
                 new_eps.append(entry)
 
         new_eps = new_eps[:MAX_NEW_PER_SHOW]
