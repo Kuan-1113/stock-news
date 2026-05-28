@@ -94,6 +94,7 @@ warnings.filterwarnings("ignore")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 JIN10_TOKEN       = os.environ.get("JIN10_TOKEN", "")
 REPORT_SESSION    = os.environ.get("REPORT_SESSION", "auto")   # morning / afternoon / evening / auto
+FORCE_RUN         = os.environ.get("FORCE_RUN", "false").lower() == "true"
 RUN_STATE_FILE    = "run_state.json"
 # Claude 模型名稱（可透過環境變數覆寫，避免 Anthropic 改版時需動程式碼）
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL",      "claude-sonnet-4-6")
@@ -1413,11 +1414,13 @@ def run_report():
             print("=" * 65)
             return
 
-    # 防重複：同一時段當天已成功執行過就跳過
-    if session_info["label"] in run_state.get(today, []):
+    # 防重複：同一時段當天已成功執行過就跳過（FORCE_RUN=true 可略過）
+    if not FORCE_RUN and session_info["label"] in run_state.get(today, []):
         print(f"⏭️  {session_info['label']} 今日已執行（{today}），跳過重複執行")
         print("=" * 65)
         return
+    if FORCE_RUN:
+        print(f"⚡ FORCE_RUN=true，略過防重複檢查")
 
     weekend_note  = "（週末版）" if is_weekend() else ""
     print(f"🚀 股市日報啟動 — {now_str()} {weekend_note}")

@@ -9,7 +9,13 @@ on:
     # 台灣時間 22:00 = UTC 14:00 前5分鐘
     - cron: '55 13 * * *'
   workflow_dispatch:
-    # 允許手動觸發（測試用）
+    inputs:
+      force_run:
+        description: '強制執行（忽略防重複檢查）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
 
 concurrency:
   group: stock-daily
@@ -103,6 +109,7 @@ jobs:
           JIN10_TOKEN: ${{ secrets.JIN10_TOKEN }}
           REPORT_SESSION: ${{ env.REPORT_SESSION }}
           VERIFIED_TW_HOUR: ${{ env.VERIFIED_TW_HOUR }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
