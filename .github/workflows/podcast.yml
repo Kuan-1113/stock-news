@@ -2,10 +2,10 @@ name: 🎙️ Podcast 追蹤與分析
 
 on:
   schedule:
-    # 台灣時間 09:00 = UTC 01:00
-    - cron: '0 1 * * *'
-    # 台灣時間 21:00 = UTC 13:00
-    - cron: '0 13 * * *'
+    # 台灣時間 09:00 → UTC 00:55（提前5min觸發，加 GitHub 排隊延遲約到 09:00±5min）
+    - cron: '55 0 * * *'
+    # 台灣時間 21:00 → UTC 12:55
+    - cron: '55 12 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -40,11 +40,26 @@ jobs:
       - name: 📦 安裝套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser anthropic pytz faster-whisper
+          pip install requests feedparser anthropic pytz faster-whisper ntplib
 
-      - name: 🕐 確認台北時間
+      - name: 🕐 台灣標準時間驗證
         run: |
-          python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
+          python -X utf8 -c "
+          import ntplib, pytz, datetime
+          TW = pytz.timezone('Asia/Taipei')
+          try:
+              c    = ntplib.NTPClient()
+              resp = c.request('time.stdtime.gov.tw', version=3, timeout=5)
+              tw   = datetime.datetime.fromtimestamp(resp.tx_time, tz=TW)
+              print(f'✅ 台灣標準時間（NTP）：{tw.strftime(\"%Y-%m-%d %H:%M:%S %Z\")}')
+          except Exception as e:
+              tw = datetime.datetime.now(TW)
+              print(f'⚠️  NTP 失敗，使用系統時間：{tw.strftime(\"%Y-%m-%d %H:%M:%S %Z\")}')
+          sys_tw = datetime.datetime.now(TW)
+          diff   = abs((tw - sys_tw).total_seconds())
+          print(f'系統差異：{diff:.1f} 秒  |  台北小時：{tw.hour:02d}時')
+          "
+          echo "TZ 驗證完成"
 
       - name: 📥 取得最新 Podcast 狀態（防誤判）
         run: |

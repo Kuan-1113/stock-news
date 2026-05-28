@@ -32,6 +32,46 @@ import schedule
 import pytz
 import io
 
+# ─────────────────────────────────────────────────────────────
+# 台灣標準時間（NTP stdtime.gov.tw → HTTP → 系統備用）
+# ─────────────────────────────────────────────────────────────
+
+def _get_tw_standard_time() -> datetime.datetime:
+    """
+    向台灣國家標準時間伺服器對時（time.stdtime.gov.tw）。
+    失敗時依序降級：worldtimeapi.org → 系統時間。
+    只在 run_report() / main() 啟動時呼叫一次。
+    """
+    TW = pytz.timezone("Asia/Taipei")
+
+    # 1. 優先：台灣 NTP 伺服器（最準確）
+    try:
+        import ntplib as _ntplib
+        c    = _ntplib.NTPClient()
+        resp = c.request('time.stdtime.gov.tw', version=3, timeout=5)
+        t    = datetime.datetime.fromtimestamp(resp.tx_time, tz=TW)
+        print(f"  ⏰ 台灣標準時間（NTP stdtime.gov.tw）：{t.strftime('%Y-%m-%d %H:%M:%S')}")
+        return t
+    except Exception as e:
+        print(f"  ⚠️  NTP 失敗（{e}）→ 嘗試 HTTP 備援")
+
+    # 2. 備援：worldtimeapi.org
+    try:
+        r = requests.get(
+            "https://worldtimeapi.org/api/timezone/Asia/Taipei",
+            timeout=5, headers={"User-Agent": "stock-report-bot/1.0"})
+        if r.status_code == 200:
+            t = datetime.datetime.fromisoformat(r.json()["datetime"])
+            print(f"  ⏰ 台灣時間（worldtimeapi.org）：{t.strftime('%Y-%m-%d %H:%M:%S')}")
+            return t
+    except Exception as e2:
+        print(f"  ⚠️  HTTP 備援失敗（{e2}）→ 使用系統時間")
+
+    # 3. 最終備用：系統時間（pytz TW_TZ）
+    t = datetime.datetime.now(TW)
+    print(f"  ⏰ 系統時間（pytz 備用）：{t.strftime('%Y-%m-%d %H:%M:%S')}")
+    return t
+
 try:
     import zhconv
     def _s2tw(text: str) -> str:
@@ -1331,26 +1371,45 @@ def build_market_table(market_data: dict) -> str:
 
 def run_report():
     print("=" * 65)
-    session_info  = get_session_info()
-    now_dt        = datetime.datetime.now(TW_TZ)
-    today         = now_dt.strftime("%Y-%m-%d")
-    h             = now_dt.hour
+
+    # ── Step 1：取得台灣標準時間（NTP 對時）──────────────────
+    print("⏰ 向台灣標準時間伺服器對時...")
+    tw_std = _get_tw_standard_time()
+    sys_tw = datetime.datetime.now(TW_TZ)
+    diff   = abs((tw_std - sys_tw).total_seconds())
+    print(f"   系統時間 ：{sys_tw.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   標準時間差：{diff:.1f} 秒{'  ✅ 正常' if diff < 60 else '  ⚠️ 偏差過大，以標準時間為準'}")
+
+    # 優先使用 workflow 傳入的驗證小時（workflow 已對時過）
+    # 次選 NTP 結果，最後才用系統時間
+    _env_h = os.environ.get("VERIFIED_TW_HOUR", "")
+    if _env_h.isdigit():
+        verified_h = int(_env_h)
+        print(f"   使用 workflow 驗證時間：{verified_h:02d}時")
+    else:
+        verified_h = tw_std.hour
+        print(f"   使用 NTP 驗證時間：{verified_h:02d}時")
+
+    # ── Step 2：時段判斷（以驗證後時間為準）─────────────────
+    session_info  = get_session_info()   # 優先用 REPORT_SESSION 環境變數
+    today         = tw_std.strftime("%Y-%m-%d")
     run_state     = load_run_state()
 
-    print(f"[INIT] REPORT_SESSION={REPORT_SESSION!r}  →  時段={session_info['label']!r}  today={today}  hour={h:02d}")
+    print(f"[INIT] REPORT_SESSION={REPORT_SESSION!r}  →  時段={session_info['label']!r}")
+    print(f"[INIT] 台灣標準時間：{tw_std.strftime('%Y-%m-%d %H:%M:%S')}  today={today}")
     print(f"[INIT] run_state 今日已執行：{run_state.get(today, [])}")
 
-    # ── 時間安全閘（auto 模式下防止在錯誤時段執行）───────────
-    # 僅在 REPORT_SESSION=auto（手動觸發）時生效；cron 觸發時 REPORT_SESSION 已明確設定
+    # ── Step 3：時間安全閘（auto 模式使用 NTP 驗證時間）──────
     if REPORT_SESSION == "auto":
         _valid_hours = {
-            "盤前早報":  set(range(7, 12)),                              # 07-11時
-            "盤中午報":  set(range(14, 18)),                             # 14-17時
-            "盤後晚報":  set(range(21, 24)) | set(range(0, 3)),          # 21-02時
+            "盤前早報":  set(range(7, 12)),               # 07-11時
+            "盤中午報":  set(range(14, 18)),              # 14-17時
+            "盤後晚報":  set(range(21, 24)) | {0, 1, 2},  # 21-02時
         }
         valid = _valid_hours.get(session_info["label"], set(range(0, 24)))
-        if h not in valid:
-            print(f"⏭️  [時間安全閘] 現在 {h:02d}:xx 不在 {session_info['label']} 有效時窗內，略過執行")
+        if verified_h not in valid:
+            print(f"⏭️  [時間安全閘] 台灣標準時間 {verified_h:02d}:xx 不在"
+                  f" {session_info['label']} 有效時窗 {sorted(valid)} 內，略過")
             print("=" * 65)
             return
 

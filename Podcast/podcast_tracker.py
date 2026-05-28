@@ -15,6 +15,21 @@ Podcast 追蹤器：RSS 偵測新集數 → faster-whisper 轉逐字稿 → Clau
 import os, sys, json, re, time, datetime, tempfile, warnings, requests, feedparser, pytz
 warnings.filterwarnings("ignore")
 
+
+def _get_tw_standard_time() -> datetime.datetime:
+    """向台灣標準時間 NTP 伺服器對時（失敗時降級備用）"""
+    TW = pytz.timezone("Asia/Taipei")
+    try:
+        import ntplib as _ntplib
+        c    = _ntplib.NTPClient()
+        resp = c.request('time.stdtime.gov.tw', version=3, timeout=5)
+        t    = datetime.datetime.fromtimestamp(resp.tx_time, tz=TW)
+        print(f"⏰ 台灣標準時間（NTP stdtime.gov.tw）：{t.strftime('%Y-%m-%d %H:%M:%S')}")
+        return t
+    except Exception as e:
+        print(f"⚠️  NTP 失敗（{e}），使用系統時間")
+    return datetime.datetime.now(TW)
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 DISCORD_PODCAST   = os.environ.get("DISCORD_PODCAST",
@@ -310,11 +325,12 @@ def send_daily_summary(show_statuses: list):
 
 def main():
     print("=" * 60)
-    print(f"🎙️  Podcast 追蹤器 — {datetime.datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M')}")
+    tw_std = _get_tw_standard_time()
+    print(f"🎙️  Podcast 追蹤器 — {tw_std.strftime('%Y-%m-%d %H:%M')}（台灣標準時間）")
     print("=" * 60)
 
     state        = load_state()
-    now_tw       = datetime.datetime.now(TW_TZ)
+    now_tw       = tw_std
     today_start  = now_tw.replace(hour=0, minute=0, second=0, microsecond=0)
     any_new      = False
     show_statuses = []   # [(name, status_str), ...]
