@@ -116,6 +116,7 @@ jobs:
           python -X utf8 股市日報/stock_daily.py
 
       - name: 💾 更新執行狀態（run_state.json）
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
