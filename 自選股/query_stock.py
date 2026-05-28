@@ -191,7 +191,7 @@ def fetch_yahoo(symbol: str) -> dict:
                 "price":    f"{curr:,.2f}",
                 "change":   f"{chg:+.2f}",
                 "pct":      f"{pct:+.2f}%",
-                "emoji":    "🔴" if pct < 0 else "🟢",
+                "emoji":    "🔴" if pct >= 0 else "🟢",   # 台灣慣例：紅=漲，綠=跌
                 "currency": meta.get("currency", ""),
                 "volume":   f"{vols[-1]:,.0f}" if vols else "N/A",
                 "ma5":      f"{ma5:,.2f}",
@@ -287,7 +287,7 @@ def analyze(symbol: str, name: str, quote: dict, news: str, ind: dict = None, fu
 • 成長面：營收成長（數值）→ 是否持續擴張
 • 52週位置：現價 vs 52週高（數值）/ 低（數值）
 
-📰 **消息面分析**（每則新聞說明是利多🟢或利空🔴及原因，2-4點）
+📰 **消息面分析**（每則新聞說明是利多🔴或利空🟢及原因，2-4點）
 
 🎯 **短期預測（1-2週）**
 • 看多情境：目標價（依據）

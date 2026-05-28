@@ -336,7 +336,7 @@ def fetch_yahoo(symbol: str, name: str = "") -> dict:
             prev, curr = closes[-2], closes[-1]
             chg = curr - prev
             pct = chg / prev * 100
-            emoji = "🔴" if pct < 0 else "🟢"
+            emoji = "🔴" if pct >= 0 else "🟢"   # 台灣慣例：紅=漲，綠=跌
             vols  = [v for v in volumes if v is not None]
             ma5   = sum(closes[-5:])  / min(5,  len(closes)) if closes else None
             ma10  = sum(closes[-10:]) / min(10, len(closes)) if closes else None
@@ -382,7 +382,7 @@ def fetch_crypto() -> dict:
             if cg_id in data:
                 price = data[cg_id]["usd"]
                 pct   = data[cg_id].get("usd_24h_change", 0) or 0
-                emoji = "🔴" if pct < 0 else "🟢"
+                emoji = "🔴" if pct >= 0 else "🟢"   # 台灣慣例：紅=漲，綠=跌
                 results[symbol] = {"price": f"${price:,.2f}", "pct": f"{pct:+.2f}%", "emoji": emoji}
         return results
     except Exception as e:
@@ -770,10 +770,10 @@ def analyze_ai_news(articles: list, session_info: dict) -> str:
 
 ## 🚀 重大突破/新發布（1-3個：是什麼、技術意義、應用影響各一句）
 ## 🤖 AI Agent 動態（新能力或部署進展，說明能做到什麼新事）
-## 💼 商業化衝擊（bullet 格式，受益方前面加🟢，受衝擊方加🔴，每點帶公司名，3-5點）
+## 💼 商業化衝擊（bullet 格式，台灣慣例：受益/股價看漲加🔴，受衝擊/股價看跌加🟢，每點帶公司名，3-5點）
 ## 📈 台灣科技股啟示（**必須完整輸出**，列出 2-3 支台股代號，每支一句說明受益邏輯）
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1400)
+    return _strip_md_tables(claude_call(prompt, max_tokens=1400))
 
 RSS_FEEDS = {
     "tw": [
@@ -897,21 +897,24 @@ def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = 
 【台股新聞（本時段）】
 {build_news_text(articles)}
 
-以繁體中文寫台股日報（800字內），每個論點必帶具體數字或事件，禁空話：
+以繁體中文寫台股日報（900字內），每個論點必帶具體數字或事件，禁空話，嚴禁 Markdown 表格（| 符號），全程 bullet（• 開頭）。
+台灣慣例：🔴=漲，🟢=跌。
 
 **📊 大盤概況** — 一句點出量能與核心驅動
 
-**💹 領漲/領跌族群** — 直接引用上方類股漲跌幅
-• 強勢（前2-3）：族群＋漲幅＋驅動一句；**領漲第一族群須列出龍頭股（依上方清單）**
-• 弱勢（後1-2）：族群＋跌幅＋壓力一句
+**💹 領漲族群（🔴）**
+• 強勢（前2-3）：族群＋🔴漲幅＋驅動一句；**領漲第一族群須列出龍頭股（依上方清單）**
 
-**📌 重點個股**（Markdown 表格，4-5檔）
-| 個股（代號） | 今日表現 | 關鍵事件 | 評估🟢🔴⚪ |
+**📉 弱勢族群（🟢）**
+• 弱勢（後1-2）：族群＋🟢跌幅＋壓力一句
+
+**📌 重點個股**（4-5檔，每檔一行 bullet，嚴禁表格）
+• 個股名稱（代號）：🔴/🟢 漲跌幅，關鍵事件，評估（偏多/偏空/觀望）
 
 **💡 操作建議**（3點，含標的/進場條件/目標/停損）
 
 **⚠️ 主要風險**（1-2句，具體觸發條件）"""
-    return claude_call(prompt, max_tokens=1200)
+    return _strip_md_tables(claude_call(prompt, max_tokens=1400))
 
 def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "", vip_news: dict = None) -> str:
     dji  = market_data.get("dji",  {})
@@ -943,23 +946,26 @@ def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = 
 {build_news_text(articles)}
 {vip_block}
 
-以繁體中文寫美股日報（900字內），每論點帶數字/具體事件：
+以繁體中文寫美股日報（900字內），每論點帶數字/具體事件，嚴禁 Markdown 表格（| 符號），全程 bullet（• 開頭）。
+台灣慣例：🔴=漲，🟢=跌。
 
 **📊 大盤概況** — 三大指數＋核心驅動一句
 
-**🏆 領漲/領跌板塊** — 直接引用上方 ETF 漲跌幅
-• 強勢（前2-3）：板塊（代號 X%）＋驅動一句
-• 弱勢（後1-2）：板塊（代號 X%）＋壓力一句
+**🏆 領漲板塊（🔴）**
+• 強勢（前2-3）：板塊名（ETF代號）🔴 X%，驅動一句
 
-**📌 重點個股**（Markdown 表格，4-5檔）
-| 個股（代號） | 今日表現 | 關鍵事件 | 評估🟢🔴 |
+**📉 弱勢板塊（🟢）**
+• 弱勢（後1-2）：板塊名（ETF代號）🟢 X%，壓力一句
 
-**🏦 Fed & 總經** — 結合新聞，說明哪個數據/聲明驅動定價
+**📌 重點個股**（4-5檔，每檔一行 bullet，嚴禁表格）
+• 個股名稱（代號）：🔴/🟢 漲跌幅，關鍵事件，評估（偏多/偏空/觀望）
 
-**👤 重要人物動態**（馬斯克/川普/黃仁勳 對市場的影響，各1-2句）
+**🏦 Fed & 總經** — 說明哪個數據/聲明驅動定價
+
+**👤 重要人物動態**（馬斯克/川普/黃仁勳，各1-2句）
 
 **💡 操作建議**（3點，含板塊/個股/觸發條件/目標/停損）"""
-    return claude_call(prompt, max_tokens=1400)
+    return _strip_md_tables(claude_call(prompt, max_tokens=1500))
 
 def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
     vix   = market_data.get("vix",   {})
@@ -978,13 +984,21 @@ def analyze_global_news(articles, session_info, market_data, jin10_text: str = "
 {build_news_text(articles)}
 {jin10_text if jin10_text else ''}
 
-以繁體中文寫國際財經日報（800字內，優先參考金十快訊）：
-1. **全球市場情緒**（2句）
-2. **重大事件**（表格：| 事件 | 影響資產 | 利多🟢/利空🔴 | 影響程度 |，3-5個）
-3. **大宗商品與加密**（表格：| 品項 | 價格 | 漲跌 | 驅動 |）
-4. **對台股/亞股影響**（3點，• 開頭）
-5. **本週重要財經數據**（若有）"""
-    return claude_call(prompt, max_tokens=1500)
+以繁體中文寫國際財經日報（900字內，優先參考金十快訊），嚴禁 Markdown 表格（| 符號），全程 bullet（• 開頭）。
+台灣慣例：🔴=漲/利多，🟢=跌/利空。
+
+**🌍 全球市場情緒**（2句）
+
+**📋 重大事件**（3-5個，每個獨立一行 bullet，嚴禁表格）
+• 事件名稱：影響資產名稱 / 🔴利多或🟢利空 / 影響程度（高/中/低）
+
+**🪙 大宗商品與加密**（每項一行 bullet，嚴禁表格）
+• 品項：現價（🔴/🟢 漲跌幅）→ 驅動因素一句
+
+**🇹🇼 對台股/亞股影響**（3點，• 開頭）
+
+**📅 本週重要財經數據**（若有）"""
+    return _strip_md_tables(claude_call(prompt, max_tokens=1600))
 
 def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
     """針對金十數據進行專屬 AI 分析"""
@@ -997,7 +1011,7 @@ def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
 2. **市場情緒**（方向+原因一句）
 3. **台股/亞股影響**（2點，• 開頭）
 4. **今日重要數據時間**（若有）"""
-    return claude_call(prompt, max_tokens=600, model=CLAUDE_MINI_MODEL)
+    return _strip_md_tables(claude_call(prompt, max_tokens=600, model=CLAUDE_MINI_MODEL))
 
 # ─────────────────────────────────────────────────────────────
 # 自選股分析（22:00 執行）
