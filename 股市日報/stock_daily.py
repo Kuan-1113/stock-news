@@ -1400,8 +1400,8 @@ def run_report():
     print(f"[INIT] 台灣標準時間：{tw_std.strftime('%Y-%m-%d %H:%M:%S')}  today={today}")
     print(f"[INIT] run_state 今日已執行：{run_state.get(today, [])}")
 
-    # ── Step 3：時間安全閘（auto 模式使用 NTP 驗證時間）──────
-    if REPORT_SESSION == "auto":
+    # ── Step 3：時間安全閘（auto 模式使用 NTP 驗證時間，FORCE_RUN 可略過）──
+    if REPORT_SESSION == "auto" and not FORCE_RUN:
         _valid_hours = {
             "盤前早報":  set(range(7, 12)),               # 07-11時
             "盤中午報":  set(range(14, 18)),              # 14-17時
