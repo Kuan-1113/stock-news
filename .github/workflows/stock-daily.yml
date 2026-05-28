@@ -11,11 +11,11 @@ on:
   workflow_dispatch:
     inputs:
       force_run:
-        description: '強制執行（忽略防重複檢查）'
+        description: '強制執行（忽略防重複與時間限制）'
         required: false
-        default: 'false'
+        default: 'true'
         type: choice
-        options: ['false', 'true']
+        options: ['true', 'false']
 
 concurrency:
   group: stock-daily
