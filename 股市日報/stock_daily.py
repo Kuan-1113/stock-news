@@ -118,14 +118,6 @@ print(f"🕐 程式啟動時間（台北）：{datetime.datetime.now(TAIPEI_TZ).
 def load_watchlist(path: str = None) -> list:
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "自選股", "watchlist.txt")
-    """
-    從 watchlist.txt 讀取自選股清單。
-    格式：每行「代碼 名稱」，# 開頭為註解，空行忽略。
-    例：
-        2330.TW 台積電
-        NVDA    輝達
-        # 這是註解
-    """
     result = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -381,8 +373,8 @@ def fetch_yahoo(symbol: str, name: str = "") -> dict:
             pct = chg / prev * 100
             emoji = "🔴" if pct >= 0 else "🟢"   # 台灣慣例：紅=漲，綠=跌
             vols  = [v for v in volumes if v is not None]
-            ma5   = sum(closes[-5:])  / min(5,  len(closes)) if closes else None
-            ma10  = sum(closes[-10:]) / min(10, len(closes)) if closes else None
+            ma5   = round(sum(closes[-5:])  / 5,  2) if len(closes) >= 5  else None
+            ma10  = round(sum(closes[-10:]) / 10, 2) if len(closes) >= 10 else None
             return {
                 "name":     name or symbol,
                 "price":    f"{curr:,.2f}",
