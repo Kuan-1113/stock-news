@@ -44,7 +44,7 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule pytz zhconv ntplib
+          pip install requests feedparser schedule pytz zhconv ntplib yfinance
 
       - name: 🕐 台灣標準時間驗證 & 設定時段
         run: |
