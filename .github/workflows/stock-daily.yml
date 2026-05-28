@@ -59,6 +59,11 @@ jobs:
           fi
           python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('TODAY_DATE='+datetime.now(tz).strftime('%Y-%m-%d'))" >> $GITHUB_ENV
 
+      - name: 📥 取得最新執行狀態（防重複執行）
+        run: |
+          git fetch origin main
+          git checkout origin/main -- run_state.json 2>/dev/null || echo "run_state.json 不存在，首次執行"
+
       - name: 🚀 執行台股日報
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

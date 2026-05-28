@@ -188,13 +188,83 @@ def now_str() -> str:
     return now_tw().strftime("%Y-%m-%d %H:%M")
 
 # ─────────────────────────────────────────────────────────────
-# Claude AI
+# Claude AI — 含餘額不足偵測與 Discord 通知
 # ─────────────────────────────────────────────────────────────
+
+# 餘額警告節流：最多每 7 天送一次 Discord 通知，避免天天轟炸
+_BALANCE_ALERT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "balance_alert_state.json")
+_BALANCE_ALERT_THROTTLE_DAYS = 7
+
+# Anthropic 餘額不足時，回應 body 會含有這些關鍵字（HTTP 400 或 402）
+_BALANCE_KEYWORDS = ("credit", "balance", "billing", "payment", "insufficient")
+
+
+def _load_balance_state() -> dict:
+    try:
+        with open(_BALANCE_ALERT_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_balance_state(state: dict):
+    try:
+        with open(_BALANCE_ALERT_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ 無法寫入 balance_alert_state.json：{e}")
+
+
+def _notify_balance_low():
+    """
+    偵測到 API 餘額不足時，發送 Discord 通知。
+    每 {_BALANCE_ALERT_THROTTLE_DAYS} 天最多通知一次，不天天騷擾。
+    """
+    state   = _load_balance_state()
+    today   = datetime.datetime.now(TAIPEI_TZ).date()
+    last_dt = state.get("last_alert_date")
+
+    if last_dt:
+        last_date = datetime.date.fromisoformat(last_dt)
+        if (today - last_date).days < _BALANCE_ALERT_THROTTLE_DAYS:
+            print(f"⏭️ 餘額通知已在 {_BALANCE_ALERT_THROTTLE_DAYS} 天內發送過（{last_dt}），跳過")
+            return
+
+    msg = (
+        "🚨 **Claude API 餘額不足 — 報告分析功能已中斷**\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"偵測時間：{datetime.datetime.now(TAIPEI_TZ).strftime('%Y-%m-%d %H:%M')}\n\n"
+        "📋 **影響範圍**\n"
+        "• 台股／美股／國際日報的 AI 分析段落將顯示空白\n"
+        "• 自選股個股深度分析無法產生\n\n"
+        "💳 **解決方式**\n"
+        "請前往 https://console.anthropic.com/settings/billing 儲值\n\n"
+        "⏰ 此通知每 7 天最多發送一次，不會天天打擾你。"
+    )
+
+    sent = False
+    for url in [DISCORD_TW, DISCORD_US, DISCORD_GLOBAL, DISCORD_WATCHLIST]:
+        if url:
+            try:
+                r = requests.post(url, json={"content": msg}, timeout=10)
+                if r.status_code in (200, 204):
+                    sent = True
+                    print(f"✅ 餘額不足通知已發送至 Discord")
+                    break   # 只需送出一次即可
+            except Exception as e:
+                print(f"⚠️ 發送餘額通知失敗：{e}")
+
+    # 無論是否送成功，都更新狀態（避免連線問題造成重複嘗試）
+    state["last_alert_date"] = today.isoformat()
+    _save_balance_state(state)
+
 
 def claude_call(prompt: str, max_tokens: int = 1200, model: str = None) -> str:
     """
     model=None        → 使用 CLAUDE_MODEL（Sonnet，深度分析）
     model=CLAUDE_MINI → 使用 CLAUDE_MINI_MODEL（Haiku，簡單任務）
+
+    餘額不足（HTTP 400/402）→ 回傳明確提示 + 觸發 Discord 通知（7 天節流）
     """
     use_model = model or CLAUDE_MODEL
     if not ANTHROPIC_API_KEY:
@@ -216,12 +286,26 @@ def claude_call(prompt: str, max_tokens: int = 1200, model: str = None) -> str:
         )
         if r.status_code == 200:
             return r.json()["content"][0]["text"].strip()
-        else:
-            print(f"❌ Claude API 錯誤：HTTP {r.status_code} {r.text[:200]}")
-            return f"AI 分析暫時無法使用（HTTP {r.status_code}）"
+
+        # ── 錯誤處理 ──────────────────────────────────
+        err_body = r.text.lower()
+        print(f"❌ Claude API 錯誤：HTTP {r.status_code} {r.text[:300]}")
+
+        # 餘額不足（HTTP 400 / 402）
+        if r.status_code in (400, 402) and any(kw in err_body for kw in _BALANCE_KEYWORDS):
+            _notify_balance_low()
+            return "🚨 Claude API 餘額不足，AI 分析暫停。請至 console.anthropic.com 儲值。"
+
+        # 速率限制
+        if r.status_code == 429:
+            return f"⏳ Claude API 請求過於頻繁（rate limit），請稍後再試。"
+
+        # 其他錯誤
+        return f"⚠️ AI 分析暫時無法使用（HTTP {r.status_code}）"
+
     except Exception as e:
         print(f"❌ Claude 呼叫失敗：{e}")
-        return f"AI 分析暫時無法使用（{str(e)[:100]}）"
+        return f"⚠️ AI 分析暫時無法使用（連線異常：{str(e)[:80]}）"
 
 # ─────────────────────────────────────────────────────────────
 # 大盤數據（Yahoo Finance）
@@ -537,6 +621,18 @@ json = _json_module
 # 類股 / 板塊強弱數據
 # ─────────────────────────────────────────────────────────────
 
+# 各族群前5大龍頭股（供領漲族群使用）
+SECTOR_LEADERS = {
+    "半導體":       ["台積電(2330)", "聯電(2303)", "日月光投控(3711)", "南電(8046)", "矽力-KY(6415)"],
+    "電子/AI供應鏈": ["鴻海(2317)", "廣達(2382)", "緯創(3231)", "英業達(2356)", "仁寶(2324)"],
+    "IC設計":       ["聯發科(2454)", "聯詠(3034)", "瑞昱(2379)", "世芯-KY(6598)", "力旺(6289)"],
+    "AI伺服器":     ["廣達(2382)", "緯穎(6669)", "英業達(2356)", "技嘉(2376)", "微星(2377)"],
+    "金融":         ["富邦金(2881)", "國泰金(2882)", "中信金(2891)", "元大金(2885)", "玉山金(2884)"],
+    "航運":         ["長榮(2603)", "陽明(2609)", "萬海(2615)", "台驊(2636)", "中航(2612)"],
+    "傳產/石化":    ["台塑(1301)", "南亞(1303)", "台化(1326)", "台塑化(6505)", "亞泥(1102)"],
+}
+
+
 def fetch_tw_sectors() -> list:
     """抓取台股各類股代表股漲跌幅，依漲跌排序"""
     TW_SECTOR_STOCKS = [
@@ -647,6 +743,21 @@ def fetch_ai_news(session_info: dict) -> list:
     return result[:12]
 
 
+def fetch_vip_news() -> dict:
+    """抓取馬斯克 / 川普 / 黃仁勳 最新動態"""
+    configs = [
+        ("musk",   "https://news.google.com/rss/search?q=Elon+Musk+Tesla+SpaceX+X&hl=en-US&gl=US&ceid=US:en"),
+        ("trump",  "https://news.google.com/rss/search?q=Donald+Trump+tariff+economy+market&hl=en-US&gl=US&ceid=US:en"),
+        ("jensen", "https://news.google.com/rss/search?q=Jensen+Huang+NVIDIA+AI+chip&hl=en-US&gl=US&ceid=US:en"),
+    ]
+    result = {}
+    for key, url in configs:
+        articles = fetch_rss(url, limit=5)
+        result[key] = articles[:3]
+        time.sleep(0.25)
+    return result
+
+
 def analyze_ai_news(articles: list, session_info: dict) -> str:
     """AI & AI Agent 全球動態分析"""
     if not articles:
@@ -655,14 +766,14 @@ def analyze_ai_news(articles: list, session_info: dict) -> str:
 【AI全球動態】
 {build_news_text(articles)}
 
-以繁體中文寫（600字內），必帶具體公司/產品名稱，禁泛說「AI持續進步」：
+以繁體中文寫，必帶具體公司/產品名稱，禁泛說「AI持續進步」，禁用 Markdown 表格：
 
 ## 🚀 重大突破/新發布（1-3個：是什麼、技術意義、應用影響各一句）
 ## 🤖 AI Agent 動態（新能力或部署進展，說明能做到什麼新事）
-## 💼 商業化衝擊（受益/受衝擊的具體公司或產業）
-## 📈 台灣科技股啟示（帶代號，一句說明受益邏輯）
+## 💼 商業化衝擊（bullet 格式，受益方前面加🟢，受衝擊方加🔴，每點帶公司名，3-5點）
+## 📈 台灣科技股啟示（**必須完整輸出**，列出 2-3 支台股代號，每支一句說明受益邏輯）
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=900)
+    return claude_call(prompt, max_tokens=1400)
 
 RSS_FEEDS = {
     "tw": [
@@ -762,10 +873,23 @@ def build_news_text(articles: list, limit: int = 8) -> str:
         lines.append(f"{i}. [{pub}] {a['title']}")
     return "\n".join(lines) if lines else "（本時段暫無新聞）"
 
-def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = "") -> str:
+def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = "", tw_sectors: list = None) -> str:
     twii = market_data.get("twii", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
-    sector_block = f"\n【台股類股今日強弱（代表股漲跌，由強至弱）】\n{tw_sectors_text}" if tw_sectors_text else ""
+
+    # 領漲族群龍頭股（取第一名族群）
+    leaders_block = ""
+    if tw_sectors:
+        top_sector = tw_sectors[0]["name"]
+        leaders    = SECTOR_LEADERS.get(top_sector, [])
+        if leaders:
+            leaders_block = f"\n【領漲第一族群龍頭股】{top_sector} → {'、'.join(leaders)}"
+
+    sector_block = (
+        f"\n【台股類股今日強弱（代表股漲跌，由強至弱）】\n{tw_sectors_text}{leaders_block}"
+        if tw_sectors_text else ""
+    )
+
     prompt = f"""台股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
 
 【加權指數】{fmt_quote(twii) if twii else 'N/A'}
@@ -778,7 +902,7 @@ def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = 
 **📊 大盤概況** — 一句點出量能與核心驅動
 
 **💹 領漲/領跌族群** — 直接引用上方類股漲跌幅
-• 強勢（前2-3）：族群＋漲幅＋驅動一句
+• 強勢（前2-3）：族群＋漲幅＋驅動一句；**領漲第一族群須列出龍頭股（依上方清單）**
 • 弱勢（後1-2）：族群＋跌幅＋壓力一句
 
 **📌 重點個股**（Markdown 表格，4-5檔）
@@ -789,20 +913,37 @@ def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = 
 **⚠️ 主要風險**（1-2句，具體觸發條件）"""
     return claude_call(prompt, max_tokens=1200)
 
-def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "") -> str:
+def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "", vip_news: dict = None) -> str:
     dji  = market_data.get("dji",  {})
     ixic = market_data.get("ixic", {})
     gspc = market_data.get("gspc", {})
     wknd = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
     sector_block = f"\n【S&P 500 板塊 ETF 今日漲跌（由強至弱）】\n{us_sectors_text}" if us_sectors_text else ""
+
+    # 重要人物最新動態
+    vip_block = ""
+    if vip_news:
+        def _titles(key):
+            return "　".join(
+                f"[{a['pub_dt'].strftime('%H:%M')}] {a['title'][:50]}" if a.get("pub_dt") else a["title"][:50]
+                for a in (vip_news.get(key) or [])[:2]
+            ) or "（暫無新聞）"
+        vip_block = (
+            "\n【重要人物最新動態】\n"
+            f"🚀 馬斯克（Musk）：{_titles('musk')}\n"
+            f"🏛️ 川普（Trump）：{_titles('trump')}\n"
+            f"🟩 黃仁勳（Jensen Huang）：{_titles('jensen')}"
+        )
+
     prompt = f"""美股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
 
 【三大指數】道瓊{fmt_quote(dji) if dji else 'N/A'} ／ 納指{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P{fmt_quote(gspc) if gspc else 'N/A'}
 {sector_block}
 【美股新聞（本時段）】
 {build_news_text(articles)}
+{vip_block}
 
-以繁體中文寫美股日報（800字內），每論點帶數字/具體事件：
+以繁體中文寫美股日報（900字內），每論點帶數字/具體事件：
 
 **📊 大盤概況** — 三大指數＋核心驅動一句
 
@@ -815,8 +956,10 @@ def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = 
 
 **🏦 Fed & 總經** — 結合新聞，說明哪個數據/聲明驅動定價
 
+**👤 重要人物動態**（馬斯克/川普/黃仁勳 對市場的影響，各1-2句）
+
 **💡 操作建議**（3點，含板塊/個股/觸發條件/目標/停損）"""
-    return claude_call(prompt, max_tokens=1200)
+    return claude_call(prompt, max_tokens=1400)
 
 def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
     vix   = market_data.get("vix",   {})
@@ -906,7 +1049,7 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
 
-    prompt = f"""資深股票分析師。根據以下實際數據分析，每項指標必帶實際數值，禁空話。
+    prompt = f"""資深股票分析師。根據以下實際數據分析，每項指標必帶實際數值，禁空話，**全程禁用 Markdown 表格**（只用 bullet）。
 {stale_note}
 {name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
 
@@ -915,7 +1058,7 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
 【新聞】
 {news_ctx if news_ctx else '（暫無）'}
 
-繁體中文，700字內：
+繁體中文，以下各節**必須全部完整輸出**：
 
 **📊 近期走勢**（2句：價格位置＋方向）
 **🔍 技術面**（每項帶實際數值）
@@ -928,9 +1071,12 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
 **🎯 短期展望**
 • 多方：目標價（依據）
 • 空方：跌破位（依據）
-**💡 操作建議**（積極進場條件/目標/停損）
+**💡 操作建議**（bullet 格式，不用表格）
+• 積極進場條件：...
+• 目標價：...
+• 停損參考：...
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1000)
+    return claude_call(prompt, max_tokens=1500)
 
 def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:
     """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔"""
@@ -1207,13 +1353,18 @@ def run_report():
     else:
         print("\n⏭️ 早報：跳過 AI 新聞（凌晨動態稀少，節省 token 費用）")
 
+    # 3e. 重要人物動態（美股頻道）
+    print("\n👤 抓取重要人物動態（馬斯克/川普/黃仁勳）...")
+    vip_news = fetch_vip_news()
+    print(f"  Musk:{len(vip_news.get('musk',[]))} Trump:{len(vip_news.get('trump',[]))} Jensen:{len(vip_news.get('jensen',[]))} 則")
+
     # 4. Claude 分析
     print("\n🤖 Claude AI 分析中...")
     print("  分析台股...")
-    tw_analysis     = analyze_tw_news(tw_news,     session_info, market_data, tw_sectors_text)
+    tw_analysis     = analyze_tw_news(tw_news,     session_info, market_data, tw_sectors_text, tw_sectors)
     time.sleep(1)
     print("  分析美股...")
-    us_analysis     = analyze_us_news(us_news,     session_info, market_data, us_sectors_text)
+    us_analysis     = analyze_us_news(us_news,     session_info, market_data, us_sectors_text, vip_news)
     time.sleep(1)
     print("  分析國際...")
     jin10_prompt_text = build_jin10_text(jin10_flash_items, jin10_calendar_items)

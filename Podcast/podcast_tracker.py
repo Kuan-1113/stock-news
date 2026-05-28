@@ -188,10 +188,10 @@ def claude_call(prompt: str, max_tokens: int = 1600) -> str:
 
 def analyze_episode(show_name: str, title: str, description: str,
                     duration_str: str, transcript: str) -> str:
-    desc = re.sub(r"<[^>]+>", "", description)[:1500]
+    desc = re.sub(r"<[^>]+>", "", description)[:3000]
 
     if transcript:
-        content = f"【逐字稿節錄（前 4000 字）】\n{transcript[:4000]}"
+        content = f"【逐字稿節錄（前 5000 字）】\n{transcript[:5000]}"
         basis   = "逐字稿"
     else:
         content = f"【集數描述】\n{desc}"
@@ -205,23 +205,27 @@ def analyze_episode(show_name: str, title: str, description: str,
 
 {content}
 
-請以繁體中文撰寫分析報告（900 字以內）：
+請以繁體中文撰寫完整分析報告（1200 字以內），讓沒聽集數的讀者也能了解這集說了什麼：
 
-🎙️ **本集主題概述**（2-3 句說明核心議題）
+🎙️ **本集主題概述**（2-3 句說明核心議題與討論方向）
+
+📝 **本集內容摘要**（條列主要討論內容，5-8 點，每點一句，讓讀者知道講了哪些事）
 
 💡 **核心觀點 Top 3-5**
-（條列，每點附簡短說明，聚焦投資/科技洞察）
+（每點帶具體論述與數據，聚焦投資/科技洞察，禁空話）
 
 📊 **提及的關鍵標的/趨勢**
-（條列個股、ETF、產業趨勢，並說明主持人看法；若無則略過）
+（條列個股代號、ETF、產業趨勢，說明主持人看法與多空判斷；若無則略過）
+
+🔮 **主持人市場展望或預測**（若有提及，摘要其具體觀點與理由）
 
 ⚠️ **重要風險提示或爭議觀點**（若有）
 
-🔑 **聽眾行動建議**（1-3 點，具體可行）
+🔑 **聽後行動建議**（2-3 點，具體可行）
 
 *以上分析基於{basis}，由 AI 生成，僅供參考，不構成投資建議。*"""
 
-    return claude_call(prompt)
+    return claude_call(prompt, max_tokens=2000)
 
 # ─────────────────────────────────────────────────────────────
 # Discord 傳送
@@ -298,11 +302,9 @@ def process_episode(show_name: str, entry) -> bool:
 def send_daily_summary(show_statuses: list):
     """每次執行結束後，發送一則當日 Podcast 檢查摘要到 Discord"""
     ts   = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
-    lines = [f"## 🎙️ Podcast 每日追蹤報告 | {ts}", ""]
+    lines = [f"🎙️ **Podcast 每日追蹤** | {ts}", ""]
     for name, status in show_statuses:
-        lines.append(f"• **{name}**　{status}")
-    lines.append("")
-    lines.append("─" * 30)
+        lines.append(f"• **{name}**：{status}")
     send_discord("\n".join(lines))
 
 
@@ -329,35 +331,48 @@ def main():
             show_statuses.append((name, "⚠️ RSS 無法取得"))
             continue
 
-        seen     = set(state.get(name, []))
+        seen         = set(state.get(name, []))
+
+        # 最新集數資訊（用於狀態顯示）
+        latest_entry = entries[0] if entries else None
+        latest_title = getattr(latest_entry, "title", "?")[:40] if latest_entry else "?"
+        latest_pub   = parse_entry_date(latest_entry) if latest_entry else None
+        latest_date  = latest_pub.strftime("%-m/%-d") if latest_pub else "?"
+
+        # 判斷最新集是否為今天發布（判斷台北時間日期）
+        today_updated = bool(latest_pub and latest_pub.date() == now_tw.date())
+
+        # 找出未分析過的集數（不再限制發布日期，避免 00:xx 發布的集數被漏掉）
         new_eps  = []
-        for entry in entries:
-            ep_id   = get_episode_id(entry)
-            pub_dt  = parse_entry_date(entry)
-            # 只處理「今天」發布且尚未處理過的集數
-            if ep_id and ep_id not in seen and pub_dt >= today_start:
+        for entry in entries[:10]:   # 只掃前 10 集，避免重處理舊集
+            ep_id = get_episode_id(entry)
+            if ep_id and ep_id not in seen:
                 new_eps.append(entry)
 
         new_eps = new_eps[:MAX_NEW_PER_SHOW]
 
         if not new_eps:
-            latest_title = getattr(entries[0], "title", "?")[:40] if entries else "?"
-            latest_date  = parse_entry_date(entries[0]).strftime("%m/%d") if entries else ""
-            print(f"  ✅ 今日無新增內容（最新：{latest_title}）")
-            show_statuses.append((name, f"📭 今日無新增內容　最新：{latest_title}（{latest_date}）"))
+            if today_updated:
+                status_str = f"今日已更新（已分析），最新日期：{latest_date}"
+            else:
+                status_str = f"今日未更新，最新日期：{latest_date}"
+            print(f"  ✅ {status_str}")
+            show_statuses.append((name, status_str))
             continue
 
         print(f"  🆕 {len(new_eps)} 集新集數")
 
         for entry in reversed(new_eps):  # 從舊到新發送
-            title = getattr(entry, "title", "Unknown")[:40]
+            ep_title = getattr(entry, "title", "Unknown")[:40]
+            ep_pub   = parse_entry_date(entry)
+            ep_date  = ep_pub.strftime("%-m/%-d") if ep_pub else "?"
             try:
                 process_episode(name, entry)
                 seen.add(get_episode_id(entry))
                 state[name] = list(seen)
                 save_state(state)
                 any_new = True
-                show_statuses.append((name, f"🆕 新集數已分析：{title}"))
+                show_statuses.append((name, f"今日已更新（已分析），最新日期：{ep_date}"))
                 time.sleep(2)
             except Exception as e:
                 print(f"  ❌ 處理失敗：{e}")

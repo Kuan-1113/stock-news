@@ -46,6 +46,11 @@ jobs:
         run: |
           python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
 
+      - name: 📥 取得最新 Podcast 狀態（防誤判）
+        run: |
+          git fetch origin main
+          git checkout origin/main -- podcast_state.json 2>/dev/null || echo "podcast_state.json 不存在，首次執行"
+
       - name: 🎙️ 執行 Podcast 追蹤
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
