@@ -29,7 +29,6 @@ import warnings
 import feedparser
 import requests
 import schedule
-import anthropic
 import pytz
 import io
 
@@ -1322,6 +1321,9 @@ def run_report():
     session_info  = get_session_info()
     today         = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
     run_state     = load_run_state()
+
+    print(f"[INIT] REPORT_SESSION={REPORT_SESSION!r}  →  時段={session_info['label']!r}  today={today}")
+    print(f"[INIT] run_state 今日已執行：{run_state.get(today, [])}")
 
     # 防重複：同一時段當天已成功執行過就跳過
     if session_info["label"] in run_state.get(today, []):
