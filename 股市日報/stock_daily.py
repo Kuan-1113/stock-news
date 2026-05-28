@@ -1036,6 +1036,29 @@ def fetch_stock_news(symbol: str, name: str) -> str:
 
     return "\n".join(titles[:8]) if titles else "（暫無相關新聞）"
 
+def _strip_md_tables(text: str) -> str:
+    """
+    後處理：把 AI 偶爾生成的 Markdown 表格行轉為 bullet 文字，
+    避免 Discord 顯示殘缺表格或只有表頭的情況。
+    """
+    lines  = text.split("\n")
+    output = []
+    for line in lines:
+        s = line.strip()
+        # 表格分隔行（|---|---| 格式）直接跳過
+        if s.startswith("|") and s.endswith("|") and re.match(r"^\|[-:\s|]+\|$", s):
+            continue
+        # 內容行（| A | B | C | 格式）→ 轉 bullet
+        if s.startswith("|") and s.endswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if cells:
+                output.append("• " + "　".join(cells))
+            continue
+        output.append(line)
+    return "\n".join(output)
+
+
 def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "") -> str:
     closes = quote.get("closes", [])
     price_history = ""
@@ -1049,7 +1072,8 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
 
-    prompt = f"""資深股票分析師。根據以下實際數據分析，每項指標必帶實際數值，禁空話，**全程禁用 Markdown 表格**（只用 bullet）。
+    prompt = f"""資深股票分析師，根據以下實際數據分析。每項指標必帶實際數值，禁空話。
+嚴格禁止使用任何 Markdown 表格（包含 | 符號的格式）！只能用 bullet（• 開頭）。
 {stale_note}
 {name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
 
@@ -1058,25 +1082,31 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
 【新聞】
 {news_ctx if news_ctx else '（暫無）'}
 
-繁體中文，以下各節**必須全部完整輸出**：
+以繁體中文輸出，以下五節全部完整寫出，每節不得省略：
 
-**📊 近期走勢**（2句：價格位置＋方向）
-**🔍 技術面**（每項帶實際數值）
-• 均線 MA5/MA20 → 多空排列
-• MACD 線/訊號線/柱 → 動能方向
-• RSI 數值 → 超買/超賣/中性
-• KD K/D值 → 黃金/死亡交叉
-• 成交量 vs 均量 → 量價配合
-**📰 消息面**（1-3則，說明具體影響方向）
+**📊 近期走勢**（2句：價格位置＋趨勢方向）
+
+**🔍 技術面**
+• 均線 MA5/MA20：（數值）→ 多空排列結論
+• MACD：線值/訊號線/柱狀 → 動能判斷
+• RSI：（數值）→ 超買/超賣/中性
+• KD：K（數值）/ D（數值）→ 交叉訊號
+• 成交量：（今日量 vs 均量）→ 量價配合度
+
+**📰 消息面**（每則新聞一句，說明是利多或利空及原因）
+
 **🎯 短期展望**
-• 多方：目標價（依據）
-• 空方：跌破位（依據）
-**💡 操作建議**（bullet 格式，不用表格）
-• 積極進場條件：...
-• 目標價：...
-• 停損參考：...
+• 看多情境：突破（價位）可看（目標價），依據（技術位/事件）
+• 看空情境：跌破（支撐位）需警覺，回測（價位）
+
+**💡 操作建議**
+• 進場條件：（觸發條件，如守穩某均線/突破壓力）
+• 停損設在：（價位＋依據，如跌破MA20 = N元）
+• 目標出場：（價位＋依據）
+
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1500)
+    raw = claude_call(prompt, max_tokens=1800)
+    return _strip_md_tables(raw)
 
 def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:
     """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔"""

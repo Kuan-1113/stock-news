@@ -13,6 +13,24 @@ import requests
 import feedparser
 import pytz
 
+
+def _strip_md_tables(text: str) -> str:
+    """後處理：移除 AI 偶爾生成的 Markdown 表格，轉為 bullet 格式"""
+    lines  = text.split("\n")
+    output = []
+    for line in lines:
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|") and re.match(r"^\|[-:\s|]+\|$", s):
+            continue  # 表格分隔行直接跳過
+        if s.startswith("|") and s.endswith("|"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if cells:
+                output.append("• " + "　".join(cells))
+            continue
+        output.append(line)
+    return "\n".join(output)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from technical_indicators import get_full_indicators, format_indicators_for_prompt
 
@@ -227,10 +245,12 @@ def analyze(symbol: str, name: str, quote: dict, news: str, ind: dict = None, fu
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
 
-    indicators_text  = format_indicators_for_prompt(ind) if ind else "（未取得技術指標）"
+    indicators_text   = format_indicators_for_prompt(ind) if ind else "（未取得技術指標）"
     fundamentals_text = format_fundamentals(fund) if fund else "（未取得基本面）"
 
-    prompt = f"""你是一位資深股票分析師，請針對以下股票進行完整深度分析。每項指標**必須帶實際數值**，禁空話，全程禁用 Markdown 表格（只用 bullet）。
+    prompt = f"""你是一位資深股票分析師，針對以下股票進行完整深度分析。
+每項指標必帶實際數值，禁空話。
+嚴格禁止使用任何 Markdown 表格（即 | 符號格式），全程只用 bullet（• 開頭）。
 
 【股票資訊】
 - 名稱：{name}（{symbol}）
@@ -247,39 +267,40 @@ def analyze(symbol: str, name: str, quote: dict, news: str, ind: dict = None, fu
 【近期相關新聞（消息面）】
 {news}
 
-請以繁體中文撰寫完整分析報告（1000字以內），以下各節**必須全部輸出**：
+請以繁體中文完整輸出以下六節，每節不得省略：
 
-📊 **近期走勢**（2-3句，說明目前價格位置與方向）
+📊 **近期走勢**（2-3句，說明目前價格位置與趨勢方向）
 
 🔍 **技術面分析**（每項帶實際數值）
-• 均線 MA5/MA20/MA60 → 多空排列
-• MACD 線/訊號線/柱 → 動能方向
-• RSI 數值 → 超買/超賣/中性
-• KD K/D值 → 黃金/死亡交叉
-• 成交量 vs 均量 → 量價配合
-• 乖離率 → 偏離程度
+• 均線 MA5/MA20/MA60：（數值）→ 多空排列
+• MACD：（線值/訊號線/柱）→ 動能方向
+• RSI：（數值）→ 超買/超賣/中性
+• KD：K（數值）/ D（數值）→ 交叉訊號
+• 成交量：（今日量 vs 均量）→ 量價配合
+• 乖離率：（正/負偏離）→ 偏離程度
 • 融資券動向（若有台股資料）
 • 三大法人動向（若有台股資料）
 
 💰 **基本面分析**
-• 估值：PE / PBR 相較產業是偏高/合理/偏低
-• 獲利：EPS / ROE / 淨利率說明獲利品質
-• 成長：營收成長率，是否持續擴張
-• 52週位置：目前股價在年度高低點之間的位置
+• 估值面：PE（數值）/ PBR（數值）→ 偏高/合理/偏低
+• 獲利面：EPS（數值）/ ROE（數值）→ 獲利品質
+• 成長面：營收成長（數值）→ 是否持續擴張
+• 52週位置：現價 vs 52週高（數值）/ 低（數值）
 
-📰 **消息面分析**（結合上方新聞，每則新聞說明其對股價影響方向，2-4點）
+📰 **消息面分析**（每則新聞說明是利多🟢或利空🔴及原因，2-4點）
 
 🎯 **短期預測（1-2週）**
-• 多方情境：目標價（依據技術位或基本面）
-• 空方情境：跌破關鍵支撐位
+• 看多情境：目標價（依據）
+• 看空情境：跌破支撐（依據）
 
-💡 **操作建議**（bullet，不用表格）
-• 積極進場條件：...
-• 目標價：...
-• 停損參考：...
+💡 **操作建議**
+• 進場條件：（觸發條件，如守穩某均線）
+• 停損設在：（價位＋依據）
+• 目標出場：（價位＋依據）
 
 ⚠️ 本報告由 AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1600)
+    raw = claude_call(prompt, max_tokens=1800)
+    return _strip_md_tables(raw)
 
 # ── Discord 傳送 ─────────────────────────────────────────────
 
