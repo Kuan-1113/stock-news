@@ -480,21 +480,13 @@ def fetch_jin10_flash(session_info: dict) -> list:
             print("  金十快訊：無資料")
             return []
 
-        now     = now_tw()
-        start_h = session_info["start_h"]
-        end_h   = session_info["end_h"]
-        if start_h < end_h:
-            ref      = (now - datetime.timedelta(days=1)) if (now.hour < 6 and start_h == 15) else now
-            start_dt = ref.replace(hour=start_h, minute=0, second=0, microsecond=0)
-            end_dt   = ref.replace(hour=end_h,   minute=0, second=0, microsecond=0)
-        else:
-            yesterday = now - datetime.timedelta(days=1)
-            start_dt  = yesterday.replace(hour=start_h, minute=0, second=0, microsecond=0)
-            end_dt    = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        # 擴大時間範圍為最近 24 小時，不局限在當日時段，確保重要事件不遺漏
+        now      = now_tw()
+        cutoff   = now - datetime.timedelta(hours=24)
 
         result = []
         for item in items:
-            content = _s2tw(item.get("content") or "")
+            content  = _s2tw(item.get("content") or "")
             time_raw = item.get("time") or ""
             if not content:
                 continue
@@ -503,14 +495,20 @@ def fetch_jin10_flash(session_info: dict) -> list:
                     time_raw.replace("Z", "+00:00")).astimezone(TW_TZ)
             except Exception:
                 pub_dt = None
-            if pub_dt and not (start_dt <= pub_dt <= end_dt):
+            # 只過濾超過 24 小時的舊訊息
+            if pub_dt and pub_dt < cutoff:
                 continue
             result.append({
-                "time":    pub_dt.strftime("%H:%M") if pub_dt else "",
-                "title":   content[:150],
+                "time":  pub_dt.strftime("%m/%d %H:%M") if pub_dt else "",
+                "title": content[:150],
+                "pub_dt": pub_dt,
             })
-        print(f"  金十快訊：取得 {len(result)} 則（時段內）")
-        return result[:15]
+
+        # 依時間新到舊排序，取最近 25 則
+        result.sort(key=lambda x: x.get("pub_dt") or datetime.datetime.min.replace(tzinfo=TW_TZ), reverse=True)
+        result = [{k: v for k, v in r.items() if k != "pub_dt"} for r in result[:25]]
+        print(f"  金十快訊：取得 {len(result)} 則（近24小時）")
+        return result
     except Exception as e:
         print(f"  金十快訊錯誤：{e}")
         return []
@@ -1000,17 +998,29 @@ def analyze_global_news(articles, session_info, market_data, jin10_text: str = "
     return _strip_md_tables(claude_call(prompt, max_tokens=1600))
 
 def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
-    """針對金十數據進行專屬 AI 分析"""
+    """針對金十數據進行專屬 AI 分析（近24小時重點事件整理）"""
     if not flash and not calendar:
         return ""
     jin10_text = build_jin10_text(flash, calendar)
-    prompt = f"""根據以下金十數據，以繁體中文寫摘要（400字內）：
+    prompt = f"""你是國際財經分析師。根據以下金十數據近24小時快訊與行事曆，以繁體中文撰寫完整分析（700字內）。
+嚴禁表格（| 符號），全程 bullet（• 開頭）。台灣慣例：🔴=漲/利多，🟢=跌/利空。
+
 {jin10_text}
-1. **重大事件**（2-3個，說明市場影響）
-2. **市場情緒**（方向+原因一句）
-3. **台股/亞股影響**（2點，• 開頭）
-4. **今日重要數據時間**（若有）"""
-    return _strip_md_tables(claude_call(prompt, max_tokens=600, model=CLAUDE_MINI_MODEL))
+
+請輸出以下四節，每節不得省略：
+
+**🔥 最重大事件（近24小時）**
+（選 3-5 個最具市場影響力的事件，每個 bullet 說明：事件內容 + 影響資產 + 市場反應）
+
+**📊 全球市場方向**
+（整體多空情緒 + 最關鍵驅動因素，2-3 點 bullet）
+
+**🇹🇼 對台股/亞股影響**
+（具體受影響族群或個股，3 點 bullet，說明原因）
+
+**📅 重要財經數據**
+（已公布或即將公布的重要數據，若無則寫「本時段無重大數據公布」）"""
+    return _strip_md_tables(claude_call(prompt, max_tokens=900))
 
 # ─────────────────────────────────────────────────────────────
 # 自選股分析（22:00 執行）
