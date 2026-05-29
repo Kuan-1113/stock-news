@@ -189,6 +189,93 @@ def calc_volume(volumes: list) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
+# 基本面（yfinance info）
+# ─────────────────────────────────────────────────────────────
+
+def fetch_stock_fundamentals(symbol: str) -> dict:
+    """從 yfinance 取得基本面數據（PE/PB/EPS/ROE/殖利率）"""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(symbol).info
+        result = {}
+        for key, src in [
+            ("pe",         "trailingPE"),
+            ("forward_pe", "forwardPE"),
+            ("pb",         "priceToBook"),
+            ("eps",        "trailingEps"),
+            ("roe",        "returnOnEquity"),
+            ("div_yield",  "dividendYield"),
+            ("profit_margin", "profitMargins"),
+            ("revenue_growth","revenueGrowth"),
+        ]:
+            v = info.get(src)
+            if v is not None:
+                result[key] = round(float(v), 4)
+        return result
+    except Exception as e:
+        print(f"基本面 API 錯誤 {symbol}: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────
+# 台指期（TAIFEX Open API）
+# ─────────────────────────────────────────────────────────────
+
+def fetch_taifex_txf_5d() -> list:
+    """台指期近5個交易日：收盤價、現貨（^TWII）、正逆價差、未平倉量"""
+    try:
+        import yfinance as yf
+        # 1. 取得加權指數近期收盤（spot）
+        twii_hist = yf.Ticker("^TWII").history(period="15d")
+        spot_map: dict[str, float] = {}
+        for ts, row in twii_hist.iterrows():
+            d = ts.strftime("%Y/%m/%d")
+            spot_map[d] = round(float(row["Close"]), 2)
+    except Exception:
+        spot_map = {}
+
+    results = []
+    for date_str in _last_trading_dates(8):
+        if len(results) >= 5:
+            break
+        d_fmt = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
+        try:
+            r = requests.get(
+                f"https://openapi.taifex.com.tw/v1/DailyMarketInfo?queryDate={d_fmt}",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not data:
+                continue
+            # 找台指期近月（TXF，選未平倉量最大的合約 = 近月）
+            txf_rows = [x for x in data if str(x.get("commodity_id", "")).upper() in ("TXF", "TX")]
+            if not txf_rows:
+                continue
+            front = max(txf_rows, key=lambda x: int(str(x.get("open_interest", 0)).replace(",", "") or 0))
+            close_p = front.get("close_price") or front.get("settlement_price") or ""
+            oi      = front.get("open_interest", "")
+            if not close_p:
+                continue
+            futures_close = round(float(str(close_p).replace(",", "")), 2)
+            spot          = spot_map.get(d_fmt, 0)
+            basis         = round(futures_close - spot, 2) if spot else None
+            results.append({
+                "date":          d_fmt,
+                "futures_close": futures_close,
+                "spot_close":    spot,
+                "basis":         basis,
+                "basis_type":    ("正價差" if basis and basis > 0 else ("逆價差" if basis and basis < 0 else "平價")),
+                "oi":            str(oi).replace(",", ""),
+            })
+        except Exception as e:
+            print(f"台指期 API 錯誤 {d_fmt}: {e}")
+        time.sleep(0.15)
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
 # TWSE 融資券 + 三大法人
 # ─────────────────────────────────────────────────────────────
 
@@ -262,6 +349,82 @@ def fetch_twse_institutional(stock_no: str) -> dict:
     return {}
 
 
+def fetch_twse_institutional_5d(stock_no: str) -> list:
+    """三大法人近5個交易日買賣超。優先用 TWT38U 單股月報，失敗再逐日用 T86。"""
+    # ── 嘗試 TWT38U（單股月度報表，一次取回整月資料）────────────
+    try:
+        today = datetime.datetime.now(TW_TZ)
+        results: list = []
+        for month_delta in range(2):   # 本月 + 上月（月初時可能當月資料不足）
+            if len(results) >= 5:
+                break
+            if month_delta == 0:
+                qdate = today.strftime("%Y%m%d")
+            else:
+                first = today.replace(day=1)
+                last_m = first - datetime.timedelta(days=1)
+                qdate = last_m.strftime("%Y%m%d")
+            r = requests.get(
+                f"https://www.twse.com.tw/rwd/zh/fund/TWT38U"
+                f"?date={qdate}&stockNo={stock_no}&response=json",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if data.get("stat") != "OK" or not data.get("data"):
+                continue
+            # 從最新日往前取 5 筆
+            for row in reversed(data["data"]):
+                if len(results) >= 5:
+                    break
+                if len(row) < 10:
+                    continue
+                try:
+                    results.append({
+                        "date":        row[0],
+                        "foreign_net": row[3],   # 外資買賣超股數（千股）
+                        "trust_net":   row[6],   # 投信買賣超股數（千股）
+                        "dealer_net":  row[9],   # 自營商買賣超股數（千股）
+                    })
+                except (IndexError, ValueError):
+                    continue
+        if results:
+            return results
+    except Exception as e:
+        print(f"TWT38U 失敗 {stock_no}，改用 T86 逐日查詢：{e}")
+
+    # ── Fallback：T86 逐日查詢 ─────────────────────────────────
+    results = []
+    for date_str in _last_trading_dates(10):
+        if len(results) >= 5:
+            break
+        try:
+            r = requests.get(
+                f"https://www.twse.com.tw/rwd/zh/fund/T86"
+                f"?date={date_str}&selectType=ALLBUT0999&response=json",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if data.get("stat") != "OK" or not data.get("data"):
+                continue
+            for row in data["data"]:
+                if str(row[0]).strip() == stock_no:
+                    results.append({
+                        "date":        date_str,
+                        "foreign_net": row[4],
+                        "trust_net":   row[10],
+                        "dealer_net":  row[13],
+                    })
+                    break
+        except Exception as e:
+            print(f"T86 錯誤 {stock_no} {date_str}: {e}")
+        time.sleep(0.3)
+    return results
+
+
 # ─────────────────────────────────────────────────────────────
 # 主函數
 # ─────────────────────────────────────────────────────────────
@@ -317,9 +480,15 @@ def get_full_indicators(symbol: str) -> dict:
         if is_tw:
             stock_no = symbol.upper().replace(".TW", "").replace(".TWO", "")
             time.sleep(0.3)
-            result["margin"]        = fetch_twse_margin(stock_no)
+            result["margin"]           = fetch_twse_margin(stock_no)
             time.sleep(0.3)
-            result["institutional"] = fetch_twse_institutional(stock_no)
+            result["institutional"]    = fetch_twse_institutional(stock_no)
+            time.sleep(0.3)
+            result["institutional_5d"] = fetch_twse_institutional_5d(stock_no)
+            time.sleep(0.3)
+            result["fundamentals"]     = fetch_stock_fundamentals(symbol)
+            time.sleep(0.3)
+            result["taifex_txf"]       = fetch_taifex_txf_5d()
 
         return result
 
@@ -388,7 +557,7 @@ def format_indicators_for_prompt(ind: dict) -> str:
             f"融券賣出={mg.get('short_sell','N/A')} 融券買進={mg.get('short_buy','N/A')}"
         )
 
-    # 三大法人
+    # 三大法人（單日）
     inst = ind.get("institutional", {})
     if inst:
         lines.append(
@@ -398,6 +567,36 @@ def format_indicators_for_prompt(ind: dict) -> str:
             f"自營商={inst.get('dealer_net','N/A')} | "
             f"合計={inst.get('total_net','N/A')}"
         )
+
+    # 籌碼面：5日三大法人
+    inst5 = ind.get("institutional_5d", [])
+    if inst5:
+        lines.append("5日法人籌碼（外資買賣超/投信買賣超/自營商，千股）：")
+        for r in inst5[:5]:
+            lines.append(f"  {r.get('date','')}  外資={r.get('foreign_net','?')}  投信={r.get('trust_net','?')}  自營={r.get('dealer_net','?')}")
+
+    # 基本面
+    fund = ind.get("fundamentals", {})
+    if fund:
+        parts = []
+        if fund.get("pe")            is not None: parts.append(f"本益比(PE)={fund['pe']:.1f}")
+        if fund.get("forward_pe")    is not None: parts.append(f"預估PE={fund['forward_pe']:.1f}")
+        if fund.get("pb")            is not None: parts.append(f"股價淨值比(PB)={fund['pb']:.2f}")
+        if fund.get("eps")           is not None: parts.append(f"EPS={fund['eps']:.2f}")
+        if fund.get("roe")           is not None: parts.append(f"ROE={fund['roe']*100:.1f}%")
+        if fund.get("div_yield")     is not None: parts.append(f"殖利率={fund['div_yield']*100:.2f}%")
+        if fund.get("profit_margin") is not None: parts.append(f"淨利率={fund['profit_margin']*100:.1f}%")
+        if parts:
+            lines.append("基本面：" + " | ".join(parts))
+
+    # 台指期5日
+    txf = ind.get("taifex_txf", [])
+    if txf:
+        lines.append("台指期近5日（期貨收盤/現貨/正逆價差/未平倉量）：")
+        for r in txf[:5]:
+            basis = r.get("basis")
+            bstr  = f"{basis:+.0f}（{r.get('basis_type','')}）" if basis is not None else "N/A"
+            lines.append(f"  {r.get('date','')}  期={r.get('futures_close','?')}  現={r.get('spot_close','?')}  價差={bstr}  OI={r.get('oi','?')}")
 
     return "\n".join(lines) if lines else "（無法取得技術指標）"
 
@@ -465,7 +664,7 @@ def format_indicators_for_discord(ind: dict) -> str:
             f"融券賣/買 `{mg.get('short_sell','N/A')}` / `{mg.get('short_buy','N/A')}`"
         )
 
-    # 三大法人
+    # 三大法人（單日）
     inst = ind.get("institutional", {})
     if inst:
         sections.append(
@@ -475,5 +674,49 @@ def format_indicators_for_discord(ind: dict) -> str:
             f"自營商 `{inst.get('dealer_net','N/A')}`　"
             f"合計 `{inst.get('total_net','N/A')}`"
         )
+
+    # 籌碼面：5日三大法人
+    inst5 = ind.get("institutional_5d", [])
+    if inst5:
+        rows = []
+        for rec in inst5[:5]:
+            rows.append(
+                f"`{rec.get('date','')}` "
+                f"外資`{rec.get('foreign_net','?')}` "
+                f"投信`{rec.get('trust_net','?')}` "
+                f"自營`{rec.get('dealer_net','?')}`"
+            )
+        sections.append("**📊 籌碼面（5日法人，千股）**\n" + "\n".join(rows))
+
+    # 基本面
+    fund = ind.get("fundamentals", {})
+    fund_parts = []
+    if fund.get("pe")            is not None: fund_parts.append(f"PE `{fund['pe']:.1f}`")
+    if fund.get("forward_pe")    is not None: fund_parts.append(f"預估PE `{fund['forward_pe']:.1f}`")
+    if fund.get("pb")            is not None: fund_parts.append(f"PB `{fund['pb']:.2f}`")
+    if fund.get("eps")           is not None: fund_parts.append(f"EPS `{fund['eps']:.2f}`")
+    if fund.get("roe")           is not None: fund_parts.append(f"ROE `{fund['roe']*100:.1f}%`")
+    if fund.get("div_yield")     is not None: fund_parts.append(f"殖利率 `{fund['div_yield']*100:.2f}%`")
+    if fund.get("profit_margin") is not None: fund_parts.append(f"淨利率 `{fund['profit_margin']*100:.1f}%`")
+    if fund_parts:
+        sections.append("**📋 基本面**\n" + "  ".join(fund_parts))
+
+    # 台指期5日
+    txf = ind.get("taifex_txf", [])
+    if txf:
+        txf_rows = []
+        for rec in txf[:5]:
+            basis = rec.get("basis")
+            if basis is not None:
+                bicon = "🔴" if basis >= 0 else "🟢"
+                bstr  = f"{bicon}`{basis:+.0f}`（{rec.get('basis_type','')}）"
+            else:
+                bstr = "N/A"
+            txf_rows.append(
+                f"`{rec.get('date','')}` "
+                f"期`{rec.get('futures_close','?')}` 現`{rec.get('spot_close','?')}` "
+                f"價差{bstr} OI`{rec.get('oi','?')}`"
+            )
+        sections.append("**📐 台指期（5日正逆價差／未平倉）**\n" + "\n".join(txf_rows))
 
     return "\n\n".join(sections) if sections else "⚠️ 無法取得技術指標"
