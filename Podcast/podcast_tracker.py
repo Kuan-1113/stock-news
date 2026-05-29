@@ -397,8 +397,15 @@ def main():
                 print(f"  ❌ 處理失敗：{e}")
                 show_statuses.append((name, f"❌ 處理失敗：{str(e)[:60]}"))
 
-    # 每次執行都發送摘要（無論有無新集數）
-    send_daily_summary(show_statuses)
+    # 防重複：同一 cron 被 GitHub 觸發兩次時，2 小時內只送一次摘要
+    last_summary = state.get("_last_summary_ts", 0)
+    elapsed = (now_tw.timestamp() - last_summary)
+    if elapsed < 7200:
+        print(f"⏭️  摘要已在 {elapsed/60:.0f} 分鐘前送出，跳過重複發送")
+    else:
+        send_daily_summary(show_statuses)
+        state["_last_summary_ts"] = now_tw.timestamp()
+        save_state(state)
 
     print("\n" + "=" * 60)
     print(f"✅ 完成！{'已傳送 Discord 通知' if any_new else '無新集數'}")
