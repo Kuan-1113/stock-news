@@ -29,7 +29,7 @@ print("=== Discord Bot starting ===", flush=True)
 
 # ── local imports ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from technical_indicators import get_full_indicators, format_indicators_for_prompt
+from technical_indicators import get_full_indicators, format_indicators_for_prompt, get_data_quality_report
 from warrant import search_warrants, analyze_warrant, lookup_stock, prewarm_cache
 from warrant import _fetch_mis, _ratio
 import warrant_db
@@ -145,62 +145,70 @@ def _do_analysis(symbol: str, name: str) -> str:
         return f"❌ 找不到股票代碼 `{symbol}`\n格式範例：台股 `2330.TW`、美股 `NVDA`、指數 `^TWII`"
     display_name = name or quote.get("name", symbol)
     news = _fetch_news(symbol, display_name)
-    ind  = get_full_indicators(symbol)
-    ind_text = format_indicators_for_prompt(ind) if ind and ind.get("available") else "（未取得技術指標）"
+    ind        = get_full_indicators(symbol)
+    ind_text   = format_indicators_for_prompt(ind) if ind and ind.get("available") else "（未取得技術指標）"
+    quality_rpt= get_data_quality_report(ind)
     closes = quote.get("closes", [])
     price_history = ""
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
-    prompt = f"""資深股票分析師，根據以下真實數據進行結構化分析。
-分析原則：① 每個論點格式「事實/數值 → 機制 → 影響方向」② 多空論點必須平行呈現 ③ 操作建議有明確觸發條件 ④ 禁止空話，禁 Markdown 表格
+    prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」。
+每個論點格式：「事實/數值（來源）→ 機制 → 影響方向」。禁止空話，禁 Markdown 表格，全程 bullet（•）。
 
-【股票資訊】
+━━━ 標的 ━━━
 代碼：{symbol}　名稱：{display_name}
 現價：{quote['price']} {quote.get('currency', '')}　漲跌：{quote['change']}（{quote['pct']}）
 {price_history}
 
-【技術指標與籌碼面數據】
+━━━ PHASE 1：資料來源品質確認 ━━━
+{quality_rpt}
+
+━━━ 原始數據 ━━━
 {ind_text}
 
-【近期相關新聞】
+━━━ 近期新聞 ━━━
 {news}
 
----
-以繁體中文撰寫，總字數 1100 字以內，以下各節全部完整輸出：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+請依序完成以下三階段，總字數 1100 字以內：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**📊 近期走勢**
-• 現價位於（均線）之上/下 → 格局判斷 + 今日主要驅動力
+## ▌PHASE 2：深度研讀 — 多維訊號交叉驗證
 
-**🔍 技術面因果分析**
-• MA5/MA20（帶數值）：排列 → 短中期趨勢
-• MACD（帶值）：動能狀態 → 是否出現交叉/背離訊號
-• RSI/KD（帶值）：超買/超賣/中性 → 轉折風險
-• 量比（帶值）→ 量能是否配合
+**🔍 技術面**（帶實際數值）
+• MA5/MA20/MA60（數值）→ 多/空頭排列 → 趨勢判斷
+• MACD/RSI/KD（數值）→ 動能與超買超賣訊號
+• 量比 → 量價配合度
 
-**⚔️ 多空論點並陳**
-多方優勢（每點：訊號 → 看多理由 → 目標/預期）：
+**🏦 籌碼與基本面**（若有數據）
+• 法人5日動向（外資/投信方向）→ 是否一致？
+• PE/PB/ROE → 估值與獲利品質快評
+
+**⚠️ 多來源訊號衝突**
+若技術/籌碼/基本面/新聞訊號不一致：
+• 哪個來源更可信？為什麼？
+
+## ▌PHASE 3：決策驗證 — 多空並陳與壓力測試
+
+**⚔️ 多空論點**
+多方（訊號來源 → 看多邏輯 → 目標）：
 •
-空方風險（每點：訊號 → 看空理由 → 壓力/跌幅）：
+空方（訊號來源 → 看空邏輯 → 壓力/跌幅）：
 •
-當前偏向：[偏多/偏空/拉鋸]，關鍵因素：
+當前偏向：[偏多/偏空/拉鋸]
 
-**🏦 籌碼面**（台股，若有數據）
-• 法人5日動向 → 多空一致或分歧 → 對股價的影響
+**🔍 反向壓力測試**
+• 若結論錯誤，最可能的原因是⋯ → 停損邏輯
 
-**📋 基本面**（若有數據）
-• PE/PB 估值 → 合理/偏貴/便宜判斷
+**📰 消息面** → 🔴/🟢 + 影響程度
 
-**📐 台指期**（台股，若有數據）
-• 正逆價差趨勢 + OI 變化 → 市場偏多/偏空訊號
+**💡 進出場規劃**（含具體觸發條件）
+• 進場條件 → 目標 → 停損，風報比 X:1
+• 觀望/停損條件
 
-**📰 消息面**
-• 新聞事件 → 🔴利多/🟢利空 → 影響程度
+**📊 信心水準**：[高/中/低]　最大不確定變數：
 
-**💡 明確進出場規劃**
-• 看多進場：條件（具體）→ 目標價 → 停損位
-• 看空/觀望：條件（具體）→ 下方支撐 → 停損位
-
-> ⚠️ 本報告由 AI 生成，僅供參考，不構成投資建議。"""
+> ⚠️ AI 生成，不構成投資建議。"""
     analysis = _claude_call(prompt, max_tokens=2400)
     header = (
         f"## {quote['emoji']} **{display_name}（{symbol}）** | {now_str()}\n"

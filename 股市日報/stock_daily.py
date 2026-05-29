@@ -81,7 +81,7 @@ except ImportError:
         return text
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from technical_indicators import get_full_indicators, format_indicators_for_prompt
+from technical_indicators import get_full_indicators, format_indicators_for_prompt, get_data_quality_report
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -904,6 +904,27 @@ def fetch_all_news(category: str, session_info: dict) -> list:
     return result[:15]
 
 # ─────────────────────────────────────────────────────────────
+# Phase 1 輔助：新聞資料品質摘要
+# ─────────────────────────────────────────────────────────────
+
+def _news_quality(articles: list, session_info: dict) -> str:
+    """生成新聞資料品質標記，供 Phase 1 資訊收斂使用"""
+    if not articles:
+        return "❌ 本時段無新聞資料"
+    total  = len(articles)
+    timed  = sum(1 for a in articles if a.get("pub_dt"))
+    in_win = sum(1 for a in articles
+                 if a.get("pub_dt") and
+                 a["pub_dt"] >= datetime.datetime.now(TW_TZ) - datetime.timedelta(hours=12))
+    latest = max((a["pub_dt"] for a in articles if a.get("pub_dt")),
+                 default=None)
+    latest_s = latest.strftime("%m/%d %H:%M") if latest else "不明"
+    return (
+        f"✅ 新聞：共 {total} 則，有時間戳 {timed} 則，12h內 {in_win} 則，最新：{latest_s}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Claude 分析 — 台股 / 美股 / 國際
 # ─────────────────────────────────────────────────────────────
 
@@ -932,42 +953,49 @@ def analyze_tw_news(articles, session_info, market_data, tw_sectors_text: str = 
         if tw_sectors_text else ""
     )
 
-    prompt = f"""台股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
+    news_quality = _news_quality(articles, session_info)
+    prompt = f"""台股分析師，採用三階段迭代分析框架。{wknd}
+時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
+每個論點格式：「事實（數值）→ 機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。台灣慣例：🔴=漲，🟢=跌。
 
-【加權指數】{fmt_quote(twii) if twii else 'N/A'}
-{sector_block}
-【台股新聞（本時段）】
+━━━ PHASE 1：資訊收斂確認 ━━━
+✅ [TWSE行情] 加權指數：{fmt_quote(twii) if twii else 'N/A'}
+✅ [TWSE類股] {tw_sectors_text[:100] if tw_sectors_text else '無法取得'}…
+{news_quality}
+
+━━━ 台股新聞 ━━━
 {build_news_text(articles)}
 
-以繁體中文寫台股日報（1000字內）。格式規則：
-① 每個論點必須是「事實（數值）→ 機制 → 影響方向」的因果鏈，禁止沒有數字的空話
-② 多空論點必須各自列出，不得偏廢一方
-③ 嚴禁 Markdown 表格（| 符號），全程 bullet（• 開頭）
-④ 台灣慣例：🔴=漲，🟢=跌
+━━━ PHASE 2：深度研讀（1000字以內，各節不得省略）━━━
 
 **📊 大盤概況**
-• 指數收＿點，漲跌幅＿%，成交量＿億 → 今日核心驅動力是什麼事件/族群
+• 加權指數數值、漲跌幅、成交量 → 今日核心驅動（哪個事件/族群引爆）
 
-**⚔️ 多空交鋒**
-多方論點（每點格式：訊號/事件 → 為何看多 → 具體目標或影響）：
-•
-空方論點（每點格式：訊號/事件 → 為何看空 → 具體風險位或影響幅度）：
-•
-當前偏向：[多方/空方/均衡]，關鍵依據：（最決定性的1個因素）
-
-**💹 類股輪動**
-• 強勢：族群 🔴漲幅 → 驅動因素（法說/訂單/政策）→ 重點股代號
-• 弱勢：族群 🟢跌幅 → 壓力來源 → 警示代號
+**💹 類股輪動因果分析**
+• 強勢族群 🔴漲幅 → 驅動因素（訂單/法說/政策/外資布局）→ 龍頭股（依清單）
+• 弱勢族群 🟢跌幅 → 壓力來源（獲利了結/資金移轉/利空）→ 警示個股
 
 **📌 重點個股**（3-4檔）
-• 代號 名稱：漲跌幅 → 關鍵事件 → 後續評估（偏多/偏空/觀望）
+• 代號 名稱：漲跌幅 → 關鍵事件 → 評估（偏多/偏空/觀望）
 
-**💡 操作建議**（每點須有觸發條件→標的→方向→停損）
+━━━ PHASE 3：決策驗證 ━━━
+
+**⚔️ 多空交鋒**
+多方論點（訊號 → 看多邏輯 → 目標）：
+•
+空方論點（訊號 → 看空邏輯 → 風險位/幅度）：
+•
+當前偏向：[多/空/均衡]　最關鍵因素：
+
+**🔍 多來源交叉驗證**
+• 若新聞、指數、類股輪動的訊號不一致，哪個更可信？為什麼？
+
+**💡 操作建議**（觸發條件→標的→方向→停損）
 •
 
 **⚠️ 主要風險**
-• 風險因素 → 若發生將影響哪些族群/幅度"""
-    return _strip_md_tables(claude_call(prompt, max_tokens=1500))
+• 風險事件 → 傳導路徑 → 受衝擊族群/幅度"""
+    return _strip_md_tables(claude_call(prompt, max_tokens=1600))
 
 def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = "", vip_news: dict = None) -> str:
     dji  = market_data.get("dji",  {})
@@ -991,46 +1019,53 @@ def analyze_us_news(articles, session_info, market_data, us_sectors_text: str = 
             f"🟩 黃仁勳（Jensen Huang）：{_titles('jensen')}"
         )
 
-    prompt = f"""美股分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
+    news_quality = _news_quality(articles, session_info)
+    prompt = f"""美股分析師，採用三階段迭代分析框架。{wknd}
+時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
+每個論點格式：「事實（數值）→ 機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。台灣慣例：🔴=漲，🟢=跌。
 
-【三大指數】道瓊{fmt_quote(dji) if dji else 'N/A'} ／ 納指{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P{fmt_quote(gspc) if gspc else 'N/A'}
-{sector_block}
-【美股新聞（本時段）】
-{build_news_text(articles)}
+━━━ PHASE 1：資訊收斂確認 ━━━
+✅ [Yahoo Finance] 道瓊：{fmt_quote(dji) if dji else 'N/A'} ／ 納指：{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P：{fmt_quote(gspc) if gspc else 'N/A'}
+✅ [SPDR ETF] {us_sectors_text[:80] if us_sectors_text else '板塊資料無法取得'}…
+{news_quality}
 {vip_block}
 
-以繁體中文寫美股日報（1000字內）。格式規則：
-① 每個論點必須是「事實（數值）→ 機制 → 影響方向」的因果鏈
-② 多空論點並陳，不得只寫單方面
-③ 嚴禁 Markdown 表格，全程 bullet（• 開頭）
-④ 台灣慣例：🔴=漲，🟢=跌
+━━━ 美股新聞 ━━━
+{build_news_text(articles)}
+
+━━━ PHASE 2：深度研讀（1000字以內）━━━
 
 **📊 大盤概況**
-• 三大指數數值＋漲跌幅 → 今日核心驅動力（哪個數據/事件/發言）
+• 三大指數數值＋漲跌幅 → 今日核心驅動（哪個數據/事件/聲明）
 
-**⚔️ 多空交鋒**
-多方論點（訊號/事件 → 利多機制 → 上行目標）：
-•
-空方論點（訊號/事件 → 利空機制 → 下行風險）：
-•
-當前偏向：[多方/空方/均衡]，最關鍵因素：
+**🏦 總經與 Fed 因果鏈**
+• 指標/聲明（數值）→ 對利率預期影響 → 對股市估值的傳導路徑
 
-**🏦 總經與 Fed**
-• 指標/聲明（數值）→ 對利率預期影響 → 對股市估值影響
-
-**🏆 板塊輪動**
-• 強勢板塊（ETF代號）🔴 X% → 驅動因素 → 可留意個股
-• 弱勢板塊（ETF代號）🟢 X% → 壓力來源 → 迴避方向
+**🏆 板塊輪動因果分析**
+• 強勢板塊（ETF數值）🔴% → 驅動機制 → 可關注個股
+• 弱勢板塊（ETF數值）🟢% → 壓力來源 → 迴避方向
 
 **📌 重點個股**（3-4檔）
-• 代號 名稱：漲跌幅 → 事件 → 後續評估
+• 代號：漲跌幅 → 事件 → 後續評估
+
+━━━ PHASE 3：決策驗證 ━━━
+
+**⚔️ 多空交鋒**
+多方（訊號 → 利多機制 → 上行目標）：
+•
+空方（訊號 → 利空機制 → 下行風險）：
+•
+當前偏向：[多/空/均衡]　最關鍵因素：
+
+**🔍 多來源交叉驗證**
+• 總經、板塊、新聞、重要人物訊號是否一致？若衝突，以哪個為主？
 
 **👤 重要人物動態**（有相關新聞才寫）
-• 人物：發言/動作 → 對哪個板塊/資產的影響
+• 人物：發言/動作 → 受影響板塊/資產 → 方向
 
-**💡 操作建議**（每點：觸發條件 → 標的 → 方向 → 停損位）
+**💡 操作建議**（觸發條件→標的→方向→停損）
 •"""
-    return _strip_md_tables(claude_call(prompt, max_tokens=1600))
+    return _strip_md_tables(claude_call(prompt, max_tokens=1700))
 
 def analyze_global_news(articles, session_info, market_data, jin10_text: str = "") -> str:
     vix   = market_data.get("vix",   {})
@@ -1042,37 +1077,47 @@ def analyze_global_news(articles, session_info, market_data, jin10_text: str = "
     btc   = crypto.get("BTC", {})
     eth   = crypto.get("ETH", {})
     wknd  = "\n⚠️ 今日為週末，部分指標為上次交易日數值。" if is_weekend() else ""
-    prompt = f"""國際財經分析師。{now_str()}，「{session_info['label']}」（{session_info['period']}）。{wknd}
+    news_quality = _news_quality(articles, session_info)
+    prompt = f"""國際財經分析師，採用三階段迭代分析框架。{wknd}
+時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
+每個論點格式：「事件/數據（數值）→ 傳導機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。台灣慣例：🔴=漲/利多，🟢=跌/利空。
 
-【關鍵指標】VIX {fmt_quote(vix) if vix else 'N/A'} ／ 美債10Y {fmt_quote(us10y) if us10y else 'N/A'} ／ DXY {fmt_quote(dxy) if dxy else 'N/A'} ／ 黃金 {fmt_quote(gold) if gold else 'N/A'} ／ 原油 {fmt_quote(oil) if oil else 'N/A'} ／ BTC {btc.get('price','N/A')}({btc.get('pct','')}) ／ ETH {eth.get('price','N/A')}({eth.get('pct','')})
-【國際新聞】
+━━━ PHASE 1：資訊收斂確認 ━━━
+✅ [Yahoo Finance] VIX：{fmt_quote(vix) if vix else 'N/A'} ／ 美債10Y：{fmt_quote(us10y) if us10y else 'N/A'} ／ DXY：{fmt_quote(dxy) if dxy else 'N/A'}
+✅ [Yahoo Finance] 黃金：{fmt_quote(gold) if gold else 'N/A'} ／ 原油：{fmt_quote(oil) if oil else 'N/A'}
+✅ [CoinGecko] BTC：{btc.get('price','N/A')}({btc.get('pct','')}) ／ ETH：{eth.get('price','N/A')}({eth.get('pct','')})
+{news_quality}
+{'✅ [金十數據] 快訊已附入' if jin10_text else '⚠️ 金十數據：未取得'}
+
+━━━ 國際新聞 ━━━
 {build_news_text(articles)}
 {jin10_text if jin10_text else ''}
 
-以繁體中文寫國際財經日報（900字內，金十快訊優先）。格式規則：
-① 每個論點：事件/數據（數值）→ 傳導機制 → 影響方向與資產
-② 多空論點各自列出，不得只寫利多或只寫利空
-③ 嚴禁 Markdown 表格，全程 bullet（• 開頭）
-④ 台灣慣例：🔴=漲/利多，🟢=跌/利空
+━━━ PHASE 2：深度研讀（900字以內）━━━
 
-**🌍 全球風險情緒**
-• VIX/美債/DXY 現值 → 目前是 Risk-On 還是 Risk-Off → 對亞股整體方向
+**🌍 全球風險情緒判讀**
+• VIX={數值}、美債={數值}、DXY={數值} → 當前 Risk-On/Risk-Off 判定 → 對亞股含義
 
 **📋 重大事件因果分析**（3-5個）
-• 事件（具體數值）→ 影響的資產/市場 → 🔴利多或🟢利空 → 程度（高/中/低）
-
-**⚔️ 多空角力**
-全球資金多方力量：（列1-2個支持上漲的宏觀因素）
-全球資金空方力量：（列1-2個壓制市場的宏觀風險）
-當前偏向：[Risk-On偏多/Risk-Off偏空/拉鋸]
+• 事件（數值）→ 傳導路徑 → 🔴利多/🟢利空（程度：高/中/低）
 
 **🪙 大宗商品與加密**
-• 品項：現價漲跌 → 驅動因素 → 對通膨/經濟的含義
+• 品項：漲跌幅 → 驅動因素 → 對通膨/央行政策的隱含訊號
 
-**🇹🇼 對台股影響（因果分析）**
-• 全球事件X → 影響台灣的傳導路徑 → 受惠/受壓族群（具體代號）
+━━━ PHASE 3：決策驗證 ━━━
 
-**📅 本週重要財經事件**（若有數據公布，說明預期影響方向）"""
+**⚔️ 全球多空角力**
+多方力量（1-2個宏觀支撐因素）：
+空方風險（1-2個宏觀壓制因素）：
+當前偏向：[Risk-On偏多/Risk-Off偏空/拉鋸]
+
+**🔍 多來源交叉驗證**
+• 多個指標訊號是否一致？若 VIX 下降但美債上升，以哪個為主導？
+
+**🇹🇼 對台股傳導路徑**
+• 全球事件/指標 → 具體傳導路徑（資金流向/匯率/原物料）→ 受惠/受壓族群（代號）
+
+**📅 本週重要財經事件**（含預期值與市場反應方向）"""
     return _strip_md_tables(claude_call(prompt, max_tokens=1600))
 
 def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
@@ -1177,55 +1222,76 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
 
-    prompt = f"""資深股票分析師，根據以下實際數據進行結構化分析。{stale_note}
-分析原則：① 每個論點格式「事實/數值 → 機制 → 影響方向」② 多空論點必須平行呈現 ③ 操作建議必須有明確觸發條件 ④ 禁止空話與 Markdown 表格
+    quality_report = get_data_quality_report(ind)
 
+    prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」對以下數據進行深度研判。
+每個論點格式：「事實/數值（來源）→ 機制 → 影響方向」。禁止空話，禁 Markdown 表格，全程 bullet（•）。
+{stale_note}
+━━━ 標的 ━━━
 {name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
 
-【完整指標數據】
+━━━ PHASE 1：資料品質確認（多來源） ━━━
+{quality_report}
+
+━━━ 原始數據 ━━━
 {indicators_text}
-【新聞】
-{news_ctx if news_ctx else '（暫無）'}
 
-以繁體中文輸出（總字數 1200 字以內），以下各節全部完整寫出：
+━━━ 消息面 ━━━
+{news_ctx if news_ctx else '（暫無新聞）'}
 
-**📊 近期走勢**
-• 現價位於（MA20/季線）之上/下，代表（多/空）頭格局 → 今日漲跌的直接原因
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+請依序完成以下三階段，總字數 1300 字以內，每階段標題不得省略：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**🔍 技術面因果分析**
-• MA5={數值} MA20={數值}：排列方式 → 短中期趨勢判斷
-• MACD：DIF={值} DEA={值} 柱={值} → 動能方向（擴張/收斂/反轉訊號）
-• RSI={值} / KD K={值} D={值} → 超買/中性/超賣，是否出現交叉
-• 成交量比={值} → 量能是否配合行情（縮量/放量的意義）
+## ▌PHASE 2：深度研讀 — 多維訊號交叉驗證
 
-**⚔️ 多空論點並陳**
-多方優勢（每點：技術/籌碼/基本面訊號 → 看多理由 → 目標或預期影響）：
+**📐 技術面訊號**（帶實際數值）
+• MA排列：MA5={}/MA20={} → 多/空頭排列，現價在均線之上/下
+• MACD({}/{}，柱{}) → 動能擴張/收斂，黃金/死亡交叉？
+• RSI={} KD K={}/D={} → 超買/中性/超賣，交叉訊號？
+• 量比={} → 量價關係（縮量/放量意義）
+
+**🏦 籌碼面訊號**（台股限定，若有）
+• 5日外資/投信買賣超方向 → 趨勢是否一致？
+• 融資券動向 → 散戶槓桿增/減的隱含意義
+
+**📋 基本面訊號**（若有）
+• PE={}/PB={} → 估值高低（vs 歷史/同業）
+• ROE={}/EPS={} → 獲利品質
+
+**📐 期貨市場訊號**（台股限定，若有）
+• 正逆價差趨勢 → 市場隱含預期方向
+• OI 增減 → 多空布局動向
+
+**⚠️ 訊號衝突點識別**
+若各來源訊號不一致，明確指出：
+• [來源A] 顯示 X，但 [來源B] 顯示 Y → 以哪個為主？原因？
+
+## ▌PHASE 3：決策驗證 — 多空並陳與壓力測試
+
+**⚔️ 多空論點對照表**
+多方優勢（每點：訊號來源 → 看多邏輯 → 目標位/預期）：
 •
-空方風險（每點：技術/籌碼/基本面訊號 → 看空理由 → 關鍵壓力或潛在跌幅）：
+空方風險（每點：訊號來源 → 看空邏輯 → 關鍵壓力/下行幅度）：
 •
-綜合偏向：[偏多/偏空/拉鋸]，最關鍵因素：
+**當前偏向**：[偏多/偏空/拉鋸]　**多空強度比**：[強多/弱多/均衡/弱空/強空]
 
-**🏦 籌碼面**（台股，若有5日法人數據）
-• 外資近5日：合計買賣超方向 → 是否形成趨勢？對股價的支撐/壓力
-• 投信/自營動向 → 多空一致或分歧？
+**🔍 反向壓力測試**（若你的結論是錯的）
+• 多方最脆弱的假設是：（若這個假設失效，股價會⋯）
+• 空方最脆弱的假設是：（若這個假設失效，股價會⋯）
 
-**📋 基本面速覽**（若有數據）
-• PE={值} / PB={值} → 相對歷史或同業是偏貴/合理/便宜
-• ROE={值}% / EPS={值} → 獲利品質判斷
-
-**📐 台指期（台股限定）**（若有數據）
-• 近5日正逆價差趨勢 → 期貨定價隱含市場偏多或偏空
-• OI 增減方向 → 多空增倉或平倉意義
-
-**📰 消息面**
-• 每則新聞：事件內容 → 🔴利多/🟢利空 → 對股價影響程度
+**📰 消息面影響評估**
+• 事件 → 🔴利多/🟢利空 → 短期影響（1-5分）vs 中期影響（1-5分）
 
 **🎯 明確進出場規劃**
-• 看多進場：當（具體條件：守穩某均線/突破某壓力位＋量能確認） → 目標價=（值）→ 停損=（值），風報比=（X:1）
-• 看空停損/空單：當（具體條件：跌破某支撐/放量下殺） → 下一支撐=（值）→ 停損=（值）
+• 看多條件：當（具體觸發：守穩均線/突破壓力＋量能）→ 進場，目標=N，停損=N，風報比=X:1
+• 看空/觀望條件：當（具體觸發：跌破支撐/放量下殺）→ 停損/回避，下一支撐=N
 
-> ⚠️ AI 生成，不構成投資建議。"""
-    raw = claude_call(prompt, max_tokens=2400)
+**📊 綜合信心水準**：[高/中/低]
+信心高的原因：　信心低的原因：（不確定的最大變數）
+
+> ⚠️ AI 生成，不構成投資建議。請自行承擔投資風險。"""
+    raw = claude_call(prompt, max_tokens=2500)
     return _strip_md_tables(raw)
 
 def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:

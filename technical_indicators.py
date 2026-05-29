@@ -504,6 +504,64 @@ def get_full_indicators(symbol: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
+# 資料品質報告（Phase 1 資訊收斂輔助）
+# ─────────────────────────────────────────────────────────────
+
+def get_data_quality_report(ind: dict) -> str:
+    """
+    生成資料來源與品質摘要，供 Phase 1 資訊收斂使用。
+    讓 Claude 知道哪些來源有效、哪些缺失，避免對缺失資料過度推論。
+    """
+    lines = []
+    symbol = ind.get("symbol", "")
+    is_tw  = ".TW" in symbol.upper() and "^" not in symbol
+
+    # 技術指標
+    if ind.get("available"):
+        macd_ok  = ind.get("macd", {}).get("macd") is not None
+        rsi_ok   = ind.get("rsi",  {}).get("rsi")  is not None
+        kdj_ok   = ind.get("kdj",  {}).get("k")    is not None
+        vol_ok   = ind.get("volume", {}).get("vol_ratio") is not None
+        lines.append(
+            f"✅ [yfinance] 技術指標：MA/MACD{'✓' if macd_ok else '✗'}"
+            f" RSI{'✓' if rsi_ok else '✗'} KDJ{'✓' if kdj_ok else '✗'}"
+            f" 量能{'✓' if vol_ok else '✗'}"
+        )
+    else:
+        lines.append("❌ [yfinance] 技術指標：資料不足（歷史 < 20 筆）")
+
+    if is_tw:
+        # 籌碼面
+        mg  = ind.get("margin", {})
+        ins = ind.get("institutional", {})
+        i5d = ind.get("institutional_5d", [])
+        lines.append(
+            f"{'✅' if mg else '⚠️'} [TWSE] 融資券：{'有' if mg else '無法取得'}"
+            f" │ 三大法人（單日）：{'有' if ins else '無法取得'}"
+            f" │ 5日明細：{'有 '+str(len(i5d))+'筆' if i5d else '無法取得'}"
+        )
+
+        # 基本面
+        fund = ind.get("fundamentals", {})
+        have = [k for k in ["pe","pb","eps","roe","div_yield"] if fund.get(k) is not None]
+        lines.append(
+            f"{'✅' if len(have)>=3 else ('⚠️' if have else '❌')} [yfinance] 基本面："
+            f" {'/'.join(have) if have else '無法取得（部分台股 yfinance 基本面不完整）'}"
+        )
+
+        # 台指期
+        txf = ind.get("taifex_txf", [])
+        lines.append(
+            f"{'✅' if len(txf)>=3 else ('⚠️' if txf else '❌')} [FinMind] 台指期："
+            f" {'近'+str(len(txf))+'日正逆價差+OI' if txf else '無法取得'}"
+        )
+    else:
+        lines.append("ℹ️ 非台股：TWSE/FinMind 籌碼與期貨資料不適用")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
 # 格式化輸出
 # ─────────────────────────────────────────────────────────────
 
