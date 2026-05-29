@@ -1392,17 +1392,19 @@ def run_report():
     print(f"[INIT] 台灣標準時間：{tw_std.strftime('%Y-%m-%d %H:%M:%S')}  today={today}")
     print(f"[INIT] run_state 今日已執行：{run_state.get(today, [])}")
 
-    # ── Step 3：時間安全閘（auto 模式使用 NTP 驗證時間，FORCE_RUN 可略過）──
-    if REPORT_SESSION == "auto" and not FORCE_RUN:
+    # ── Step 3：時間安全閘（FORCE_RUN 可略過，排程/auto 模式都檢查）──
+    # 排程延遲超過 3 小時才會被擋（GitHub cron ±30min 屬正常抖動）
+    if not FORCE_RUN:
         _valid_hours = {
-            "盤前早報":  set(range(7, 12)),               # 07-11時
-            "盤中午報":  set(range(14, 18)),              # 14-17時
-            "盤後晚報":  set(range(21, 24)) | {0, 1, 2},  # 21-02時
+            "盤前早報":  set(range(5, 13)),                # 05-12時（預期 08，容忍 ±3h）
+            "盤中午報":  set(range(11, 19)),               # 11-18時（預期 15，容忍 ±3h）
+            "盤後晚報":  set(range(18, 24)) | {0, 1, 2},  # 18-02時（預期 22，容忍 ±3h）
         }
         valid = _valid_hours.get(session_info["label"], set(range(0, 24)))
         if verified_h not in valid:
             print(f"⏭️  [時間安全閘] 台灣標準時間 {verified_h:02d}:xx 不在"
-                  f" {session_info['label']} 有效時窗 {sorted(valid)} 內，略過")
+                  f" {session_info['label']} 有效時窗 {sorted(valid)} 內，略過"
+                  f"（GitHub 排程延遲過長或手動執行時段錯誤）")
             print("=" * 65)
             return
 
