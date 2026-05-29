@@ -29,7 +29,8 @@ print("=== Discord Bot starting ===", flush=True)
 
 # ── local imports ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from technical_indicators import get_full_indicators, format_indicators_for_prompt, get_data_quality_report
+from technical_indicators import (get_full_indicators, format_indicators_for_prompt,
+                                  get_data_quality_report, classify_signals, format_signal_tiers)
 from warrant import search_warrants, analyze_warrant, lookup_stock, prewarm_cache
 from warrant import _fetch_mis, _ratio
 import warrant_db
@@ -148,20 +149,38 @@ def _do_analysis(symbol: str, name: str) -> str:
     ind        = get_full_indicators(symbol)
     ind_text   = format_indicators_for_prompt(ind) if ind and ind.get("available") else "（未取得技術指標）"
     quality_rpt= get_data_quality_report(ind)
+    # 計算新聞時效性（12h內）
+    import re as _re
+    _news_lines   = [l for l in news.split("\n") if l.strip()]
+    _news_recent  = sum(1 for l in _news_lines if _re.search(r'\d{1,2}/\d{1,2}\s+\d{2}:\d{2}', l))
+    tier_result   = classify_signals(ind, news_count=len(_news_lines), news_recent_12h=_news_recent)
+    tier_report   = format_signal_tiers(tier_result)
     closes = quote.get("closes", [])
     price_history = ""
     if len(closes) >= 5:
         price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
+    t1_count = sum(1 for v in tier_result['classifications'].values() if v == 'tier1')
     prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」。
-每個論點格式：「事實/數值（來源）→ 機制 → 影響方向」。禁止空話，禁 Markdown 表格，全程 bullet（•）。
+每個論點：「事實/數值（來源）→ 機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。
 
 ━━━ 標的 ━━━
 代碼：{symbol}　名稱：{display_name}
 現價：{quote['price']} {quote.get('currency', '')}　漲跌：{quote['change']}（{quote['pct']}）
 {price_history}
 
-━━━ PHASE 1：資料來源品質確認 ━━━
+━━━ PHASE 1：資訊收斂 ━━━
+
+【資料來源品質】
 {quality_rpt}
+
+【訊號分級（程式自動評估）】
+{tier_report}
+
+⚠️ Phase 2 閱讀規則：
+  ① 先聚焦 Tier 1（主要訊號），結論不得與 Tier 1 相悖
+  ② Tier 2 用於確認，不單獨決策
+  ③ Tier 3 僅在與 Tier 1 明顯矛盾時才提及，否則略過
+  ④ Tier 1 訊號越多且方向一致 → 信心越高
 
 ━━━ 原始數據 ━━━
 {ind_text}
@@ -169,44 +188,42 @@ def _do_analysis(symbol: str, name: str) -> str:
 ━━━ 近期新聞 ━━━
 {news}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-請依序完成以下三階段，總字數 1100 字以內：
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+請依序完成以下二階段，總字數 1100 字以內：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## ▌PHASE 2：深度研讀 — 多維訊號交叉驗證
+## ▌PHASE 2：依分級優先閱讀
 
-**🔍 技術面**（帶實際數值）
-• MA5/MA20/MA60（數值）→ 多/空頭排列 → 趨勢判斷
-• MACD/RSI/KD（數值）→ 動能與超買超賣訊號
-• 量比 → 量價配合度
+**🔴 Tier 1 主要訊號**（逐項帶數值說明）
+•
 
-**🏦 籌碼與基本面**（若有數據）
-• 法人5日動向（外資/投信方向）→ 是否一致？
-• PE/PB/ROE → 估值與獲利品質快評
+**🟡 Tier 2 輔助確認**（說明是否與 Tier 1 一致）
+• 技術面（MA/MACD/RSI/KD/量比帶數值）
+• 籌碼/基本面/台指期（若台股且有資料）
 
-**⚠️ 多來源訊號衝突**
-若技術/籌碼/基本面/新聞訊號不一致：
-• 哪個來源更可信？為什麼？
+**⚠️ 訊號衝突**（不同層級有矛盾才填）
+• 衝突點 → 以哪個為主，理由
 
-## ▌PHASE 3：決策驗證 — 多空並陳與壓力測試
+## ▌PHASE 3：決策驗證
 
 **⚔️ 多空論點**
-多方（訊號來源 → 看多邏輯 → 目標）：
+多方（Tier來源 → 邏輯 → 目標）：
 •
-空方（訊號來源 → 看空邏輯 → 壓力/跌幅）：
+空方（Tier來源 → 邏輯 → 壓力）：
 •
-當前偏向：[偏多/偏空/拉鋸]
+偏向：[偏多/偏空/拉鋸]　強度：[強/弱]
 
 **🔍 反向壓力測試**
-• 若結論錯誤，最可能的原因是⋯ → 停損邏輯
+• 若結論錯，最脆弱的假設是⋯
 
-**📰 消息面** → 🔴/🟢 + 影響程度
+**📰 消息面** → 🔴/🟢 → 影響期限
 
-**💡 進出場規劃**（含具體觸發條件）
+**💡 進出場規劃**（具體觸發）
 • 進場條件 → 目標 → 停損，風報比 X:1
-• 觀望/停損條件
+• 觀望/回避條件
 
-**📊 信心水準**：[高/中/低]　最大不確定變數：
+**📊 信心水準**：[高/中/低]
+Tier 1 共 {t1_count} 個訊號，最大不確定變數：
 
 > ⚠️ AI 生成，不構成投資建議。"""
     analysis = _claude_call(prompt, max_tokens=2400)

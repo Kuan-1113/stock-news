@@ -81,7 +81,8 @@ except ImportError:
         return text
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from technical_indicators import get_full_indicators, format_indicators_for_prompt, get_data_quality_report
+from technical_indicators import (get_full_indicators, format_indicators_for_prompt,
+                                  get_data_quality_report, classify_signals, format_signal_tiers)
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
@@ -1221,17 +1222,33 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     print(f"    計算技術指標 {symbol}...")
     ind = get_full_indicators(symbol)
     indicators_text = format_indicators_for_prompt(ind)
+    quality_report  = get_data_quality_report(ind)
 
-    quality_report = get_data_quality_report(ind)
+    # ── Phase 1 訊號分級（程式層客觀分類）──────────────────────
+    news_total    = len([l for l in (news_ctx or "").split("\n") if l.strip()])
+    news_recent   = 0   # stock_daily 無法在此得知時效，保守設 0（已在 fetch_all_news 過濾）
+    tier_result   = classify_signals(ind, news_count=news_total, news_recent_12h=news_recent)
+    tier_report   = format_signal_tiers(tier_result)
 
-    prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」對以下數據進行深度研判。
-每個論點格式：「事實/數值（來源）→ 機制 → 影響方向」。禁止空話，禁 Markdown 表格，全程 bullet（•）。
+    prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」。
+每個論點：「事實/數值（來源）→ 機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。
 {stale_note}
 ━━━ 標的 ━━━
 {name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
 
-━━━ PHASE 1：資料品質確認（多來源） ━━━
+━━━ PHASE 1：資訊收斂 ━━━
+
+【資料來源品質】
 {quality_report}
+
+【訊號分級（程式自動評估）】
+{tier_report}
+
+⚠️ Phase 2 閱讀規則：
+  ① 先聚焦 Tier 1 訊號建立核心論點，結論不得與 Tier 1 訊號相悖
+  ② Tier 2 訊號用於確認或補充，不單獨決定方向
+  ③ Tier 3 資料僅在與 Tier 1 明顯矛盾時才提及，否則略過
+  ④ 若 Tier 1 多個訊號方向一致 → 信心高；若 Tier 1 內部矛盾 → 信心中/低
 
 ━━━ 原始數據 ━━━
 {indicators_text}
@@ -1239,58 +1256,51 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
 ━━━ 消息面 ━━━
 {news_ctx if news_ctx else '（暫無新聞）'}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-請依序完成以下三階段，總字數 1300 字以內，每階段標題不得省略：
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+請依序完成以下二個階段，總字數 1300 字以內：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## ▌PHASE 2：深度研讀 — 多維訊號交叉驗證
+## ▌PHASE 2：深度研讀 — 依分級優先順序判讀
 
-**📐 技術面訊號**（帶實際數值）
-• MA排列：MA5={}/MA20={} → 多/空頭排列，現價在均線之上/下
-• MACD({}/{}，柱{}) → 動能擴張/收斂，黃金/死亡交叉？
-• RSI={} KD K={}/D={} → 超買/中性/超賣，交叉訊號？
-• 量比={} → 量價關係（縮量/放量意義）
+**🔴 Tier 1 主要訊號解讀**（若有，優先分析）
+• 依程式分級結果，逐一說明各 Tier 1 訊號的方向、強度與意義
 
-**🏦 籌碼面訊號**（台股限定，若有）
-• 5日外資/投信買賣超方向 → 趨勢是否一致？
-• 融資券動向 → 散戶槓桿增/減的隱含意義
+**🟡 Tier 2 輔助訊號補充**（用於確認 Tier 1，或填補 Tier 1 空缺時使用）
+• 技術面（帶數值）：MA排列/MACD/RSI/KD/量比 → 與 Tier 1 的一致性評估
 
-**📋 基本面訊號**（若有）
-• PE={}/PB={} → 估值高低（vs 歷史/同業）
-• ROE={}/EPS={} → 獲利品質
+**🏦 籌碼面**（若為台股且有資料）
+• 外資/投信5日動向 → 是否強化或矛盾 Tier 1 結論？
 
-**📐 期貨市場訊號**（台股限定，若有）
-• 正逆價差趨勢 → 市場隱含預期方向
-• OI 增減 → 多空布局動向
+**📋 基本面 + 台指期**（若有資料）
+• 估值與期貨市場是否支持或挑戰主要訊號方向？
 
-**⚠️ 訊號衝突點識別**
-若各來源訊號不一致，明確指出：
-• [來源A] 顯示 X，但 [來源B] 顯示 Y → 以哪個為主？原因？
+**⚠️ 訊號衝突識別**
+• 不同 Tier 或不同來源若有矛盾，明確說明：[來源A 訊號] vs [來源B 訊號] → 以哪個為主，理由為何
 
 ## ▌PHASE 3：決策驗證 — 多空並陳與壓力測試
 
-**⚔️ 多空論點對照表**
-多方優勢（每點：訊號來源 → 看多邏輯 → 目標位/預期）：
+**⚔️ 多空論點**（以 Tier 1 訊號為主軸）
+多方優勢（訊號來源→Tier → 看多邏輯 → 目標/預期）：
 •
-空方風險（每點：訊號來源 → 看空邏輯 → 關鍵壓力/下行幅度）：
+空方風險（訊號來源→Tier → 看空邏輯 → 關鍵壓力/跌幅）：
 •
-**當前偏向**：[偏多/偏空/拉鋸]　**多空強度比**：[強多/弱多/均衡/弱空/強空]
+**當前偏向**：[偏多/偏空/拉鋸]　**強度**：[強/弱]
 
-**🔍 反向壓力測試**（若你的結論是錯的）
-• 多方最脆弱的假設是：（若這個假設失效，股價會⋯）
-• 空方最脆弱的假設是：（若這個假設失效，股價會⋯）
+**🔍 反向壓力測試**
+• 多方最脆弱的假設：（若失效 → 股價影響）
+• 空方最脆弱的假設：（若失效 → 股價影響）
 
-**📰 消息面影響評估**
-• 事件 → 🔴利多/🟢利空 → 短期影響（1-5分）vs 中期影響（1-5分）
+**📰 消息面評估** → 🔴/🟢 + 影響期限（短/中）
 
 **🎯 明確進出場規劃**
-• 看多條件：當（具體觸發：守穩均線/突破壓力＋量能）→ 進場，目標=N，停損=N，風報比=X:1
-• 看空/觀望條件：當（具體觸發：跌破支撐/放量下殺）→ 停損/回避，下一支撐=N
+• 看多：條件（具體）→ 目標=N → 停損=N，風報比=X:1
+• 看空/觀望：條件（具體）→ 下一支撐=N → 停損=N
 
-**📊 綜合信心水準**：[高/中/低]
-信心高的原因：　信心低的原因：（不確定的最大變數）
+**📊 信心水準**：[高/中/低]
+依據：Tier 1 訊號數量={len(tier_result['classifications'])} 個中有{sum(1 for v in tier_result['classifications'].values() if v=='tier1')}個 Tier 1
+最大不確定變數：
 
-> ⚠️ AI 生成，不構成投資建議。請自行承擔投資風險。"""
+> ⚠️ AI 生成，不構成投資建議。"""
     raw = claude_call(prompt, max_tokens=2500)
     return _strip_md_tables(raw)
 

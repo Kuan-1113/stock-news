@@ -562,6 +562,217 @@ def get_data_quality_report(ind: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 訊號分級引擎（Phase 1 → 資料分級）
+# ─────────────────────────────────────────────────────────────
+
+def classify_signals(ind: dict, news_count: int = 0, news_recent_12h: int = 0) -> dict:
+    """
+    對每個維度的訊號進行客觀分級：
+      Tier 1（主要訊號）：方向明確、可信度高，分析必須以此為錨點
+      Tier 2（輔助訊號）：有參考價值但不單獨決定方向，用於確認或補充
+      Tier 3（背景雜訊）：中性、資料不足或容易誤導，避免過度解讀
+
+    分級規則採用「訊號強度 × 資料品質」兩軸判斷，
+    不依賴主觀判斷，讓 Phase 2 能依優先順序閱讀資料。
+    """
+    cls: dict[str, str] = {}   # {dimension: "tier1"|"tier2"|"tier3"}
+    rsn: dict[str, str] = {}   # {dimension: 分級理由}
+
+    # ── 1. 價格趨勢（均線位置 × 量能確認）───────────────────────
+    curr    = ind.get("price", 0)
+    ma20    = ind.get("ma20")
+    vol_r   = ind.get("volume", {}).get("vol_ratio")
+    try:
+        vol_f = float(str(vol_r).replace("x","")) if vol_r else 0
+    except Exception:
+        vol_f = 0
+
+    if ma20 and curr:
+        direction = "上方" if curr >= ma20 else "下方"
+        if vol_f >= 1.3:
+            cls["price_trend"] = "tier1"
+            rsn["price_trend"] = f"現價在MA20{direction}且量比{vol_f:.1f}x確認，多/空方向清晰"
+        elif ma20:
+            cls["price_trend"] = "tier2"
+            rsn["price_trend"] = f"現價在MA20{direction}但量能（{vol_f:.1f}x）未充分確認方向"
+    else:
+        cls["price_trend"] = "tier3"
+        rsn["price_trend"] = "均線或價格資料不足，無法判斷趨勢"
+
+    # ── 2. MACD 動能（交叉訊號 > 柱狀方向 > 無交叉）──────────────
+    macd_d = ind.get("macd", {})
+    if macd_d.get("golden_cross"):
+        cls["macd"] = "tier1"
+        rsn["macd"] = "MACD 黃金交叉，動能由空轉多的明確訊號"
+    elif macd_d.get("dead_cross"):
+        cls["macd"] = "tier1"
+        rsn["macd"] = "MACD 死亡交叉，動能由多轉空的明確訊號"
+    elif macd_d.get("macd") is not None:
+        hist = macd_d.get("hist", 0) or 0
+        cls["macd"] = "tier2"
+        rsn["macd"] = f"MACD 無交叉訊號，柱狀{'+' if hist>0 else ''}{hist:.2f} 提供動能方向輔助"
+    else:
+        cls["macd"] = "tier3"
+        rsn["macd"] = "MACD 歷史資料不足（需 27 筆以上）"
+
+    # ── 3. RSI / KD 震盪（極端值 > 交叉 > 中性）─────────────────
+    rsi_d = ind.get("rsi", {})
+    kdj_d = ind.get("kdj", {})
+    rsi_v = rsi_d.get("rsi")
+    if rsi_v is not None:
+        if rsi_v >= 80:
+            cls["momentum_osc"] = "tier1"
+            rsn["momentum_osc"] = f"RSI={rsi_v} 嚴重超買，短期反轉風險高，需優先納入空方論點"
+        elif rsi_v <= 20:
+            cls["momentum_osc"] = "tier1"
+            rsn["momentum_osc"] = f"RSI={rsi_v} 嚴重超賣，短期反彈機率高，需優先納入多方論點"
+        elif "交叉" in str(kdj_d.get("signal", "")):
+            cls["momentum_osc"] = "tier2"
+            rsn["momentum_osc"] = f"KD 出現交叉訊號（K={kdj_d.get('k')} D={kdj_d.get('d')}），輔助確認轉折"
+        else:
+            cls["momentum_osc"] = "tier3"
+            rsn["momentum_osc"] = f"RSI={rsi_v} 位於中性區間，震盪指標無顯著訊號，避免過度解讀"
+    else:
+        cls["momentum_osc"] = "tier3"
+        rsn["momentum_osc"] = "RSI/KD 資料不足"
+
+    # ── 4. 三大法人籌碼（趨勢天數 × 方向一致性）──────────────────
+    inst5 = ind.get("institutional_5d", [])
+    if inst5:
+        foreign_vals: list[float] = []
+        for r in inst5[:5]:
+            raw = str(r.get("foreign_net", "0")).replace(",", "").replace("+", "")
+            try:
+                foreign_vals.append(float(raw))
+            except Exception:
+                pass
+
+        if len(foreign_vals) >= 3:
+            buys  = sum(1 for v in foreign_vals if v > 0)
+            sells = sum(1 for v in foreign_vals if v < 0)
+            if buys >= 4:
+                cls["institutional"] = "tier1"
+                rsn["institutional"] = f"外資近{len(foreign_vals)}日持續買超（{buys}日），籌碼趨勢明確偏多"
+            elif sells >= 4:
+                cls["institutional"] = "tier1"
+                rsn["institutional"] = f"外資近{len(foreign_vals)}日持續賣超（{sells}日），籌碼趨勢明確偏空"
+            elif buys >= 3 or sells >= 3:
+                cls["institutional"] = "tier2"
+                rsn["institutional"] = f"外資方向偏{('多' if buys >= 3 else '空')}但一致性不足（{buys}買/{sells}賣），輔助參考"
+            else:
+                cls["institutional"] = "tier3"
+                rsn["institutional"] = f"外資多空交錯（{buys}買/{sells}賣），方向雜訊大，忽略此維度"
+        else:
+            cls["institutional"] = "tier2"
+            rsn["institutional"] = f"法人資料僅 {len(inst5)} 日，不足以判斷趨勢"
+    else:
+        cls["institutional"] = "tier3"
+        rsn["institutional"] = "法人5日資料無法取得"
+
+    # ── 5. 基本面估值（極端值 > 正常範圍 > 缺失）────────────────
+    fund = ind.get("fundamentals", {})
+    pe   = fund.get("pe")
+    roe  = fund.get("roe")
+    if pe is not None:
+        if pe > 60:
+            cls["fundamental"] = "tier1"
+            rsn["fundamental"] = f"PE={pe:.1f} 嚴重高估（>60），評估下行估值修正風險"
+        elif pe < 8:
+            cls["fundamental"] = "tier1"
+            rsn["fundamental"] = f"PE={pe:.1f} 顯著低估（<8），評估低估反彈空間"
+        else:
+            cls["fundamental"] = "tier2"
+            rsn["fundamental"] = (
+                f"PE={pe:.1f} 在合理範圍，ROE={roe*100:.1f}%" if roe
+                else f"PE={pe:.1f} 在合理範圍，輔助估值判斷"
+            )
+    else:
+        cls["fundamental"] = "tier3"
+        rsn["fundamental"] = "基本面資料缺失（yfinance 台股覆蓋率有限），此維度僅供參考"
+
+    # ── 6. 台指期（正逆價差趨勢 × OI 方向）──────────────────────
+    txf = ind.get("taifex_txf", [])
+    if txf and len(txf) >= 3:
+        basis_list = [r.get("basis") for r in txf[:5] if r.get("basis") is not None]
+        if len(basis_list) >= 3:
+            pos = sum(1 for b in basis_list if b > 0)
+            neg = sum(1 for b in basis_list if b < 0)
+            if pos >= 4 or neg >= 4:
+                cls["futures"] = "tier1"
+                rsn["futures"] = f"台指期連{'正' if pos>=4 else '逆'}價差 {max(pos,neg)} 日，市場預期方向明確"
+            else:
+                cls["futures"] = "tier2"
+                rsn["futures"] = f"台指期正逆價差方向混合（正{pos}/負{neg}日），提供整體市場背景"
+        else:
+            cls["futures"] = "tier2"
+            rsn["futures"] = "台指期資料可用但不足5日，輔助參考"
+    else:
+        cls["futures"] = "tier3"
+        rsn["futures"] = "台指期資料無法取得，忽略此維度"
+
+    # ── 7. 新聞消息（時效性 × 數量）─────────────────────────────
+    if news_recent_12h >= 3:
+        cls["news"] = "tier1"
+        rsn["news"] = f"12h內有 {news_recent_12h} 則相關新聞，時效性高，可能有重大催化劑"
+    elif news_recent_12h >= 1 or news_count >= 3:
+        cls["news"] = "tier2"
+        rsn["news"] = f"有 {news_count} 則新聞（12h內 {news_recent_12h} 則），提供消息面背景"
+    else:
+        cls["news"] = "tier3"
+        rsn["news"] = "新聞稀少或時效性低，消息面影響有限，不過度解讀"
+
+    return {"classifications": cls, "reasons": rsn}
+
+
+def format_signal_tiers(result: dict) -> str:
+    """
+    格式化訊號分級報告，輸出給 Phase 1 資訊收斂區塊。
+    讓 Claude 在 Phase 2 依分級優先順序閱讀與分析。
+    """
+    cls = result.get("classifications", {})
+    rsn = result.get("reasons", {})
+
+    LABELS = {
+        "price_trend":    "價格趨勢（均線×量能）",
+        "macd":           "MACD 動能",
+        "momentum_osc":   "RSI/KD 震盪指標",
+        "institutional":  "三大法人籌碼",
+        "fundamental":    "基本面估值",
+        "futures":        "台指期",
+        "news":           "新聞消息",
+    }
+
+    t1 = [(LABELS.get(k, k), rsn.get(k, "")) for k, v in cls.items() if v == "tier1"]
+    t2 = [(LABELS.get(k, k), rsn.get(k, "")) for k, v in cls.items() if v == "tier2"]
+    t3 = [(LABELS.get(k, k), rsn.get(k, "")) for k, v in cls.items() if v == "tier3"]
+
+    lines = []
+    if t1:
+        lines.append("🔴 Tier 1【主要訊號 — Phase 2 必須以此為分析錨點，結論不得違背】")
+        for name, reason in t1:
+            lines.append(f"  ► {name}：{reason}")
+    if t2:
+        lines.append("🟡 Tier 2【輔助訊號 — 用於確認或補充論點，不單獨決策】")
+        for name, reason in t2:
+            lines.append(f"  ◆ {name}：{reason}")
+    if t3:
+        lines.append("⚫ Tier 3【背景雜訊 — 僅在與 Tier 1 明顯矛盾時才提及，否則略過】")
+        for name, reason in t3:
+            lines.append(f"  ○ {name}：{reason}")
+
+    total = len(t1) + len(t2) + len(t3)
+    if total > 0:
+        lines.append(
+            f"\n📊 訊號強度分佈：Tier1={len(t1)} Tier2={len(t2)} Tier3={len(t3)}"
+            + (" → 多維度 Tier1 一致，信心基礎強" if len(t1) >= 3 else
+               " → Tier1 訊號少，分析需保守" if len(t1) <= 1 else
+               " → Tier1 有限，重點交叉驗證 Tier2")
+        )
+
+    return "\n".join(lines) if lines else "（無法分級）"
+
+
+# ─────────────────────────────────────────────────────────────
 # 格式化輸出
 # ─────────────────────────────────────────────────────────────
 
