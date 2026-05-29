@@ -222,57 +222,63 @@ def fetch_stock_fundamentals(symbol: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 def fetch_taifex_txf_5d() -> list:
-    """台指期近5個交易日：收盤價、現貨（^TWII）、正逆價差、未平倉量"""
+    """台指期近5個交易日：收盤價、現貨（^TWII）、正逆價差、未平倉量
+    資料來源：FinMind（TaiwanFuturesDaily TX）+ yfinance ^TWII
+    """
+    # 1. 取 ^TWII spot 近期收盤
+    spot_map: dict[str, float] = {}
     try:
         import yfinance as yf
-        # 1. 取得加權指數近期收盤（spot）
-        twii_hist = yf.Ticker("^TWII").history(period="15d")
-        spot_map: dict[str, float] = {}
-        for ts, row in twii_hist.iterrows():
-            d = ts.strftime("%Y/%m/%d")
-            spot_map[d] = round(float(row["Close"]), 2)
-    except Exception:
-        spot_map = {}
+        twii = yf.Ticker("^TWII").history(period="20d")
+        for ts, row in twii.iterrows():
+            spot_map[ts.strftime("%Y-%m-%d")] = round(float(row["Close"]), 2)
+    except Exception as e:
+        print(f"^TWII 取得失敗: {e}")
+
+    # 2. FinMind TaiwanFuturesDaily（TX 台指期，免費公開 API）
+    try:
+        start = (datetime.datetime.now(TW_TZ) - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
+        end   = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+        r = requests.get(
+            "https://api.finmindtrade.com/api/v4/data"
+            f"?dataset=TaiwanFuturesDaily&data_id=TX&start_date={start}&end_date={end}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"FinMind API 失敗: {r.status_code}")
+            return []
+        raw = r.json().get("data", [])
+    except Exception as e:
+        print(f"FinMind 取得失敗: {e}")
+        return []
+
+    # 3. 每日取成交量最大的近月合約
+    from collections import defaultdict
+    by_date: dict[str, list] = defaultdict(list)
+    for rec in raw:
+        if rec.get("volume", 0) > 0 and rec.get("close", 0) > 0:
+            by_date[rec["date"]].append(rec)
 
     results = []
-    for date_str in _last_trading_dates(8):
+    for d in sorted(by_date.keys(), reverse=True):
         if len(results) >= 5:
             break
-        d_fmt = f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}"
-        try:
-            r = requests.get(
-                f"https://openapi.taifex.com.tw/v1/DailyMarketInfo?queryDate={d_fmt}",
-                headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not data:
-                continue
-            # 找台指期近月（TXF，選未平倉量最大的合約 = 近月）
-            txf_rows = [x for x in data if str(x.get("commodity_id", "")).upper() in ("TXF", "TX")]
-            if not txf_rows:
-                continue
-            front = max(txf_rows, key=lambda x: int(str(x.get("open_interest", 0)).replace(",", "") or 0))
-            close_p = front.get("close_price") or front.get("settlement_price") or ""
-            oi      = front.get("open_interest", "")
-            if not close_p:
-                continue
-            futures_close = round(float(str(close_p).replace(",", "")), 2)
-            spot          = spot_map.get(d_fmt, 0)
-            basis         = round(futures_close - spot, 2) if spot else None
-            results.append({
-                "date":          d_fmt,
-                "futures_close": futures_close,
-                "spot_close":    spot,
-                "basis":         basis,
-                "basis_type":    ("正價差" if basis and basis > 0 else ("逆價差" if basis and basis < 0 else "平價")),
-                "oi":            str(oi).replace(",", ""),
-            })
-        except Exception as e:
-            print(f"台指期 API 錯誤 {d_fmt}: {e}")
-        time.sleep(0.15)
-    return results
+        front = max(by_date[d], key=lambda x: x.get("volume", 0))
+        futures_close = round(float(front["close"]), 2)
+        oi            = int(front.get("open_interest", 0))
+        spot          = spot_map.get(d, 0)
+        basis         = round(futures_close - spot, 2) if spot else None
+        results.append({
+            "date":          d,
+            "futures_close": futures_close,
+            "spot_close":    spot,
+            "basis":         basis,
+            "basis_type":    ("正價差" if basis and basis > 0
+                              else ("逆價差" if basis and basis < 0 else "平價")),
+            "oi":            f"{oi:,}",
+        })
+
+    return results  # newest first
 
 
 # ─────────────────────────────────────────────────────────────
