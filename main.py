@@ -30,7 +30,8 @@ print("=== Discord Bot starting ===", flush=True)
 # ── local imports ─────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from technical_indicators import (get_full_indicators, format_indicators_for_prompt,
-                                  get_data_quality_report, classify_signals, format_signal_tiers)
+                                  get_data_quality_report, classify_signals, format_signal_tiers,
+                                  calc_macd, calc_rsi, calc_kdj, calc_bias, calc_volume)
 from warrant import search_warrants, analyze_warrant, lookup_stock, prewarm_cache
 from warrant import _fetch_mis, _ratio
 import warrant_db
@@ -140,83 +141,177 @@ def _fetch_news(symbol: str, name: str) -> str:
         _add(f"https://finance.yahoo.com/rss/headline?s={symbol}")
     return "\n".join(titles[:8]) if titles else "（暫無相關新聞）"
 
+def _fetch_tech_fast(symbol: str) -> str:
+    """
+    從 Yahoo Finance v8 API 抓取 3 個月 OHLCV，
+    用純 Python 計算技術指標（不呼叫 yfinance，速度快 ≈1-2s）。
+    回傳格式化純文字，供 Claude 分析用。
+    """
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=3mo",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+        )
+        if r.status_code != 200:
+            return "（技術指標暫時無法取得）"
+
+        result = r.json()["chart"]["result"][0]
+        qdata  = result["indicators"]["quote"][0]
+
+        # 過濾出 close/high/low 都有值的 bar
+        valid = [
+            (c, h, l, v)
+            for c, h, l, v in zip(
+                qdata.get("close",  []), qdata.get("high",   []),
+                qdata.get("low",    []), qdata.get("volume", [])
+            )
+            if c is not None and h is not None and l is not None
+        ]
+        if len(valid) < 20:
+            return "（歷史資料不足，無法計算技術指標）"
+
+        closes  = [x[0] for x in valid]
+        highs   = [x[1] for x in valid]
+        lows    = [x[2] for x in valid]
+        volumes = [x[3] if x[3] is not None else 0 for x in valid]
+        curr    = closes[-1]
+
+        # 均線
+        def _ma(n: int):
+            return round(sum(closes[-n:]) / n, 2) if len(closes) >= n else None
+
+        ma5, ma10, ma20 = _ma(5), _ma(10), _ma(20)
+        ma60 = _ma(60) if len(closes) >= 30 else None
+
+        lines = []
+
+        # ── 均線
+        ma_parts = []
+        for p, v in [(5, ma5), (10, ma10), (20, ma20), (60, ma60)]:
+            if v:
+                is_lg = curr > 1000
+                vf = f"{v:,.0f}" if is_lg else f"{v:,.2f}"
+                ma_parts.append(f"MA{p}={vf}（現價{'上方' if curr >= v else '下方'}）")
+        if ma_parts:
+            lines.append("均線：" + " | ".join(ma_parts))
+
+        # ── MACD
+        m = calc_macd(closes)
+        if m.get("macd") is not None:
+            cross = ""
+            if m.get("golden_cross"):
+                cross = " ★黃金交叉"
+            elif m.get("dead_cross"):
+                cross = " ★死亡交叉"
+            lines.append(
+                f"MACD={m['macd']} Signal={m['signal']} 柱={m['hist']} "
+                f"{m['trend']}{cross}"
+            )
+
+        # ── RSI
+        rd = calc_rsi(closes)
+        if rd.get("rsi") is not None:
+            lines.append(f"RSI(14)={rd['rsi']} — {rd['signal']}")
+
+        # ── KDJ
+        kd = calc_kdj(highs, lows, closes)
+        if kd.get("k") is not None:
+            lines.append(f"KDJ：K={kd['k']} D={kd['d']} J={kd['j']} — {kd['signal']}")
+
+        # ── 乖離率
+        b = calc_bias(closes)
+        bp = [f"{p}日={b[f'bias{p}']:+.2f}%" for p in [5, 10, 20] if b.get(f"bias{p}") is not None]
+        if bp:
+            lines.append("乖離率：" + " | ".join(bp))
+
+        # ── 量比
+        vd = calc_volume(volumes)
+        if vd.get("vol_ratio") is not None:
+            lines.append(f"量比={vd['vol_ratio']}x — {vd['vol_trend']}")
+
+        # ── 近20日支撐壓力（依實際高低點）
+        is_large = curr > 1000
+        fmt = lambda v: f"{v:,.0f}" if is_large else f"{v:,.2f}"
+        r_hi = sorted(highs[-20:], reverse=True)[:3]
+        r_lo = sorted(lows[-20:])[:3]
+        lines.append("近20日壓力參考：" + " / ".join([fmt(h) for h in r_hi]))
+        lines.append("近20日支撐參考：" + " / ".join([fmt(l) for l in r_lo]))
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"⚠️ _fetch_tech_fast 錯誤 {symbol}: {e}", flush=True)
+        return "（技術指標暫時無法取得）"
+
+
 def _do_analysis(symbol: str, name: str) -> str:
+    """
+    查股深度分析：
+    - 以 Yahoo Finance v8 直抓 OHLCV + 純 Python 技術指標（快，~2s）
+    - 不使用 yfinance（避免 Railway 上 timeout）
+    """
     quote = _fetch_quote(symbol)
     if not quote:
-        return f"❌ 找不到股票代碼 `{symbol}`\n格式範例：台股 `2330.TW`、美股 `NVDA`、指數 `^TWII`"
+        return (
+            f"❌ 找不到股票代碼 `{symbol}`\n"
+            f"格式範例：台股 `2330.TW`、美股 `NVDA`、指數 `^TWII`"
+        )
     display_name = name or quote.get("name", symbol)
-    news = _fetch_news(symbol, display_name)
-    ind        = get_full_indicators(symbol)
-    ind_text   = format_indicators_for_prompt(ind) if ind and ind.get("available") else "（未取得技術指標）"
-    quality_rpt= get_data_quality_report(ind)
-    # 計算新聞時效性（12h內）
-    import re as _re
-    _news_lines   = [l for l in news.split("\n") if l.strip()]
-    _news_recent  = sum(1 for l in _news_lines if _re.search(r'\d{1,2}/\d{1,2}\s+\d{2}:\d{2}', l))
-    tier_result   = classify_signals(ind, news_count=len(_news_lines), news_recent_12h=_news_recent)
-    tier_report   = format_signal_tiers(tier_result)
+    news     = _fetch_news(symbol, display_name)
+    tech_txt = _fetch_tech_fast(symbol)   # 純 Yahoo v8 + 純 Python，快
+
     closes = quote.get("closes", [])
     price_history = ""
     if len(closes) >= 5:
-        price_history = "近5日收盤：" + " → ".join([f"{c:,.2f}" for c in closes[-5:]])
-    t1_count = sum(1 for v in tier_result['classifications'].values() if v == 'tier1')
-    prompt = f"""你是資深股票分析師，採用「三階段迭代分析框架」。
-每個論點：「事實/數值（來源）→ 機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。
+        is_lg = float(closes[-1]) > 1000
+        fmt_p = (lambda v: f"{v:,.0f}") if is_lg else (lambda v: f"{v:,.2f}")
+        price_history = "近5日收盤：" + " → ".join([fmt_p(c) for c in closes[-5:]])
 
-━━━ 標的 ━━━
+    prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析。
+
+【注意】
+- 直接開始寫分析內容，禁空話，禁 Markdown 表格，全程 bullet（•）
+- 台灣慣例：🔴=漲，🟢=跌
+- 每個論點格式：「數值/事實 → 機制 → 影響方向」
+- 總字數 1100 字以內
+
+【標的資訊】
 代碼：{symbol}　名稱：{display_name}
 現價：{quote['price']} {quote.get('currency', '')}　漲跌：{quote['change']}（{quote['pct']}）
 {price_history}
 
-━━━ PHASE 1：資訊收斂（程式預處理結果）━━━
+【技術指標（近3個月，Yahoo Finance + 純 Python 計算）】
+{tech_txt}
 
-【資料來源品質確認】
-{quality_rpt}
-
-【訊號分級（客觀規則自動評估）】
-{tier_report}
-※ Tier 1 = 主要訊號（分析錨點）　Tier 2 = 輔助確認　Tier 3 = 背景雜訊
-
-━━━ 原始數據 ━━━
-{ind_text}
-
-━━━ 近期新聞 ━━━
+【近期相關新聞】
 {news}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PHASE 2 與 3 格式說明：
-• 不需按固定章節填寫，以邏輯流暢為主
-• 必須涵蓋四個核心任務，順序與篇幅自由調配
-• 總字數 1100 字以內
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ 以下四節全部完整輸出 ━━━
 
-## ▌PHASE 2：邏輯推論層
+**A. 歸因分析（必做）**
+• 識別 1-3 個近期走勢主要驅動力（技術突破/籌碼主導/消息催化/總體環境）
+• 結合技術指標說明目前趨勢結構：均線位置（多/空排列）＋MACD/RSI 動能
+• 這是短暫脈衝（1-5日）還是持續結構趨勢？判斷依據？
 
-**核心任務 A — 歸因分析**
-這支股票近期表現，主要由什麼驅動？
-• 識別 1-3 個主因（技術突破/籌碼主導/消息催化/總體環境/估值修正），說明相對重要性
-• 是短暫脈衝（1-5日）還是持續結構（趨勢改變）？判斷依據？
-• 若驅動力不明確，提出 2-3 個競爭性假說並標注最有支持的一個
+**B. 技術訊號整合（必做）**
+• 均線多空排列 → 短/中/長期偏向
+• MACD 動能（柱狀方向＋是否交叉）+ RSI/KDJ 超買超賣狀態
+• 量比配合：量增/縮 → 說明趨勢健康度
+• **關鍵壓力位**（帶具體數字，參考近20日高點）
+• **關鍵支撐位**（帶具體數字，參考近20日低點及均線）
 
-**核心任務 B — 訊號整合**
-以 Tier 1 為主軸，整合各維度觀察（不需逐一列舉，選最重要的說）：
-• Tier 1 訊號方向一致還是矛盾？整合後指向何方？
-• 最值得關注的 Tier 2 輔助訊號（1-2個）
+**C. 多空決策（必做）**
+• 多方論點（技術+消息面）→ 目標價位（數字）
+• 空方論點（風險因素）→ 止損建議（數字）
+• 當前偏向：多/空/觀望 + 最關鍵決定因素一句
 
-**核心任務 C — AI 自由觀察**（可省略，若確實無特別洞察）
-框架外值得關注的異常或模式：量價型態、歷史類比、跨資產訊號、行為偏誤等
+**D. 操作建議（必做）**
+• 進場條件（突破什麼位置才進？）
+• 目標價位 → 停損位（具體數字）
+• 信心水準（高/中/低）+ 最大不確定因子（1句）
 
-## ▌PHASE 3：決策層
+> ⚠️ AI 生成分析，不構成投資建議。"""
 
-**核心任務 D — 多空並陳與操作框架**（格式自由，但以下必須涵蓋）
-• 多方核心論點 + 目標價位
-• 空方核心論點 + 關鍵壓力位
-• 若結論錯誤，最脆弱的假設是什麼？
-• 進場條件 → 目標 → 停損（帶具體價位），風報比
-• 信心水準（高/中/低）+ 最大不確定因子
-  ※ 本次 Tier 1 共 {t1_count} 個訊號
-
-> ⚠️ AI 生成，不構成投資建議。"""
     analysis = _claude_call(prompt, max_tokens=2400)
     header = (
         f"## {quote['emoji']} **{display_name}（{symbol}）** | {now_str()}\n"
@@ -246,6 +341,272 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
         return False, str(e)[:80]
 
 # ── 定時觸發日報（Railway 永遠在線，取代不可靠的 GitHub cron）────
+
+# ── 期貨試算功能 ─────────────────────────────────────────────────
+
+_FUT_SPEC = {
+    "TX":  {"name": "臺股期貨（大台）",     "yf": "TXF=F",  "mult": 200,  "tick": 1,    "unit": "點"},
+    "MX":  {"name": "小型臺股期貨（小台）", "yf": "MXF=F",  "mult": 50,   "tick": 1,    "unit": "點"},
+    "TE":  {"name": "電子期貨",             "yf": None,      "mult": 4000, "tick": 0.05, "unit": "點"},
+    "TF":  {"name": "金融期貨",             "yf": None,      "mult": 1000, "tick": 0.2,  "unit": "點"},
+    "XIF": {"name": "非金電期貨",           "yf": None,      "mult": 200,  "tick": 1,    "unit": "點"},
+    "GDF": {"name": "黃金期貨",             "yf": "GC=F",    "mult": 100,  "tick": 0.5,  "unit": "美元"},
+    "BRF": {"name": "布蘭特原油期貨",       "yf": "BZ=F",    "mult": 1000, "tick": 0.01, "unit": "美元"},
+}
+_MARGIN_TABLE = {
+    "TX":  {"orig": 170000, "maint": 130000},
+    "MX":  {"orig":  43000, "maint":  33000},
+    "TE":  {"orig":  84000, "maint":  64500},
+    "TF":  {"orig":  41000, "maint":  31500},
+    "XIF": {"orig":  42000, "maint":  32000},
+    "GDF": {"orig":  27000, "maint":  20700},
+    "BRF": {"orig":  27000, "maint":  20700},
+}
+
+
+def _calc_atr(history: list, period: int = 10) -> float:
+    """計算 ATR（Average True Range），供停損建議使用"""
+    trs = []
+    for i in range(1, len(history)):
+        h  = history[i].get("high",  0) or 0
+        l  = history[i].get("low",   0) or 0
+        pc = history[i - 1].get("close", 0) or 0
+        if h > 0 and l > 0 and pc > 0:
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return 0.0
+    return round(sum(trs[-period:]) / min(period, len(trs)), 1)
+
+
+def _fetch_fut_history(yf_symbol: str, days: int = 15) -> list:
+    """抓取期貨 OHLCV（Yahoo Finance v8，不依賴 yfinance）"""
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}"
+            f"?interval=1d&range={days}d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=12,
+        )
+        if r.status_code != 200:
+            return []
+        result     = r.json()["chart"]["result"][0]
+        timestamps = result.get("timestamp", [])
+        q = result["indicators"]["quote"][0]
+        rows = []
+        for i, ts in enumerate(timestamps):
+            c = q["close"][i]  if i < len(q.get("close",  [])) else None
+            o = q["open"][i]   if i < len(q.get("open",   [])) else None
+            h = q["high"][i]   if i < len(q.get("high",   [])) else None
+            l = q["low"][i]    if i < len(q.get("low",    [])) else None
+            v = q["volume"][i] if i < len(q.get("volume", [])) else None
+            if c is None:
+                continue
+            dt = datetime.datetime.fromtimestamp(ts, tz=TW_TZ)
+            rows.append({"date": dt.strftime("%m/%d"), "open": o, "high": h, "low": l, "close": c, "volume": v})
+        return rows
+    except Exception as e:
+        print(f"期貨歷史錯誤 {yf_symbol}：{e}", flush=True)
+        return []
+
+
+def _fetch_spot_twii() -> float | None:
+    """抓台指現貨 ^TWII 最新收盤，供期現基差計算"""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/^TWII?interval=1d&range=2d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code == 200:
+            closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c]
+            return closes[-1] if closes else None
+    except Exception:
+        pass
+    return None
+
+
+def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int) -> str:
+    """期貨試算：P&L + 保證金 + ATR停損 + 損益情境 + AI分析"""
+    code = symbol.upper().strip()
+    spec = _FUT_SPEC.get(code, {
+        "name": code, "yf": f"{code}=F" if "=" not in code else code,
+        "mult": 1, "tick": 1, "unit": "點",
+    })
+    margin  = _MARGIN_TABLE.get(code, {"orig": 0, "maint": 0})
+    mult    = spec["mult"]
+    is_long = "買" in direction or "多" in direction or direction.lower() in ("long", "buy")
+    sign    = 1 if is_long else -1
+    dir_tag = "🔴 買進（多）" if is_long else "🟢 賣出（空）"
+
+    # 抓歷史
+    history       = _fetch_fut_history(spec["yf"], 15) if spec.get("yf") else []
+    hist10        = history[-10:] if len(history) >= 10 else history
+    current_price = history[-1]["close"] if history else None
+
+    # ATR & 近期統計
+    atr      = _calc_atr(hist10) if hist10 else 0
+    highs    = [r["high"]  for r in hist10 if r.get("high")]
+    lows     = [r["low"]   for r in hist10 if r.get("low")]
+    amp_list = [(r["high"] - r["low"]) / r["low"] * 100
+                for r in hist10 if r.get("high") and r.get("low") and r["low"] > 0]
+    period_hi = max(highs) if highs else None
+    period_lo = min(lows)  if lows  else None
+    avg_amp   = round(sum(amp_list) / len(amp_list), 1) if amp_list else 0
+
+    # P&L 計算
+    pnl         = (current_price - entry_price) * mult * contracts * sign if current_price else None
+    pnl_per_pt  = mult * contracts
+    orig        = margin["orig"]
+    maint       = margin["maint"]
+    call_thresh = (orig - maint) * contracts if orig > 0 else 0
+    call_price  = (entry_price - call_thresh / (mult * contracts) * sign
+                   if call_thresh > 0 and mult > 0 else None)
+
+    # 期現基差（只對 TX/MX）
+    basis_line = ""
+    if code in ("TX", "MX") and current_price:
+        spot = _fetch_spot_twii()
+        if spot:
+            basis = current_price - spot
+            btype = "正價差" if basis > 0 else "逆價差"
+            basis_line = f"• 台指期現基差：期貨 {current_price:,.0f} 現貨 {spot:,.0f} → **{basis:+.0f}**（{btype}）\n"
+
+    # ── 組合輸出 ───────────────────────────────────────────────
+    pnl_tag = (f"{'🟩 獲利' if (pnl or 0) >= 0 else '🟥 虧損'} {pnl:+,.0f} 元"
+               if pnl is not None else "（目前價格未取得）")
+
+    lines = [
+        f"## ⚡ 期貨試算 | {now_str()}",
+        f"**{spec['name']}（{code}）** — {dir_tag}　**{contracts} 口**",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "**📋 合約資訊**",
+        f"• 進場價格：**{entry_price:,.0f}**",
+        f"• 合約乘數：{mult:,} 元/{spec['unit']}",
+        f"• {contracts} 口每點損益：**{pnl_per_pt:,} 元**",
+    ]
+
+    if current_price:
+        move = (current_price - entry_price) * sign
+        lines += [
+            "",
+            "**📊 目前損益**",
+            f"• 目前價格：**{current_price:,.0f}**",
+            f"• {pnl_tag}（{move:+.0f} {spec['unit']}）",
+        ]
+    if basis_line:
+        lines.append(basis_line.rstrip())
+
+    if orig > 0:
+        lines += [
+            "",
+            "**💰 保證金資訊**（參考值，實際請至 taifex.com.tw 確認）",
+            f"• 原始保證金（每口）：**{orig:,}** 元　→ {contracts} 口合計 **{orig*contracts:,}** 元",
+            f"• 維持保證金（每口）：**{maint:,}** 元　→ {contracts} 口合計 **{maint*contracts:,}** 元",
+        ]
+
+    if call_price is not None:
+        dir_word = "跌破" if is_long else "突破"
+        lines += [
+            "",
+            "**⚠️ 追加保證金觸發點（Margin Call）**",
+            f"• 當價格 {dir_word} **{call_price:,.0f}** 時，需追繳保證金",
+            f"• 追繳金額（補回原始水位）：**{call_thresh:,} 元**",
+        ]
+
+    # ── ATR 停損建議
+    if atr > 0:
+        sl_1x = entry_price - atr * sign
+        sl_15 = entry_price - atr * 1.5 * sign
+        max_loss_1x = atr * mult * contracts
+        lines += [
+            "",
+            f"**📐 停損建議（近10日 ATR = {atr:,.0f} {spec['unit']}）**",
+            f"• 1x ATR 停損：**{sl_1x:,.0f}**　→ 最大虧損 **{max_loss_1x:,.0f} 元**（{'偏緊' if atr / (entry_price or 1) < 0.005 else '合理'}）",
+            f"• 1.5x ATR 停損：**{sl_15:,.0f}**　→ 給市場更多震盪空間",
+        ]
+
+    # ── 損益情境
+    if current_price and atr > 0:
+        steps = [int(atr * m) for m in [0.5, 1, 2, 3]]
+        lines += ["", f"**💡 損益情境（基於 ATR={atr:.0f}）**"]
+        for step in steps:
+            for s in [1, -1]:
+                price_s = entry_price + step * s
+                pnl_s   = (price_s - entry_price) * mult * contracts * sign
+                arrow   = "⬆️" if s > 0 else "⬇️"
+                hit_mc  = call_price and ((is_long and price_s <= call_price) or (not is_long and price_s >= call_price))
+                mc_tag  = " ⚠️Margin Call!" if hit_mc else ""
+                lines.append(f"• {arrow} {s*step:+.0f}{spec['unit']} → 價格 {price_s:,.0f}　損益 **{pnl_s:+,.0f} 元**{mc_tag}")
+
+    # ── 近10日行情
+    if hist10:
+        lines += ["", f"**📅 近 {len(hist10)} 個交易日行情**"]
+        for row in hist10:
+            amp = ((row["high"] - row["low"]) / row["low"] * 100
+                   if row.get("high") and row.get("low") and row["low"] > 0 else 0)
+            lines.append(
+                f"• {row['date']}　高 {row['high']:,.0f}　低 {row['low']:,.0f}"
+                f"　收 {row['close']:,.0f}　振幅 {amp:.1f}%"
+            )
+        if period_hi and period_lo:
+            lines += [
+                "",
+                f"• 期間最高：**{period_hi:,.0f}**　最低：**{period_lo:,.0f}**",
+                f"• {len(hist10)} 日平均振幅：**{avg_amp:.1f}%**",
+            ]
+
+    # ── AI 分析（升級為 500字）
+    price_ctx = f"目前價 {current_price:,.0f}" if current_price else "（目前價格未取得）"
+    pnl_ctx   = f"損益 {pnl:+,.0f} 元（{(current_price - entry_price)*sign:+.0f} 點）" if pnl is not None else ""
+    sl_ctx    = f"1xATR 停損 {entry_price - atr*sign:,.0f}" if atr > 0 else ""
+    hi_ctx    = f"期間高 {period_hi:,.0f} 低 {period_lo:,.0f}" if period_hi and period_lo else ""
+
+    prompt = f"""你是一位期貨交易風險分析師。根據以下試算數據，以繁體中文撰寫完整風險評估（禁 Markdown 表格，全程 bullet（•），500字以內）。
+
+商品：{spec['name']}（{code}）
+方向：{direction}（{dir_tag}）
+進場：{entry_price:,.0f}　口數：{contracts} 口
+{price_ctx}　{pnl_ctx}
+ATR（近10日）：{atr:,.0f} {spec['unit']}
+{sl_ctx}　{hi_ctx}
+平均振幅：{avg_amp:.1f}%
+原始保證金：{orig:,} 元/口　Margin Call 觸發價：{f'{call_price:,.0f}' if call_price else 'N/A'}
+
+請輸出以下五節：
+
+**📊 當前狀況評估**
+• 目前盈虧方向、倉位風險程度（低/中/高）
+• 距 Margin Call 的緩衝空間（點數＋百分比）
+
+**📐 關鍵價位分析**
+• 主要支撐位（帶數字，依近期行情）
+• 主要壓力位（帶數字）
+• 突破/跌破哪個價位才改變看法？
+
+**⚡ 風險管理建議**
+• 停損設置：1x ATR vs 1.5x ATR，哪個更適合目前市場波動度？
+• 若已盈利，考慮移動停損的條件是什麼？
+• 加碼條件（若確認趨勢，可在哪個位置加碼？）
+
+**⚖️ 多空論點**
+• 支持當前方向的 2 個最強理由（帶具體數值）
+• 威脅當前方向的 2 個最大風險
+
+**💡 操作建議**
+• 短期（1-3 日）：維持/減倉/出場？觸發條件是什麼？
+• 中期（5-10 日）：目標價位 → 出場計畫
+
+> ⚠️ 以上為 AI 生成試算，保證金數字為參考值，不構成投資建議。"""
+
+    lines += [
+        "",
+        "**🤖 AI 風險評估**",
+        _claude_call(prompt, max_tokens=700),
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "> ⚠️ 保證金數字為參考值，請至 [TAIFEX](https://www.taifex.com.tw/cht/2/parame) 查詢最新",
+    ]
+    return "\n".join(lines)
+
 
 def _update_warrant_prices_bg():
     """
@@ -471,6 +832,55 @@ async def cmd_自選股(interaction: discord.Interaction):
         except Exception:
             pass
 
+# ── 期貨指令 ─────────────────────────────────────────────────
+
+@tree.command(name="期貨", description="期貨試算：損益 / 保證金 / ATR停損 / 情境分析 / AI評估")
+@app_commands.describe(
+    symbol      = "期貨代碼（TX=大台、MX=小台、TE=電子、TF=金融、GDF=黃金、BRF=布蘭特油）",
+    direction   = "買進（多）或 賣出（空）",
+    entry_price = "進場價格（數字，如：21500）",
+    contracts   = "口數（預設 1）",
+)
+@app_commands.choices(direction=[
+    app_commands.Choice(name="買進（多）", value="買進"),
+    app_commands.Choice(name="賣出（空）", value="賣出"),
+])
+async def cmd_期貨(
+    interaction: discord.Interaction,
+    symbol:      str,
+    direction:   app_commands.Choice[str],
+    entry_price: float,
+    contracts:   int = 1,
+):
+    dir_str = direction.value
+    print(f"⚡ /期貨 收到：{symbol} {dir_str} @{entry_price} {contracts}口", flush=True)
+    try:
+        await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /期貨 互動已過期，忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /期貨 defer 失敗：{e}", flush=True)
+        return
+    try:
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, _do_futures, symbol.strip().upper(), dir_str, entry_price, max(1, contracts)
+        )
+        chunks = _split_messages(result)
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(chunk)
+            else:
+                await interaction.channel.send(chunk)
+    except Exception as e:
+        print(f"❌ /期貨 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 試算失敗：{str(e)[:150]}")
+        except Exception:
+            pass
+
+
 # ── 權證指令 ─────────────────────────────────────────────────
 
 def _do_warrant_search(stock_input: str) -> str:
@@ -480,28 +890,35 @@ def _do_warrant_search(stock_input: str) -> str:
         return summary
 
     prompt = f"""你是一位台灣認購權證專家。以下是 {zh_name}（{code}）目前市場上的認購權證候選清單，已依綜合評分由高到低排序，全部剩餘天數 > 90 天。
-請直接引用各權證的實際數值，不要泛泛而談。
+
+【重要格式規則】
+- 禁 Markdown 表格（禁用 | 符號製表）
+- 全程 bullet（• 開頭）
+- 每項評估必須帶入實際數值，不可泛泛而談
 
 【認購權證候選清單】
 {summary}
 
-請以繁體中文撰寫分析報告（750字以內），格式如下：
+請以繁體中文撰寫（800字以內）：
 
 **🏆 推薦排名分析**
-對每一檔逐一說明，直接帶入實際數值：
+對每一檔逐一評估，格式：
 
-**第 N 名　代號 ／ 名稱**（若有【評級】請顯示）
-> 剩 X 天　溢價 X%　槓桿 X 倍　今日成交 XXX 張
-- ✅ 優勢：（最吸引人的 2 個具體理由，帶數值）
-- ⚠️ 注意：（1-2 個風險點，帶數值）
+**第N名　代號 名稱**（若有【評級】請顯示）
+• 到期日：X 天剩餘
+• 溢價率 X% → 評估（偏高/合理/偏低）
+• 槓桿 X 倍 → 評估（甜蜜點 5-15 倍）
+• 今日成交 XXX 張 → 流動性（佳/>50萬/普通/差）
+• ✅ 優勢：最吸引人的 2 個具體理由
+• ⚠️ 注意：1-2 個風險點
 
 **💡 綜合建議**
-• **首選**：第幾名？原因（綜合到期時間、溢價率、流動性、槓桿）
-• **短線操作（1-2 週）**：推薦哪檔？理由
-• **中線操作（1 個月以上）**：推薦哪檔？理由
-• **進場提示**：進場前應確認的關鍵條件（溢價率、流動性、停損設置）
+• 首選：第幾名？理由（綜合到期/溢價/流動性/槓桿）
+• 短線（1-2週）首選：哪檔？為什麼？
+• 中線（1個月以上）首選：哪檔？為什麼？
+• 進場前必確認：溢價率上限 + 流動性要求 + 停損設置
 
-> ⚠️ AI 生成，不構成投資建議。實際交易前請自行確認最新報價。"""
+> ⚠️ AI 生成，不構成投資建議。交易前請自行確認最新報價。"""
 
     analysis = _claude_call(prompt, max_tokens=2000)
     header = (
@@ -518,52 +935,56 @@ def _do_warrant_analyze(warrant_code: str) -> str:
 
     prompt = f"""你是一位台灣認購權證專家，請根據以下實際數據進行逐項評估。
 
+【重要格式規則】
+- 禁 Markdown 表格（禁用 | 符號製表）
+- 全程 bullet（• 開頭）
+- 每項評估必須帶入實際數值，不可省略；資料顯示「—」才寫「資料不足」
+
 【目標權證資料】
 {target_summary}
 
 【同標的其他認購權證（供比較）】
 {similar_summary}
 
----
-**撰寫規則（必須遵守）：**
-- 每項評估格式：「實際數值 → 評估結論（好／普通／差 + 一句理由）」
-- 有數值就帶入，不可省略；僅資料顯示「—」才寫「資料不足」
-- 禁止只給範圍說明而不帶本權證的實際數值
-
-請以繁體中文撰寫（850字以內）：
+請以繁體中文撰寫（900字以內）：
 
 **📋 逐項數據評估**
 
 **① 剩餘天數**
-到期日【填入】，距今【填入】天 → 評估時間充裕度與時間價值衰退風險
+• 到期日：【填入】，距今【填入】天 → 時間充裕度：（充裕/普通/偏短）+ 一句時間價值衰退說明
 
 **② 價內外狀態**
-履約價【填入】元 vs 標的現價【填入】元 → 目前價內 X% ／ 價外 X%，需要標的漲 X% 才獲利
+• 履約價【填入】元 vs 標的現價【填入】元
+• 目前【價內/價外】X%，標的需漲 X% 才損益兩平
 
 **③ 溢價率**
-溢價率【填入】%（若無法計算請說明原因） → 合理範圍 3-8%；偏高代表需更多漲幅才能回本
+• 溢價率【填入】%（若無法計算請說明原因）
+• 評估：（偏高>8%/合理3-8%/偏低<3%） → 對報酬的實際影響
 
 **④ 槓桿倍數**
-槓桿【填入】倍（若為估算請標注） → 5-15 倍為甜蜜點；評估報酬風險比
+• 槓桿【填入】倍（若估算請標注）→ 5-15 倍為甜蜜點，評估報酬風險比
 
 **⑤ 流動性（成交量）**
-今日成交【填入】張 → 佳（>50 萬張）／普通（5-50 萬張）／差（<5 萬張）；說明出場難易度
+• 今日成交【填入】張 → 佳（>50萬）/ 普通（5-50萬）/ 差（<5萬）
+• 出場難易度說明
 
 **⑥ 發行規模**
-發行量【填入】仟單位 → 評估長期供應充足度
+• 發行量【填入】仟單位 → 供應充足度評估
 
-> ⚠️ Delta ／ IV ／ 有效槓桿：TWSE 公開資料未提供，需向發行商（元大、凱基、統一等）查詢報價系統
+> ℹ️ Delta / IV / 有效槓桿：TWSE 公開資料未提供，請向發行商查詢報價系統
 
-**✅ 主要優勢**（2-3 點，每點帶實際數值）
+**✅ 主要優勢**（2-3點，每點帶實際數值）
 
-**⚠️ 主要風險**（2-3 點，每點帶實際數值）
+**⚠️ 主要風險**（2-3點，每點帶實際數值）
 
 **🔄 同標的選項比較**
-（若有其他同標的認購權證）列出簡表：代號 ｜ 到期日 ｜ 剩餘天數 ｜ 溢價率 ｜ 成交張數，並說明各檔優劣
-（若無）直接說明「目前市場無其他同標的認購權證可供比較」，**不要製作空表格**
+若有其他同標的認購權證，對每一檔逐一 bullet 說明：
+• 代號 名稱：剩餘天數 X 天、溢價率 X%、成交 XXX 張 → 優於/劣於目標權證的理由
+若無同標的：說明「目前市場無其他同標的認購權證」，不製作空表格
 
 **⭐ 綜合評級**
-若資料顯示了【評級 A+/A/B/C/D】，直接引用並說明評定依據；否則根據以上數據自行評定 A／B／C／D，並一句話說明理由。
+• 若資料顯示【評級 A+/A/B/C/D】直接引用；否則自行評定 A/B/C/D
+• 一句話說明評定依據
 
 > ⚠️ AI 生成，不構成投資建議。"""
 
@@ -647,6 +1068,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
+    print(f"   指令列表：/查股 /自選股 /期貨 /查權證 /分析權證", flush=True)
     warrant_db.init_db()   # 建立/確認資料庫表格
     prewarm_cache()        # 背景預熱快取（優先用 DB，DB 過期才打 API）
 
