@@ -54,15 +54,50 @@ def now_str():
     return datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
 
 # ── Anthropic SDK（取代 requests.post 直接呼叫）────────────────
-from shared.claude_client import simple_call as _sdk_call
+from shared.claude_client import simple_call as _sdk_call, stream_call as _async_stream
+import watchlist_db
 
 def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
     """
-    Discord bot 統一 Claude 呼叫入口。
-    使用 anthropic SDK Messages API（simple_call），
-    比原本 requests.post() 更穩定、有型別錯誤分類、自動處理 rate limit。
+    Discord bot 同步 Claude 呼叫（不串流版）。
+    用於期貨試算、查權證等還不需要串流的指令。
     """
     return _sdk_call(prompt, max_tokens=max_tokens, model=CLAUDE_MODEL)
+
+
+async def _stream_to_discord(
+    prompt: str,
+    msg: discord.Message,
+    prefix: str = "",
+    max_tokens: int = 2400,
+) -> str:
+    """
+    串流 Claude 回應並即時更新 Discord 訊息。
+    • 每 1.5 秒 edit 一次（避免 Discord rate limit）
+    • 顯示進度游標 ▌
+    • 回傳完整輸出文字
+    """
+    import time as _time
+    accumulated = ""
+    last_edit   = _time.monotonic()
+
+    try:
+        async for chunk in _async_stream(prompt, max_tokens=max_tokens, model=CLAUDE_MODEL):
+            accumulated += chunk
+            now = _time.monotonic()
+            if now - last_edit >= 1.5:
+                display = (prefix + accumulated)[:1950] + " ▌"
+                try:
+                    await msg.edit(content=display)
+                except Exception:
+                    pass
+                last_edit = now
+    except Exception as e:
+        print(f"❌ _stream_to_discord 例外：{e}", flush=True)
+        if not accumulated:
+            accumulated = _claude_call(prompt, max_tokens)   # fallback
+
+    return prefix + accumulated
 
 def _fetch_quote(symbol: str) -> dict | None:
     try:
@@ -227,21 +262,24 @@ def _fetch_tech_fast(symbol: str) -> str:
         return "（技術指標暫時無法取得）"
 
 
-def _do_analysis(symbol: str, name: str) -> str:
+def _prepare_analysis(symbol: str, name: str) -> dict:
     """
-    查股深度分析：
-    - 以 Yahoo Finance v8 直抓 OHLCV + 純 Python 技術指標（快，~2s）
-    - 不使用 yfinance（避免 Railway 上 timeout）
+    抓取股票資料並組好 prompt，供串流版 / 同步版共用。
+    回傳：
+      {"error": str}          → 找不到股票
+      {"error": None, "header": str, "prompt": str}  → 正常
     """
     quote = _fetch_quote(symbol)
     if not quote:
-        return (
-            f"❌ 找不到股票代碼 `{symbol}`\n"
-            f"格式範例：台股 `2330.TW`、美股 `NVDA`、指數 `^TWII`"
-        )
+        return {
+            "error": (
+                f"❌ 找不到股票代碼 `{symbol}`\n"
+                f"格式範例：台股 `2330.TW`、美股 `NVDA`、指數 `^TWII`"
+            )
+        }
     display_name = name or quote.get("name", symbol)
     news     = _fetch_news(symbol, display_name)
-    tech_txt = _fetch_tech_fast(symbol)   # 純 Yahoo v8 + 純 Python，快
+    tech_txt = _fetch_tech_fast(symbol)
 
     closes = quote.get("closes", [])
     price_history = ""
@@ -295,14 +333,60 @@ def _do_analysis(symbol: str, name: str) -> str:
 
 > ⚠️ AI 生成分析，不構成投資建議。"""
 
-    analysis = _claude_call(prompt, max_tokens=2400)
     header = (
         f"## {quote['emoji']} **{display_name}（{symbol}）** | {now_str()}\n"
         f"**現價：{quote['price']} {quote.get('currency','')}**　"
         f"漲跌：{quote['change']}（{quote['pct']}）\n"
         f"{'─' * 28}\n\n"
     )
-    return header + analysis
+    return {"error": None, "header": header, "prompt": prompt}
+
+
+def _do_analysis(symbol: str, name: str) -> str:
+    """同步版查股分析（期貨/自選股等指令的 fallback 仍可使用）"""
+    data = _prepare_analysis(symbol, name)
+    if data["error"]:
+        return data["error"]
+    return data["header"] + _claude_call(data["prompt"], max_tokens=2400)
+
+
+# ── 市場新聞抓取（/新聞 指令用）──────────────────────────────────
+
+_MARKET_NEWS_FEEDS: dict[str, list[str]] = {
+    "台股": [
+        "https://news.cnyes.com/rss/cat/tw_stock",
+        "https://news.google.com/rss/search?q=台股+股市+今日&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+        "https://news.google.com/rss/search?q=台灣+財經+科技股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
+    ],
+    "美股": [
+        "https://finance.yahoo.com/rss/topstories",
+        "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+        "https://news.google.com/rss/search?q=US+stock+market+Wall+Street+today&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "國際": [
+        "https://feeds.reuters.com/reuters/businessNews",
+        "https://news.google.com/rss/search?q=global+economy+Fed+inflation+oil&hl=en-US&gl=US&ceid=US:en",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
+    ],
+}
+
+def _fetch_market_news(market_type: str) -> list[str]:
+    """抓取市場新聞標題（去重，最多 10 則）"""
+    urls = _MARKET_NEWS_FEEDS.get(market_type, _MARKET_NEWS_FEEDS["台股"])
+    titles, seen = [], set()
+    for url in urls:
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for e in feed.entries[:6]:
+                t = getattr(e, "title", "").strip()
+                key = re.sub(r"\s+", "", t.lower())[:30]
+                if t and key not in seen:
+                    seen.add(key)
+                    titles.append(t)
+            time.sleep(0.3)
+        except Exception:
+            pass
+    return titles[:10]
 
 def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
     if not GITHUB_PAT:
@@ -770,20 +854,140 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
         print(f"❌ /查股 defer 失敗：{e}", flush=True)
         return
     try:
-        loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _do_analysis, symbol.strip().upper(), name.strip())
-        chunks = _split_messages(result)
-        for i, chunk in enumerate(chunks):
-            if i == 0:
-                await interaction.followup.send(chunk)
-            else:
-                await interaction.channel.send(chunk)
+        # ── Phase 1：抓取資料（同步，不阻塞 event loop）─────────────
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, _prepare_analysis, symbol.strip().upper(), name.strip()
+        )
+        if data["error"]:
+            await interaction.followup.send(data["error"])
+            return
+
+        # ── Phase 2：傳送初始訊息 + 串流 AI 分析 ──────────────────
+        msg = await interaction.followup.send(
+            data["header"] + "🔍 AI 分析中，請稍候... ▌"
+        )
+        full_text = await _stream_to_discord(
+            data["prompt"], msg,
+            prefix=data["header"], max_tokens=2400
+        )
+
+        # ── Phase 3：最終確認 + 處理超長訊息 ─────────────────────
+        chunks = _split_messages(full_text)
+        await msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
+
     except Exception as e:
         print(f"❌ /查股 例外：{e}", flush=True)
         try:
             await interaction.followup.send(f"❌ 查詢失敗：{str(e)[:150]}")
         except Exception:
             pass
+
+# ── /新聞 ────────────────────────────────────────────────────────
+
+@tree.command(name="新聞", description="最新財經新聞 + AI 摘要（台股 / 美股 / 國際）")
+@app_commands.describe(市場="選擇新聞市場")
+@app_commands.choices(市場=[
+    app_commands.Choice(name="📈 台股", value="台股"),
+    app_commands.Choice(name="🇺🇸 美股", value="美股"),
+    app_commands.Choice(name="🌏 國際", value="國際"),
+])
+async def cmd_新聞(interaction: discord.Interaction, 市場: app_commands.Choice[str]):
+    mtype = 市場.value
+    print(f"⚡ /新聞 收到：{mtype}", flush=True)
+    try:
+        await interaction.response.defer()
+    except Exception:
+        return
+    try:
+        loop   = asyncio.get_running_loop()
+        titles = await loop.run_in_executor(None, _fetch_market_news, mtype)
+        if not titles:
+            await interaction.followup.send(f"❌ 目前無法取得 {mtype} 新聞，請稍後再試。")
+            return
+
+        news_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
+        prompt = f"""你是財經新聞分析師。以下是最新的{mtype}財經新聞標題，請用繁體中文寫簡明摘要（500字以內）。
+
+禁用 Markdown 表格，全程 bullet（• 開頭）。
+{mtype}慣例：🔴=漲/利多，🟢=跌/利空。
+
+【新聞標題】
+{news_text}
+
+請輸出兩節：
+
+**🔥 重要事件（3-5條最重要的）**
+• 事件 → 影響方向 → 重要性（高/中/低）
+
+**📊 市場影響研判**
+• 整體偏多或偏空？重點受惠/受壓族群？
+
+> ⚠️ AI 生成摘要，不構成投資建議。"""
+
+        header = (
+            f"## 📰 {mtype}最新財經新聞摘要 | {now_str()}\n"
+            f"{'─' * 28}\n\n"
+        )
+        msg = await interaction.followup.send(header + "🔍 AI 分析新聞中... ▌")
+        full_text = await _stream_to_discord(prompt, msg, prefix=header, max_tokens=900)
+        await msg.edit(content=full_text[:2000])
+
+    except Exception as e:
+        print(f"❌ /新聞 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 取得新聞失敗：{str(e)[:150]}")
+        except Exception:
+            pass
+
+
+# ── /自選股新增 / /自選股刪除 / /自選股清單 ───────────────────────
+
+@tree.command(name="自選股新增", description="新增股票到個人自選股清單（最多 20 支）")
+@app_commands.describe(
+    symbol="股票代碼（台股：2330.TW｜美股：NVDA）",
+    name="股票名稱（選填，如：台積電）",
+)
+async def cmd_自選股新增(interaction: discord.Interaction, symbol: str, name: str = ""):
+    uid = str(interaction.user.id)
+    gid = str(interaction.guild_id or "dm")
+    ok, msg_text = watchlist_db.add_stock(uid, gid, symbol.strip().upper(), name.strip())
+    await interaction.response.send_message(msg_text, ephemeral=True)
+
+
+@tree.command(name="自選股刪除", description="從個人自選股清單刪除股票")
+@app_commands.describe(symbol="股票代碼（例：2330.TW）")
+async def cmd_自選股刪除(interaction: discord.Interaction, symbol: str):
+    uid = str(interaction.user.id)
+    gid = str(interaction.guild_id or "dm")
+    ok, msg_text = watchlist_db.remove_stock(uid, gid, symbol.strip().upper())
+    await interaction.response.send_message(msg_text, ephemeral=True)
+
+
+@tree.command(name="自選股清單", description="查看個人自選股清單")
+async def cmd_自選股清單(interaction: discord.Interaction):
+    uid    = str(interaction.user.id)
+    gid    = str(interaction.guild_id or "dm")
+    stocks = watchlist_db.get_watchlist(uid, gid)
+    if not stocks:
+        await interaction.response.send_message(
+            "📋 你的自選股清單是空的。\n"
+            "使用 `/自選股新增 代碼 名稱` 開始新增（例：`/自選股新增 2330.TW 台積電`）。",
+            ephemeral=True,
+        )
+        return
+    lines = [f"📋 **你的自選股清單**（{len(stocks)}/{watchlist_db.MAX_STOCKS}）\n"]
+    for s in stocks:
+        date = s["added_at"][:10]
+        label = f"  {s['name']}" if s["name"] else ""
+        lines.append(f"• `{s['symbol']}`{label}  _(加入：{date})_")
+    lines.append("\n> 使用 `/自選股刪除 代碼` 移除，`/查股 代碼` 查詢個股")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+# ── /自選股 ──────────────────────────────────────────────────────
 
 @tree.command(name="自選股", description="觸發完整自選股分析（結果約 2 分鐘後出現）")
 async def cmd_自選股(interaction: discord.Interaction):
@@ -1051,9 +1255,10 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令列表：/查股 /自選股 /期貨 /查權證 /分析權證", flush=True)
-    warrant_db.init_db()   # 建立/確認資料庫表格
-    prewarm_cache()        # 背景預熱快取（優先用 DB，DB 過期才打 API）
+    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股 /期貨 /查權證 /分析權證", flush=True)
+    warrant_db.init_db()     # 建立/確認權證資料庫表格
+    watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
+    prewarm_cache()          # 背景預熱快取（優先用 DB，DB 過期才打 API）
 
 if not DISCORD_BOT_TOKEN:
     print("❌ 未設定 DISCORD_BOT_TOKEN，Bot 無法啟動", flush=True)

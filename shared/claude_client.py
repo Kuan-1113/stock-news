@@ -23,16 +23,25 @@ import anthropic
 # 直接讀環境變數（不 import shared.config，確保 main.py / Railway 也能單獨使用）
 ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# ── Singleton Client ──────────────────────────────────────────────
-_client: anthropic.Anthropic | None = None
+# ── Singleton Clients ─────────────────────────────────────────────
+_client:       anthropic.Anthropic      | None = None
+_async_client: anthropic.AsyncAnthropic | None = None
 
 
 def get_client() -> anthropic.Anthropic:
-    """回傳（或初始化）Anthropic SDK singleton。"""
+    """回傳（或初始化）同步 Anthropic SDK singleton。"""
     global _client
     if _client is None:
         _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     return _client
+
+
+def get_async_client() -> anthropic.AsyncAnthropic:
+    """回傳（或初始化）非同步 Anthropic SDK singleton（Discord bot 串流用）。"""
+    global _async_client
+    if _async_client is None:
+        _async_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return _async_client
 
 
 # ── 模式一：Messages API（快速、適合 Discord bot）────────────────
@@ -204,6 +213,54 @@ def agent_call(
     except Exception as e:
         print(f"❌ Managed Agents 呼叫失敗，降級 simple_call：{e}")
         return simple_call(prompt, max_tokens, model)
+
+
+# ── 模式三：Async Streaming（Discord bot 串流回應用）─────────────
+
+async def stream_call(
+    prompt: str,
+    max_tokens: int = 2400,
+    model: str = "claude-sonnet-4-6",
+    system: str = "",
+):
+    """
+    非同步 generator：逐 chunk 產出 Claude 回應文字。
+    • 適用：Discord bot 串流顯示（邊生成邊更新訊息）
+    • 使用 AsyncAnthropic，不阻塞 event loop
+
+    用法：
+        async for chunk in stream_call(prompt, max_tokens, model):
+            accumulated += chunk
+    """
+    if not ANTHROPIC_API_KEY:
+        yield "⚠️ 未設定 ANTHROPIC_API_KEY，AI 分析無法使用。"
+        return
+
+    client = get_async_client()
+    kwargs: dict = {
+        "model":      model,
+        "max_tokens": max_tokens,
+        "messages":   [{"role": "user", "content": prompt}],
+    }
+    if system:
+        kwargs["system"] = system
+
+    try:
+        async with client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                yield text
+    except anthropic.RateLimitError:
+        print("⏳ Claude rate limit（stream_call）")
+        yield "\n⏳ AI 分析暫時無法使用（rate limit），請稍後再試。"
+    except anthropic.APIStatusError as e:
+        print(f"❌ Claude stream HTTP {e.status_code}")
+        yield f"\n⚠️ AI 分析暫時無法使用（HTTP {e.status_code}）"
+    except anthropic.APIConnectionError as e:
+        print(f"❌ Claude stream 連線失敗：{e}")
+        yield "\n⚠️ AI 分析暫時無法使用（連線逾時）"
+    except Exception as e:
+        print(f"❌ Claude stream 失敗：{e}")
+        yield f"\n⚠️ AI 分析暫時無法使用（{str(e)[:80]}）"
 
 
 # ── 公開旗標：是否啟用 Managed Agents ────────────────────────────

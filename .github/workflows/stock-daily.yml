@@ -72,13 +72,19 @@ jobs:
 
       - name: 🚀 執行 Agent 股市日報（orchestrator.py）
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          DISCORD_TW:        ${{ secrets.DISCORD_TW }}
-          DISCORD_US:        ${{ secrets.DISCORD_US }}
-          DISCORD_GLOBAL:    ${{ secrets.DISCORD_GLOBAL }}
-          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
-          JIN10_TOKEN:       ${{ secrets.JIN10_TOKEN }}
-          REPORT_SESSION:    ${{ env.REPORT_SESSION }}
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_TW:          ${{ secrets.DISCORD_TW }}
+          DISCORD_US:          ${{ secrets.DISCORD_US }}
+          DISCORD_GLOBAL:      ${{ secrets.DISCORD_GLOBAL }}
+          DISCORD_WATCHLIST:   ${{ secrets.DISCORD_WATCHLIST }}
+          JIN10_TOKEN:         ${{ secrets.JIN10_TOKEN }}
+          REPORT_SESSION:      ${{ env.REPORT_SESSION }}
+          # Managed Agents：設定後 orchestrator 改用 Sessions API
+          # 未設定（預設）= 使用 Messages API，速度最快
+          USE_MANAGED_AGENTS:  ${{ secrets.USE_MANAGED_AGENTS }}
+          # 跨 run 復用 Agent/Environment（不設定則每次建立新的）
+          MANAGED_AGENT_ID_STOCK_ANALYST: ${{ secrets.MANAGED_AGENT_ID_STOCK_ANALYST }}
+          MANAGED_ENV_ID_STOCK_ANALYSIS:  ${{ secrets.MANAGED_ENV_ID_STOCK_ANALYSIS }}
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
