@@ -1,0 +1,42 @@
+name: 🧪 Agent 架構測試（手動觸發）
+
+on:
+  workflow_dispatch:
+    # 只能手動觸發，不影響正式排程
+
+jobs:
+  test-orchestrator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Taipei
+
+    steps:
+      - name: 📥 Checkout 程式碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安裝相依套件
+        run: |
+          pip install --upgrade pip
+          pip install requests feedparser schedule anthropic pytz
+
+      - name: 🕐 確認目前台北時間
+        run: |
+          python -c "import pytz; from datetime import datetime; tz=pytz.timezone('Asia/Taipei'); print('台北時間:', datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S %Z'))"
+
+      - name: 🚀 執行 Agent 架構（orchestrator.py）
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_TW:        ${{ secrets.DISCORD_TW }}
+          DISCORD_US:        ${{ secrets.DISCORD_US }}
+          DISCORD_GLOBAL:    ${{ secrets.DISCORD_GLOBAL }}
+          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          PYTHONUTF8: "1"
+          TZ: Asia/Taipei
+        run: |
+          python -X utf8 orchestrator.py
