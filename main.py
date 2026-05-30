@@ -506,6 +506,7 @@ def _prepare_individual_futures(
     # ── Margin Call 觸發價 ─────────────────────────────────────
     diff_per_shr = (orig_m - maint_m) / (lot_size * contracts) if lot_size > 0 else 0
     call_price   = entry_price - diff_per_shr * sign if diff_per_shr > 0 else None
+    buf_cash_ind = orig_m - maint_m   # 全部口數的總緩衝金額
 
     # ── ATR（用股票歷史資料）──────────────────────────────────
     hist = _fetch_fut_history(yf_sym, 15)   # 沿用同一函式，Yahoo v8
@@ -543,17 +544,45 @@ def _prepare_individual_futures(
         lines += [
             "",
             f"**💰 保證金資訊** {margin_note}",
-            f"• 原始保證金（{orig_ratio:.1%}）：**{orig_m:,}** {currency}",
-            f"• 維持保證金（{maint_ratio:.1%}）：**{maint_m:,}** {currency}",
+            f"• 原始保證金（{orig_ratio:.1%}）：**{orig_m:,}** {currency}（入場須繳）",
+            f"• 維持保證金（{maint_ratio:.1%}）：**{maint_m:,}** {currency}（低於此線追繳）",
+            f"• 保證金緩衝：**{buf_cash_ind:,}** {currency}（約 **{diff_per_shr:,.2f}** 元/股）— 超過即觸發追繳",
         ]
 
     if call_price is not None:
-        dir_word = "跌破" if is_long else "突破"
+        dir_word  = "跌破" if is_long else "突破"
+        move_word = "下跌" if is_long else "上漲"
         lines += [
             "",
-            "**⚠️ 追加保證金觸發點（Margin Call）**",
-            f"• 當股價 {dir_word} **{call_price:,.2f}** 時，需追繳保證金",
+            "**⚠️ 追加保證金（Margin Call）分析**",
+            f"• 觸發條件：虧損超過 **{buf_cash_ind:,} {currency}**（股價{move_word} **{diff_per_shr:,.2f}** 元）",
+            f"• 觸發股價：{dir_word} **{call_price:,.2f}**",
+            f"• 追繳金額：**{buf_cash_ind:,} {currency}**（補回至原始保證金 **{orig_m:,}** {currency}）",
+            "• ⏰ 追繳期限：**T+1 收盤前**（次一交易日），逾期券商強制平倉",
+            "",
+            f"📉 **虧損階梯**（{dir_tag}，緩衝 {diff_per_shr:,.2f} 元/股 / {buf_cash_ind:,} {currency}）：",
         ]
+        for pct_int, pct in [(25, 0.25), (50, 0.50), (75, 0.75), (100, 1.0), (150, 1.5)]:
+            loss_psh  = diff_per_shr * pct
+            loss_cash = buf_cash_ind  * pct
+            price_at  = entry_price  - loss_psh * sign
+            balance   = orig_m       - loss_cash
+            if pct < 1.0:
+                remain = buf_cash_ind - loss_cash
+                marker = "🟡" if pct <= 0.5 else "🟠"
+                status = (f"✅ 安全（距追繳還有 {remain:,.0f} {currency}）" if pct <= 0.5
+                          else f"⚠️ 接近警戒（距追繳剩 {remain:,.0f} {currency}）")
+            elif pct == 1.0:
+                marker = "🔴"
+                status = f"🚨 **追繳 {int(buf_cash_ind):,} {currency}**（T+1 截止）"
+            else:
+                marker = "💀"
+                extra  = loss_cash - buf_cash_ind
+                status = f"💀 超過追繳線 {extra:,.0f} {currency}，**強平風險**"
+            lines.append(
+                f"• {marker} 股價{move_word} **{loss_psh:.2f} 元**（{pct_int}%）"
+                f" → 股價 **{price_at:,.2f}**　帳餘 {balance:,.0f} {currency}　{status}"
+            )
 
     if atr > 0:
         sl_1x  = entry_price - atr * sign
@@ -607,7 +636,8 @@ def _prepare_individual_futures(
 {price_ctx}　損益：{pnl:+,.0f} 元
 ATR（近10日）：{atr:,.2f} 元　{sl_ctx}　{hi_ctx}
 今日漲跌：{chg_today}（{pct_today}）　平均振幅：{avg_amp:.1f}%
-原始保證金：{orig_m:,} 元　Margin Call 觸發：{f'{call_price:,.2f}' if call_price else 'N/A'}
+原始保證金：{orig_m:,} 元（維持 {maint_m:,} 元，緩衝 {buf_cash_ind:,} 元 / {diff_per_shr:,.2f} 元/股）
+Margin Call 觸發股價：{f'{call_price:,.2f}' if call_price else 'N/A'}（觸發後 T+1 需補繳 {buf_cash_ind:,} 元）
 
 請輸出以下五節：
 
@@ -771,6 +801,8 @@ def _prepare_futures(symbol: str, direction: str, entry_price: float, contracts:
     call_thresh = (orig - maint) * contracts if orig > 0 else 0
     call_price  = (entry_price - call_thresh / (mult * contracts) * sign
                    if call_thresh > 0 and mult > 0 else None)
+    # 每口緩衝空間（點數）
+    buf_pts = (orig - maint) / mult if (orig > 0 and mult > 0) else 0
 
     # 期現基差（只對 TX/MX）
     basis_line = ""
@@ -807,21 +839,51 @@ def _prepare_futures(symbol: str, direction: str, entry_price: float, contracts:
         lines.append(basis_line)
 
     if orig > 0:
+        orig_total  = orig  * contracts
+        maint_total = maint * contracts
         lines += [
             "",
             "**💰 保證金資訊**（參考值，實際請至 taifex.com.tw 確認）",
-            f"• 原始保證金（每口）：**{orig:,}** 元　→ {contracts} 口合計 **{orig*contracts:,}** 元",
-            f"• 維持保證金（每口）：**{maint:,}** 元　→ {contracts} 口合計 **{maint*contracts:,}** 元",
+            f"• 原始保證金：**{orig:,}** 元/口 × {contracts} 口 = **{orig_total:,}** 元（入場須繳）",
+            f"• 維持保證金：**{maint:,}** 元/口 × {contracts} 口 = **{maint_total:,}** 元（低於此線追繳）",
+            f"• 保證金緩衝：**{call_thresh:,}** 元（約 **{buf_pts:.0f}** {spec['unit']}）— 超過此幅度即觸發追繳",
         ]
 
     if call_price is not None:
-        dir_word = "跌破" if is_long else "突破"
+        dir_word   = "跌破" if is_long else "突破"
+        move_word  = "下跌" if is_long else "上漲"
+        orig_total = orig  * contracts
         lines += [
             "",
-            "**⚠️ 追加保證金觸發點（Margin Call）**",
-            f"• 當價格 {dir_word} **{call_price:,.0f}** 時，需追繳保證金",
-            f"• 追繳金額（補回原始水位）：**{call_thresh:,} 元**",
+            "**⚠️ 追加保證金（Margin Call）分析**",
+            f"• 觸發條件：虧損超過 **{call_thresh:,} 元**（{move_word} **{buf_pts:.0f} {spec['unit']}**）",
+            f"• 觸發價位：{dir_word} **{call_price:,.0f}**",
+            f"• 追繳金額：**{call_thresh:,} 元**（補回至原始保證金 **{orig_total:,}** 元）",
+            "• ⏰ 追繳期限：**T+1 收盤前**（次一交易日），逾期券商強制平倉",
+            "",
+            f"📉 **虧損階梯**（{dir_tag}，緩衝 {buf_pts:.0f} {spec['unit']} / {call_thresh:,} 元）：",
         ]
+        for pct_int, pct in [(25, 0.25), (50, 0.50), (75, 0.75), (100, 1.0), (150, 1.5)]:
+            loss_pts  = buf_pts    * pct
+            loss_cash = call_thresh * pct
+            price_at  = entry_price - loss_pts * sign
+            balance   = orig_total - loss_cash
+            if pct < 1.0:
+                remain = call_thresh - loss_cash
+                marker = "🟡" if pct <= 0.5 else "🟠"
+                status = (f"✅ 安全（距追繳還有 {remain:,.0f} 元）" if pct <= 0.5
+                          else f"⚠️ 接近警戒（距追繳剩 {remain:,.0f} 元）")
+            elif pct == 1.0:
+                marker = "🔴"
+                status = f"🚨 **追繳 {int(call_thresh):,} 元**（T+1 截止）"
+            else:
+                marker = "💀"
+                extra  = loss_cash - call_thresh
+                status = f"💀 超過追繳線 {extra:,.0f} 元，**強平風險**"
+            lines.append(
+                f"• {marker} {move_word} **{loss_pts:.0f} {spec['unit']}**（{pct_int}%）"
+                f" → 價格 **{price_at:,.0f}**　帳餘 {balance:,.0f} 元　{status}"
+            )
 
     if atr > 0:
         sl_1x = entry_price - atr * sign
@@ -877,7 +939,9 @@ def _prepare_futures(symbol: str, direction: str, entry_price: float, contracts:
 ATR（近10日）：{atr:,.0f} {spec['unit']}
 {sl_ctx}　{hi_ctx}
 平均振幅：{avg_amp:.1f}%
-原始保證金：{orig:,} 元/口　Margin Call 觸發價：{f'{call_price:,.0f}' if call_price else 'N/A'}
+原始保證金：{orig:,} 元/口（{contracts} 口合計 {orig*contracts:,} 元）
+維持保證金：{maint:,} 元/口　緩衝：{buf_pts:.0f} {spec['unit']} / {call_thresh:,} 元
+Margin Call 觸發價：{f'{call_price:,.0f}' if call_price else 'N/A'}（觸發後 T+1 需補繳 {call_thresh:,} 元）
 
 請輸出以下五節：
 

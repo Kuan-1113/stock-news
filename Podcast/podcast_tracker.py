@@ -15,6 +15,9 @@ Podcast 追蹤器：RSS 偵測新集數 → faster-whisper 轉逐字稿 → Clau
 import os, sys, json, re, time, datetime, tempfile, warnings, requests, feedparser, pytz
 warnings.filterwarnings("ignore")
 
+# ── 讓 shared/ 套件可被 import（Podcast/ 子目錄執行時需向上一層加路徑）────
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 def _get_tw_standard_time() -> datetime.datetime:
     """向台灣標準時間 NTP 伺服器對時（失敗時降級備用）"""
@@ -182,31 +185,50 @@ def transcribe(audio_path: str) -> str:
 # Claude AI 分析
 # ─────────────────────────────────────────────────────────────
 
-def claude_call(prompt: str, max_tokens: int = 1600) -> str:
-    if not ANTHROPIC_API_KEY:
-        return "⚠️ 未設定 ANTHROPIC_API_KEY"
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": CLAUDE_MODEL,
-                  "max_tokens": max_tokens,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=90,
-        )
-        return r.json()["content"][0]["text"].strip() if r.status_code == 200 \
-               else f"分析暫時無法使用（HTTP {r.status_code}）"
-    except Exception as e:
-        return f"分析暫時無法使用（{str(e)[:100]}）"
+try:
+    from shared.claude_client import simple_call as _sdk_call
+    def claude_call(prompt: str, max_tokens: int = 1600) -> str:
+        """使用 Anthropic SDK 呼叫 Claude（優先）。"""
+        return _sdk_call(prompt, max_tokens=max_tokens)
+except ImportError:
+    def claude_call(prompt: str, max_tokens: int = 1600) -> str:
+        """降級：直接用 requests.post 呼叫 Claude（SDK 不可用時）。"""
+        if not ANTHROPIC_API_KEY:
+            return "⚠️ 未設定 ANTHROPIC_API_KEY"
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": CLAUDE_MODEL,
+                      "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=90,
+            )
+            return r.json()["content"][0]["text"].strip() if r.status_code == 200 \
+                   else f"分析暫時無法使用（HTTP {r.status_code}）"
+        except Exception as e:
+            return f"分析暫時無法使用（{str(e)[:100]}）"
 
 def analyze_episode(show_name: str, title: str, description: str,
                     duration_str: str, transcript: str) -> str:
     desc = re.sub(r"<[^>]+>", "", description)[:3000]
 
     if transcript:
-        content = f"【逐字稿節錄（前 5000 字）】\n{transcript[:5000]}"
+        tlen = len(transcript)
+        # 智慧截取：60 分鐘 Podcast 約 4-8 萬字元，只送前 5000 字會嚴重截斷
+        # 策略：≤24000 → 全文；>24000 → 首 16000 + 尾 8000（保留開頭重點與結尾結論）
+        MAX_CHARS = 24000
+        if tlen <= MAX_CHARS:
+            chunk_text = transcript
+            chunk_note = f"全文 {tlen:,} 字元"
+        else:
+            head = transcript[:16000]
+            tail = transcript[-8000:]
+            chunk_text = head + "\n\n……[中段省略，僅保留首尾精華]……\n\n" + tail
+            chunk_note = f"節錄：首 16,000 + 尾 8,000 字元（全文共 {tlen:,} 字元）"
+        content = f"【逐字稿（{chunk_note}）】\n{chunk_text}"
         basis   = "逐字稿"
     else:
         content = f"【集數描述】\n{desc}"
@@ -240,7 +262,7 @@ def analyze_episode(show_name: str, title: str, description: str,
 
 *以上分析基於{basis}，由 AI 生成，僅供參考，不構成投資建議。*"""
 
-    return claude_call(prompt, max_tokens=2000)
+    return claude_call(prompt, max_tokens=2500)
 
 # ─────────────────────────────────────────────────────────────
 # Discord 傳送
