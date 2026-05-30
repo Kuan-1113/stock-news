@@ -24,32 +24,48 @@ def is_weekend() -> bool:
     return now_tw().weekday() >= 5  # 5=Saturday, 6=Sunday
 
 def get_session_info() -> dict:
-    """依目前台灣時間決定本次時段資訊"""
-    h = now_tw().hour
-    if 8 <= h < 14:
-        return {
+    """
+    依 REPORT_SESSION 環境變數（morning/afternoon/evening）決定時段；
+    未設定時才依台灣時間自動偵測。
+    GitHub Actions cron 在 07:55 觸發，若靠時間自動偵測會誤判，
+    因此正式 workflow 應明確傳入 REPORT_SESSION。
+    """
+    import os
+    _sessions = {
+        "morning": {
             "label": "盤前早報",
             "period": "前日 22:00 ～ 今日 08:00",
             "emoji": "🌅",
             "start_h": 22,
             "end_h": 8,
-        }
-    elif 14 <= h < 22:
-        return {
+        },
+        "afternoon": {
             "label": "盤中午報",
             "period": "今日 08:00 ～ 14:00",
             "emoji": "☀️",
             "start_h": 8,
             "end_h": 14,
-        }
-    else:
-        return {
+        },
+        "evening": {
             "label": "盤後晚報",
             "period": "今日 14:00 ～ 22:00",
             "emoji": "🌙",
             "start_h": 14,
             "end_h": 22,
-        }
+        },
+    }
+    env_session = os.environ.get("REPORT_SESSION", "auto").lower()
+    if env_session in _sessions:
+        print(f"  ⏰ 時段（env）：{_sessions[env_session]['label']}")
+        return _sessions[env_session]
+    # 自動偵測（本機測試 / 手動觸發）
+    h = now_tw().hour
+    if 8 <= h < 14:
+        return _sessions["morning"]
+    elif 14 <= h < 22:
+        return _sessions["afternoon"]
+    else:
+        return _sessions["evening"]
 
 
 # ── 格式化工具 ────────────────────────────────────────────────────

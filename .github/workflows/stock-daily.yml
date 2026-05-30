@@ -2,33 +2,32 @@ name: 台股日報自動發送（每天含週六日）
 
 on:
   schedule:
-    # 台灣時間 08:00 = UTC 00:00（整點前5分鐘 cron，加上 GitHub 排隊延遲約到 08:00±5min）
+    # 台灣時間 08:00 = UTC 00:00 前5分鐘（加上排隊延遲約到 08:00±5min）
     - cron: '55 23 * * *'
-    # 台灣時間 15:00 = UTC 07:00 前5分鐘
-    - cron: '55 6 * * *'
+    # 台灣時間 14:00 = UTC 06:00 前5分鐘
+    - cron: '55 5 * * *'
     # 台灣時間 22:00 = UTC 14:00 前5分鐘
     - cron: '55 13 * * *'
   workflow_dispatch:
     inputs:
-      force_run:
-        description: '強制執行（忽略防重複與時間限制）'
+      report_session:
+        description: '指定時段（空白=自動偵測）'
         required: false
-        default: 'true'
+        default: ''
         type: choice
-        options: ['true', 'false']
+        options: ['', 'morning', 'afternoon', 'evening']
 
 concurrency:
   group: stock-daily
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run-report:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # 設定時區為台北，確保時間判斷正確
     env:
       TZ: Asia/Taipei
 
@@ -44,104 +43,43 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule pytz zhconv ntplib yfinance
+          pip install requests feedparser schedule pytz zhconv
 
-      - name: 🕐 台灣標準時間驗證 & 設定時段
+      - name: 🕐 設定時段（REPORT_SESSION）
         run: |
-          python -X utf8 - <<'PYEOF'
-          import ntplib, pytz, sys, os, datetime
-          TW = pytz.timezone("Asia/Taipei")
-
-          # ── 台灣標準時間（NTP → 系統備用）──────────────────
-          ntp_ok = False
-          try:
-              c    = ntplib.NTPClient()
-              resp = c.request('time.stdtime.gov.tw', version=3, timeout=5)
-              tw   = datetime.datetime.fromtimestamp(resp.tx_time, tz=TW)
-              ntp_ok = True
-              print(f"✅ 台灣標準時間（NTP stdtime.gov.tw）：{tw.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-          except Exception as e:
-              tw = datetime.datetime.now(TW)
-              print(f"⚠️  NTP 取得失敗（{e}），使用系統時間：{tw.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
-          sys_tw = datetime.datetime.now(TW)
-          diff   = abs((tw - sys_tw).total_seconds())
-          print(f"   系統時間：{sys_tw.strftime('%Y-%m-%d %H:%M:%S')}")
-          print(f"   差異：{diff:.1f} 秒{'  ✅ 正常' if diff < 60 else '  ⚠️ 偏差過大'}")
-          print(f"   台北小時：{tw.hour:02d}時")
-
-          # ── 寫入 GITHUB_ENV ────────────────────────────────
-          env_file = os.environ.get("GITHUB_ENV", "")
-          if env_file:
-              with open(env_file, "a", encoding="utf-8") as f:
-                  f.write(f"TODAY_DATE={tw.strftime('%Y-%m-%d')}\n")
-                  f.write(f"VERIFIED_TW_HOUR={tw.hour}\n")
-          PYEOF
-
-          SCHEDULE="${{ github.event.schedule }}"
-          echo "DEBUG schedule='$SCHEDULE'"
-          if   echo "$SCHEDULE" | grep -qE '^55\s+23(\s|$)'; then
-            echo "REPORT_SESSION=morning"        >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤前早報"  >> $GITHUB_ENV
-            echo "✅ 時段 → morning（盤前早報 台灣08:00±5min）"
-          elif echo "$SCHEDULE" | grep -qE '^55\s+6(\s|$)';  then
-            echo "REPORT_SESSION=afternoon"      >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤中午報"  >> $GITHUB_ENV
-            echo "✅ 時段 → afternoon（盤中午報 台灣15:00±5min）"
-          elif echo "$SCHEDULE" | grep -qE '^55\s+13(\s|$)'; then
-            echo "REPORT_SESSION=evening"        >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL=盤後晚報"  >> $GITHUB_ENV
-            echo "✅ 時段 → evening（盤後晚報 台灣22:00±5min）"
+          # 手動觸發有指定時段 → 直接用
+          if [ -n "${{ github.event.inputs.report_session }}" ]; then
+            echo "REPORT_SESSION=${{ github.event.inputs.report_session }}" >> $GITHUB_ENV
+            echo "✅ 手動指定時段：${{ github.event.inputs.report_session }}"
           else
-            echo "REPORT_SESSION=auto"           >> $GITHUB_ENV
-            echo "REPORT_SESSION_LABEL="         >> $GITHUB_ENV
-            echo "⚠️  手動觸發，Python 將以驗證後的台北時間自動偵測時段"
+            # 依 cron 排程自動設定
+            SCHEDULE="${{ github.event.schedule }}"
+            echo "DEBUG schedule='$SCHEDULE'"
+            if   echo "$SCHEDULE" | grep -qE '^55\s+23(\s|$)'; then
+              echo "REPORT_SESSION=morning"   >> $GITHUB_ENV
+              echo "✅ 時段 → morning（盤前早報 台灣08:00）"
+            elif echo "$SCHEDULE" | grep -qE '^55\s+5(\s|$)';  then
+              echo "REPORT_SESSION=afternoon" >> $GITHUB_ENV
+              echo "✅ 時段 → afternoon（盤中午報 台灣14:00）"
+            elif echo "$SCHEDULE" | grep -qE '^55\s+13(\s|$)'; then
+              echo "REPORT_SESSION=evening"   >> $GITHUB_ENV
+              echo "✅ 時段 → evening（盤後晚報 台灣22:00）"
+            else
+              echo "REPORT_SESSION=auto"      >> $GITHUB_ENV
+              echo "⚠️ 手動觸發未指定時段，Python 自動偵測"
+            fi
           fi
 
-      - name: 📥 取得最新執行狀態（防重複執行）
-        run: |
-          git fetch origin main
-          git checkout origin/main -- run_state.json 2>/dev/null || echo "run_state.json 不存在，首次執行"
-
-      - name: 🚀 執行台股日報
+      - name: 🚀 執行 Agent 股市日報（orchestrator.py）
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          JIN10_TOKEN: ${{ secrets.JIN10_TOKEN }}
-          REPORT_SESSION: ${{ env.REPORT_SESSION }}
-          VERIFIED_TW_HOUR: ${{ env.VERIFIED_TW_HOUR }}
-          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          DISCORD_TW:        ${{ secrets.DISCORD_TW }}
+          DISCORD_US:        ${{ secrets.DISCORD_US }}
+          DISCORD_GLOBAL:    ${{ secrets.DISCORD_GLOBAL }}
+          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          JIN10_TOKEN:       ${{ secrets.JIN10_TOKEN }}
+          REPORT_SESSION:    ${{ env.REPORT_SESSION }}
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
-          python -X utf8 股市日報/stock_daily.py
-
-      - name: 💾 更新執行狀態（run_state.json）
-        if: success()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 先 fetch 最新版，再用 Python 合併寫入（避免並行競速覆蓋）
-          git fetch origin main
-          git checkout origin/main -- run_state.json 2>/dev/null || true
-          python3 - <<'EOF'
-          import json, os, sys
-          f = "run_state.json"
-          state = json.load(open(f, encoding="utf-8")) if os.path.exists(f) else {}
-          today   = os.environ.get("TODAY_DATE", "")
-          session = os.environ.get("REPORT_SESSION_LABEL", "")
-          if today and session:
-              state.setdefault(today, [])
-              if session not in state[today]:
-                  state[today].append(session)
-          # 保留最近 7 天
-          from datetime import datetime, timedelta
-          import pytz
-          cutoff = (datetime.now(pytz.timezone("Asia/Taipei")) - timedelta(days=7)).strftime("%Y-%m-%d")
-          state  = {k: v for k, v in state.items() if k >= cutoff}
-          json.dump(state, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-          print(f"run_state updated: {session} @ {today}")
-          EOF
-          git add run_state.json
-          git diff --staged --quiet || git commit -m "chore: update run state [skip ci]"
-          git pull --rebase origin main
-          git push || (git pull --rebase origin main && git push)
+          python -X utf8 orchestrator.py
