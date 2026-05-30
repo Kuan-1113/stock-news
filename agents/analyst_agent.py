@@ -115,7 +115,7 @@ def analyze_tw(news: list, session_info: dict, market_data: dict) -> str:
 **D. 風險提示**（1-2句）
 
 > ⚠️ 以上為 AI 生成分析，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1600)
+    return claude_call(prompt, max_tokens=2500)
 
 
 # ── 美股分析 ──────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ def analyze_us(news: list, session_info: dict, market_data: dict, vip_news: dict
 • 人物：發言/動作 → 受影響板塊/資產
 
 > ⚠️ 以上為 AI 生成分析，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1700)
+    return claude_call(prompt, max_tokens=2500)
 
 
 # ── 國際分析 ──────────────────────────────────────────────────────
@@ -240,7 +240,7 @@ def analyze_global(news: list, session_info: dict, market_data: dict, jin10_text
 • 數據名稱：預期值 → 若超預期/不如預期，影響方向
 
 > ⚠️ 以上為 AI 生成分析，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1600)
+    return claude_call(prompt, max_tokens=2500)
 
 
 # ── 金十專屬分析 ──────────────────────────────────────────────────
@@ -271,7 +271,7 @@ def analyze_jin10(flash: list, calendar: list, session_info: dict) -> str:
 
 **📅 重要財經數據**
 • 數據名稱：預期值 → 若高於/低於預期，影響方向（升/降/多/空）"""
-    return claude_call(prompt, max_tokens=1000)
+    return claude_call(prompt, max_tokens=1500)
 
 
 # ── AI 新聞分析 ────────────────────────────────────────────────────
@@ -301,7 +301,7 @@ def analyze_ai(articles: list, session_info: dict) -> str:
 • 台股代號 公司名：全球AI事件X → 訂單/技術/競爭的傳導路徑 → 股價偏多/偏空/觀望
 
 > ⚠️ AI 生成，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1400)
+    return claude_call(prompt, max_tokens=2000)
 
 
 # ── Agent ─────────────────────────────────────────────────────────
