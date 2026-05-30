@@ -43,7 +43,7 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule pytz zhconv
+          pip install requests feedparser schedule pytz zhconv anthropic
 
       - name: 🕐 設定時段（REPORT_SESSION）
         run: |

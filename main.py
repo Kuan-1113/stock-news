@@ -53,33 +53,16 @@ TW_TZ = pytz.timezone("Asia/Taipei")
 def now_str():
     return datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
 
-# ── 分析核心 ──────────────────────────────────────────────────
+# ── Anthropic SDK（取代 requests.post 直接呼叫）────────────────
+from shared.claude_client import simple_call as _sdk_call
 
 def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
-    if not ANTHROPIC_API_KEY:
-        return "⚠️ 未設定 ANTHROPIC_API_KEY"
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CLAUDE_MODEL,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=120,
-        )
-        if r.status_code == 200:
-            return r.json()["content"][0]["text"].strip()
-        err_detail = r.text[:300] if r.text else "(no body)"
-        print(f"❌ Claude API {r.status_code}：{err_detail}", flush=True)
-        return f"AI 分析暫時無法使用（HTTP {r.status_code}）\n`{err_detail[:150]}`"
-    except Exception as e:
-        return f"AI 分析暫時無法使用（{str(e)[:80]}）"
+    """
+    Discord bot 統一 Claude 呼叫入口。
+    使用 anthropic SDK Messages API（simple_call），
+    比原本 requests.post() 更穩定、有型別錯誤分類、自動處理 rate limit。
+    """
+    return _sdk_call(prompt, max_tokens=max_tokens, model=CLAUDE_MODEL)
 
 def _fetch_quote(symbol: str) -> dict | None:
     try:

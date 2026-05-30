@@ -8,18 +8,22 @@ agents/analyst_agent.py — Claude AI 分析 Agent
   - analyze_global()：加入金十文字作為 context
   - analyze_us()：加入 VIP 人物動態
   - _strip_md_tables()：移除 Markdown 表格，避免 Discord 顯示殘缺
+
+SDK 升級（Managed Agents）：
+  claude_call() → 依 USE_MANAGED_AGENTS 旗標自動選擇：
+    - simple_call()：Messages API（快速、預設）
+    - agent_call()：Managed Agents Sessions API（設 USE_MANAGED_AGENTS=1）
 """
 
 import re
-import requests
 from concurrent.futures import ThreadPoolExecutor
 
-from shared.config import ANTHROPIC_API_KEY
 from shared.utils import (
     build_news_text, fmt_quote, now_str, is_weekend
 )
 from agents.news_agent import build_jin10_text
 from agents.market_data_agent import format_tech_for_prompt
+from shared.claude_client import simple_call, agent_call, USE_MANAGED_AGENTS
 
 
 # ── 工具函式 ─────────────────────────────────────────────────────
@@ -42,37 +46,40 @@ def _strip_md_tables(text: str) -> str:
     return "\n".join(output)
 
 
-# ── Claude API 呼叫 ───────────────────────────────────────────────
+# ── Claude 呼叫封裝 ───────────────────────────────────────────────
 
-def claude_call(prompt: str, max_tokens: int = 1800, model: str = "claude-sonnet-4-6") -> str:
-    if not ANTHROPIC_API_KEY:
-        return "⚠️ 未設定 ANTHROPIC_API_KEY，AI 分析無法使用。"
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=90,
+# 各分析類型的 Managed Agent 名稱與系統提示（只有 USE_MANAGED_AGENTS=1 時使用）
+_AGENT_SYSTEM = (
+    "你是一位資深股票分析師。以繁體中文撰寫深度分析報告。"
+    "禁用 Markdown 表格（禁止 | 符號製表）。"
+    "全程使用 bullet（• 開頭）條列重點。"
+    "台灣慣例：🔴=漲/利多，🟢=跌/利空。"
+)
+
+
+def claude_call(
+    prompt: str,
+    max_tokens: int = 1800,
+    model: str = "claude-sonnet-4-6",
+    agent_name: str = "stock-analyst",
+) -> str:
+    """
+    Claude 分析呼叫統一入口。
+    • USE_MANAGED_AGENTS=1 → Managed Agents Sessions API（有 Agent 定義快取）
+    • 未設定（預設）       → Messages API（直接快速呼叫）
+    兩者均自動去除 Markdown 表格，確保 Discord 顯示正常。
+    """
+    if USE_MANAGED_AGENTS:
+        result = agent_call(
+            prompt,
+            agent_name=agent_name,
+            system=_AGENT_SYSTEM,
+            model=model,
+            max_tokens=max_tokens,
         )
-        if r.status_code == 200:
-            return _strip_md_tables(r.json()["content"][0]["text"].strip())
-        elif r.status_code == 429:
-            print(f"⏳ Claude rate limit，稍後重試...")
-            return "⏳ AI 分析暫時無法使用（rate limit），請稍後再試。"
-        else:
-            print(f"❌ Claude API 錯誤：HTTP {r.status_code} {r.text[:200]}")
-            return f"⚠️ AI 分析暫時無法使用（HTTP {r.status_code}）"
-    except Exception as e:
-        print(f"❌ Claude 呼叫失敗：{e}")
-        return f"⚠️ AI 分析暫時無法使用（{str(e)[:100]}）"
+    else:
+        result = simple_call(prompt, max_tokens, model)
+    return _strip_md_tables(result)
 
 
 # ── 台股分析 ──────────────────────────────────────────────────────
