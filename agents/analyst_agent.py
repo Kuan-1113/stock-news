@@ -19,6 +19,7 @@ from shared.utils import (
     build_news_text, fmt_quote, now_str, is_weekend
 )
 from agents.news_agent import build_jin10_text
+from agents.market_data_agent import format_tech_for_prompt
 
 
 # ── 工具函式 ─────────────────────────────────────────────────────
@@ -81,6 +82,10 @@ def analyze_tw(news: list, session_info: dict, market_data: dict) -> str:
     weekend_note = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
     news_quality = f"✅ 新聞：共 {len(news)} 則" if news else "❌ 本時段無新聞資料"
 
+    # 取 TWII 技術指標（fetch_yahoo_extended 已計算好）
+    twii_tech = twii.get("tech", {})
+    tech_text = format_tech_for_prompt(twii_tech)
+
     prompt = f"""你是一位資深台股分析師。請根據以下數據與新聞，以繁體中文撰寫台股分析。{weekend_note}
 時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
 
@@ -90,6 +95,9 @@ def analyze_tw(news: list, session_info: dict, market_data: dict) -> str:
 • 加權指數：{fmt_quote(twii) if twii else 'N/A'}
 • 新聞筆數：{news_quality}
 
+【加權指數技術指標（^TWII）】
+{tech_text}
+
 【本時段台股新聞】
 {build_news_text(news)}
 
@@ -98,6 +106,7 @@ def analyze_tw(news: list, session_info: dict, market_data: dict) -> str:
 **A. 歸因分析（必做）**
 今日台股主要驅動力是什麼？
 • 識別 1-3 個主因（指數/族群/消息/外部），說明哪個最主導
+• 結合技術指標（均線位置、MACD、RSI）說明目前趨勢結構
 • 這個驅動是一日事件還是延續性趨勢？後續是否有跟進空間？
 • 若方向不明，列出競爭性解釋並說明觀察哪個指標可確認
 

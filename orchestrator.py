@@ -28,7 +28,7 @@ from shared.utils import (
     get_session_info, now_str, is_weekend,
     send_discord_message, send_embed, truncate, fmt_quote
 )
-from agents.market_data_agent import MarketDataAgent, fetch_yahoo
+from agents.market_data_agent import MarketDataAgent, fetch_yahoo, fetch_yahoo_extended, format_tech_for_prompt
 from agents.news_agent         import NewsAgent
 from agents.analyst_agent      import AnalystAgent, claude_call
 from agents.publisher_agent    import PublisherAgent
@@ -51,8 +51,13 @@ def _fetch_stock_news(symbol: str, name: str) -> str:
         return ""
 
 def _analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "") -> str:
-    """Claude 分析單一股票"""
+    """Claude 分析單一股票（含技術指標）"""
     stale_note = "⚠️ 注意：今日為週末，以下為上次交易日收盤數據。\n" if quote.get("stale") else ""
+
+    # 取技術指標（fetch_yahoo_extended 已算好，掛在 quote["tech"]）
+    tech = quote.get("tech", {})
+    tech_text = format_tech_for_prompt(tech)
+
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析與預測。
 
 {stale_note}【股票資訊】
@@ -61,22 +66,28 @@ def _analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "
 - 漲跌幅：{quote.get('pct', 'N/A')}
 - 漲跌點：{quote.get('change', 'N/A')}
 
+【技術指標】
+{tech_text}
+
 【相關新聞背景】
 {news_ctx if news_ctx else '（暫無相關新聞）'}
 
-請以繁體中文撰寫分析報告，格式如下：
+請以繁體中文撰寫分析報告（禁 Markdown 表格，全程 bullet（•），1000字以內）：
 
-1. **近期走勢分析**（2-3句）
-2. **技術面觀察**（均線、支撐壓力位、RSI/MACD）
-3. **基本面亮點**（2-3個重點，結合近期新聞）
-4. **短期預測**（未來 1-2 週走向，給出目標價區間）
+1. **近期走勢分析**（結合技術指標，2-3句說明均線與動能現況）
+2. **技術訊號解讀**
+   • 均線結構（MA5/20/60 位置關係）→ 短中長期偏多/偏空
+   • MACD / RSI / KDJ 訊號 → 強弱與轉折徵兆
+   • 量比分析 → 量能是否配合走勢
+3. **重要支撐與壓力**（基於均線＋技術指標估計）
+4. **短期預測**（未來 1-2 週走向，給出目標價區間，並說明主要假設）
 5. **操作建議**
-   - 多方策略：...
-   - 空方策略：...
-   - 風險提示：...
+   • 多方策略：進場條件 → 目標 → 停損
+   • 空方策略：觸發條件 → 目標 → 停損
+   • 風險提示：1-2句
 
-請保持專業、客觀，並明確標示這是 AI 分析，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=1200)
+> ⚠️ AI 生成分析，不構成投資建議。"""
+    return claude_call(prompt, max_tokens=1400)
 
 def _run_watchlist_report(session_info: dict) -> None:
     """自選股日報（每日 22:00 盤後執行）"""
@@ -100,7 +111,7 @@ def _run_watchlist_report(session_info: dict) -> None:
         name   = stock["name"]
         print(f"  分析 {name}（{symbol}）...")
 
-        quote    = fetch_yahoo(symbol, name)
+        quote    = fetch_yahoo_extended(symbol, name)   # 含技術指標
         news_ctx = _fetch_stock_news(symbol, name)
         time.sleep(0.5)
 
