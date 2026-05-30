@@ -1,7 +1,10 @@
 """
 agents/publisher_agent.py — Discord 發送 Agent
 依序發送 TW / US / Global 三個頻道
-（Discord 有 rate limit，保留 sleep 間隔）
+
+新增（對應 stock_daily.py 功能）：
+  - 國際頻道額外發送：金十數據原文 + 金十專屬 AI 分析
+  - 國際頻道額外發送：AI 全球動態分析
 """
 
 import time
@@ -12,6 +15,7 @@ from shared.utils import (
     send_discord_message, send_embed, truncate,
     build_market_table, build_news_links, now_str, is_weekend
 )
+from agents.news_agent import build_jin10_discord_message
 
 
 class PublisherAgent:
@@ -21,9 +25,9 @@ class PublisherAgent:
 
     def run(
         self,
-        market_data: dict,
-        news_data:   dict,
-        analysis:    dict,
+        market_data:  dict,
+        news_data:    dict,
+        analysis:     dict,
         session_info: dict,
     ) -> None:
         print("📤 [PublisherAgent] 發送到 Discord...")
@@ -41,15 +45,21 @@ class PublisherAgent:
             for sym, d in crypto.items()
         ]) if crypto else "暫無數據"
 
-        tw_links     = build_news_links(news_data.get("tw", []))
-        us_links     = build_news_links(news_data.get("us", []))
+        tw_links     = build_news_links(news_data.get("tw",     []))
+        us_links     = build_news_links(news_data.get("us",     []))
         global_links = build_news_links(news_data.get("global", []))
+
+        jin10_flash    = news_data.get("jin10_flash",    [])
+        jin10_calendar = news_data.get("jin10_calendar", [])
+        jin10_msg      = build_jin10_discord_message(jin10_flash, jin10_calendar)
+        jin10_analysis = analysis.get("jin10", "")
+        ai_analysis    = analysis.get("ai",    "")
 
         # ── 🇹🇼 台股頻道 ───────────────────────────────────────────
         send_embed(DISCORD_TW, {
-            "title": f"🇹🇼 台股{session_info['label']} {weekend_banner}| {ts}",
+            "title":       f"🇹🇼 台股{session_info['label']} {weekend_banner}| {ts}",
             "description": f"**時段：** {session_info['period']}",
-            "color": 0x2ECC71,
+            "color":       0x2ECC71,
             "fields": [
                 {"name": "📊 大盤指數", "value": truncate(market_table), "inline": False},
             ],
@@ -64,8 +74,8 @@ class PublisherAgent:
         time.sleep(1.2)
 
         send_embed(DISCORD_TW, {
-            "title": f"📰 台股新聞連結 | {ts}",
-            "color": 0x27AE60,
+            "title":  f"📰 台股新聞連結 | {ts}",
+            "color":  0x27AE60,
             "fields": [
                 {"name": "🔗 本時段重要新聞", "value": truncate(tw_links), "inline": False},
             ],
@@ -88,9 +98,9 @@ class PublisherAgent:
         ])
 
         send_embed(DISCORD_US, {
-            "title": f"🇺🇸 美股{session_info['label']} {weekend_banner}| {ts}",
+            "title":       f"🇺🇸 美股{session_info['label']} {weekend_banner}| {ts}",
             "description": f"**時段：** {session_info['period']}",
-            "color": 0x3498DB,
+            "color":       0x3498DB,
             "fields": [
                 {"name": "📊 三大指數", "value": truncate(us_market_text), "inline": False},
             ],
@@ -105,8 +115,8 @@ class PublisherAgent:
         time.sleep(1.2)
 
         send_embed(DISCORD_US, {
-            "title": f"📰 美股新聞連結 | {ts}",
-            "color": 0x2980B9,
+            "title":  f"📰 美股新聞連結 | {ts}",
+            "color":  0x2980B9,
             "fields": [
                 {"name": "🔗 本時段重要新聞", "value": truncate(us_links), "inline": False},
             ],
@@ -130,12 +140,12 @@ class PublisherAgent:
         ])
 
         send_embed(DISCORD_GLOBAL, {
-            "title": f"🌍 國際市場{session_info['label']} {weekend_banner}| {ts}",
+            "title":       f"🌍 國際市場{session_info['label']} {weekend_banner}| {ts}",
             "description": f"**時段：** {session_info['period']}",
-            "color": 0x9B59B6,
+            "color":       0x9B59B6,
             "fields": [
-                {"name": "📉 總體指標",  "value": truncate(global_market_text), "inline": True},
-                {"name": "🪙 加密貨幣",  "value": truncate(crypto_text),        "inline": True},
+                {"name": "📉 總體指標", "value": truncate(global_market_text), "inline": True},
+                {"name": "🪙 加密貨幣", "value": truncate(crypto_text),        "inline": True},
             ],
             "footer": {"text": f"資料來源：Yahoo Finance / CoinGecko{weekend_footer}"},
         })
@@ -148,12 +158,32 @@ class PublisherAgent:
         time.sleep(1.2)
 
         send_embed(DISCORD_GLOBAL, {
-            "title": f"📰 國際新聞連結 | {ts}",
-            "color": 0x8E44AD,
+            "title":  f"📰 國際新聞連結 | {ts}",
+            "color":  0x8E44AD,
             "fields": [
                 {"name": "🔗 本時段重要新聞", "value": truncate(global_links), "inline": False},
             ],
             "footer": {"text": "資料來源：Reuters / BBC / Google News"},
         })
+        time.sleep(1.5)
+
+        # ── 📡 金十數據（有 Token 時發送）──────────────────────────
+        if jin10_msg:
+            send_discord_message(DISCORD_GLOBAL, jin10_msg)
+            time.sleep(1.2)
+
+            if jin10_analysis:
+                send_discord_message(
+                    DISCORD_GLOBAL,
+                    f"## 🤖 Claude AI 金十數據解讀 — {session_tag}\n\n{jin10_analysis}"
+                )
+                time.sleep(1.2)
+
+        # ── 🚀 AI 全球動態（獨立發到國際頻道）───────────────────────
+        if ai_analysis:
+            send_discord_message(
+                DISCORD_GLOBAL,
+                f"## 🤖 Claude AI — AI 全球動態分析 — {session_tag}\n\n{ai_analysis}"
+            )
 
         print("📤 [PublisherAgent] 完成")

@@ -36,6 +36,7 @@ jobs:
           DISCORD_US:        ${{ secrets.DISCORD_US }}
           DISCORD_GLOBAL:    ${{ secrets.DISCORD_GLOBAL }}
           DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          JIN10_TOKEN:       ${{ secrets.JIN10_TOKEN }}
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
