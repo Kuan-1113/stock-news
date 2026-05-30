@@ -490,8 +490,15 @@ def _fetch_spot_twii() -> float | None:
     return None
 
 
-def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int) -> str:
-    """期貨試算：P&L + 保證金 + ATR停損 + 損益情境 + AI分析"""
+def _prepare_futures(symbol: str, direction: str, entry_price: float, contracts: int) -> dict:
+    """
+    期貨試算：抓取資料 + 組合計算結果文字 + 建立 AI prompt（不呼叫 Claude）。
+    回傳 dict：
+      error      → str | None
+      calc_text  → 計算結果區塊（P&L / 保證金 / ATR / 情境 / 近期行情）
+      ai_prompt  → Claude 分析 prompt
+      footer     → 最後一行免責聲明
+    """
     code = symbol.upper().strip()
     spec = _FUT_SPEC.get(code, {
         "name": code, "yf": f"{code}=F" if "=" not in code else code,
@@ -534,9 +541,8 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
         if spot:
             basis = current_price - spot
             btype = "正價差" if basis > 0 else "逆價差"
-            basis_line = f"• 台指期現基差：期貨 {current_price:,.0f} 現貨 {spot:,.0f} → **{basis:+.0f}**（{btype}）\n"
+            basis_line = f"• 台指期現基差：期貨 {current_price:,.0f} 現貨 {spot:,.0f} → **{basis:+.0f}**（{btype}）"
 
-    # ── 組合輸出 ───────────────────────────────────────────────
     pnl_tag = (f"{'🟩 獲利' if (pnl or 0) >= 0 else '🟥 虧損'} {pnl:+,.0f} 元"
                if pnl is not None else "（目前價格未取得）")
 
@@ -560,7 +566,7 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
             f"• {pnl_tag}（{move:+.0f} {spec['unit']}）",
         ]
     if basis_line:
-        lines.append(basis_line.rstrip())
+        lines.append(basis_line)
 
     if orig > 0:
         lines += [
@@ -579,7 +585,6 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
             f"• 追繳金額（補回原始水位）：**{call_thresh:,} 元**",
         ]
 
-    # ── ATR 停損建議
     if atr > 0:
         sl_1x = entry_price - atr * sign
         sl_15 = entry_price - atr * 1.5 * sign
@@ -591,7 +596,6 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
             f"• 1.5x ATR 停損：**{sl_15:,.0f}**　→ 給市場更多震盪空間",
         ]
 
-    # ── 損益情境
     if current_price and atr > 0:
         steps = [int(atr * m) for m in [0.5, 1, 2, 3]]
         lines += ["", f"**💡 損益情境（基於 ATR={atr:.0f}）**"]
@@ -604,7 +608,6 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
                 mc_tag  = " ⚠️Margin Call!" if hit_mc else ""
                 lines.append(f"• {arrow} {s*step:+.0f}{spec['unit']} → 價格 {price_s:,.0f}　損益 **{pnl_s:+,.0f} 元**{mc_tag}")
 
-    # ── 近10日行情
     if hist10:
         lines += ["", f"**📅 近 {len(hist10)} 個交易日行情**"]
         for row in hist10:
@@ -621,13 +624,13 @@ def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int)
                 f"• {len(hist10)} 日平均振幅：**{avg_amp:.1f}%**",
             ]
 
-    # ── AI 分析（升級為 500字）
+    # ── 組建 AI prompt ─────────────────────────────────────────
     price_ctx = f"目前價 {current_price:,.0f}" if current_price else "（目前價格未取得）"
     pnl_ctx   = f"損益 {pnl:+,.0f} 元（{(current_price - entry_price)*sign:+.0f} 點）" if pnl is not None else ""
     sl_ctx    = f"1xATR 停損 {entry_price - atr*sign:,.0f}" if atr > 0 else ""
     hi_ctx    = f"期間高 {period_hi:,.0f} 低 {period_lo:,.0f}" if period_hi and period_lo else ""
 
-    prompt = f"""你是一位期貨交易風險分析師。根據以下試算數據，以繁體中文撰寫完整風險評估（禁 Markdown 表格，全程 bullet（•），500字以內）。
+    ai_prompt = f"""你是一位期貨交易風險分析師。根據以下試算數據，以繁體中文撰寫完整風險評估（禁 Markdown 表格，全程 bullet（•），500字以內）。
 
 商品：{spec['name']}（{code}）
 方向：{direction}（{dir_tag}）
@@ -664,15 +667,25 @@ ATR（近10日）：{atr:,.0f} {spec['unit']}
 
 > ⚠️ 以上為 AI 生成試算，保證金數字為參考值，不構成投資建議。"""
 
-    lines += [
-        "",
-        "**🤖 AI 風險評估**",
-        _claude_call(prompt, max_tokens=700),
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "> ⚠️ 保證金數字為參考值，請至 [TAIFEX](https://www.taifex.com.tw/cht/2/parame) 查詢最新",
-    ]
-    return "\n".join(lines)
+    return {
+        "error":     None,
+        "calc_text": "\n".join(lines),
+        "ai_prompt": ai_prompt,
+        "footer":    "━━━━━━━━━━━━━━━━━━━━━━\n> ⚠️ 保證金數字為參考值，請至 [TAIFEX](https://www.taifex.com.tw/cht/2/parame) 查詢最新",
+    }
+
+
+def _do_futures(symbol: str, direction: str, entry_price: float, contracts: int) -> str:
+    """同步版期貨試算（向下相容，含 Claude 呼叫）"""
+    data = _prepare_futures(symbol, direction, entry_price, contracts)
+    if data["error"]:
+        return data["error"]
+    ai_text = _claude_call(data["ai_prompt"], max_tokens=700)
+    return (
+        data["calc_text"]
+        + "\n\n**🤖 AI 風險評估**\n" + ai_text
+        + "\n\n" + data["footer"]
+    )
 
 
 def _update_warrant_prices_bg():
@@ -987,6 +1000,75 @@ async def cmd_自選股清單(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+# ── /自選股分析（個人版）────────────────────────────────────────
+
+@tree.command(name="自選股分析", description="逐支分析你個人自選股清單中的股票（串流顯示）")
+async def cmd_自選股分析(interaction: discord.Interaction):
+    uid    = str(interaction.user.id)
+    gid    = str(interaction.guild_id or "dm")
+    stocks = watchlist_db.get_watchlist(uid, gid)
+
+    if not stocks:
+        await interaction.response.send_message(
+            "📋 你的自選股清單是空的！\n"
+            "先用 `/自選股新增 代碼 名稱` 加入股票，再執行 `/自選股分析`。",
+            ephemeral=True,
+        )
+        return
+
+    print(f"⚡ /自選股分析 收到：{uid}，共 {len(stocks)} 支", flush=True)
+    try:
+        await interaction.response.defer()
+    except Exception:
+        return
+
+    n = len(stocks)
+    est = n * 15   # 每支約 15 秒
+    await interaction.followup.send(
+        f"📊 開始分析你的 **{n}** 支自選股（預計約 **{est//60}分{est%60}秒**）\n"
+        f"結果將逐支出現在下方 ↓"
+    )
+
+    loop = asyncio.get_running_loop()
+    for i, stock in enumerate(stocks, 1):
+        sym  = stock["symbol"]
+        name = stock["name"]
+        label = name or sym
+
+        # 進度佔位訊息
+        prog_msg = await interaction.channel.send(
+            f"🔍 分析中（{i}/{n}）：**{label}**（`{sym}`）▌"
+        )
+
+        # 抓取資料（同步，在 executor 執行）
+        data = await loop.run_in_executor(None, _prepare_analysis, sym, name)
+
+        if data["error"]:
+            await prog_msg.edit(content=f"❌ **{sym}**：{data['error'][:200]}")
+            await asyncio.sleep(1)
+            continue
+
+        # 串流 Claude 分析
+        full_text = await _stream_to_discord(
+            data["prompt"], prog_msg,
+            prefix=data["header"], max_tokens=1800,
+        )
+
+        # 最終確認：處理超長訊息
+        chunks = _split_messages(full_text)
+        await prog_msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
+
+        # 節流：避免 Discord rate limit + Claude rate limit
+        await asyncio.sleep(2)
+
+    await interaction.channel.send(
+        f"✅ **個人自選股分析完成**（共 {n} 支）| {now_str()}\n"
+        "> 資料來源：Yahoo Finance + Claude AI　⚠️ 不構成投資建議"
+    )
+
+
 # ── /自選股 ──────────────────────────────────────────────────────
 
 @tree.command(name="自選股", description="觸發完整自選股分析（結果約 2 分鐘後出現）")
@@ -1050,16 +1132,31 @@ async def cmd_期貨(
         print(f"❌ /期貨 defer 失敗：{e}", flush=True)
         return
     try:
-        loop   = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, _do_futures, symbol.strip().upper(), dir_str, entry_price, max(1, contracts)
+        # ── Phase 1：抓取資料 + 計算（同步，~2s）─────────────────
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, _prepare_futures,
+            symbol.strip().upper(), dir_str, entry_price, max(1, contracts)
         )
-        chunks = _split_messages(result)
-        for i, chunk in enumerate(chunks):
-            if i == 0:
-                await interaction.followup.send(chunk)
-            else:
-                await interaction.channel.send(chunk)
+        if data.get("error"):
+            await interaction.followup.send(data["error"])
+            return
+
+        # ── Phase 2：立刻送出計算結果（不用等 AI）──────────────
+        calc_chunks = _split_messages(data["calc_text"])
+        msg = await interaction.followup.send(calc_chunks[0])
+        for chunk in calc_chunks[1:]:
+            await interaction.channel.send(chunk)
+
+        # ── Phase 3：串流 AI 風險評估 ─────────────────────────
+        ai_msg = await interaction.channel.send("**🤖 AI 風險評估**\n🔍 分析中... ▌")
+        ai_text = await _stream_to_discord(
+            data["ai_prompt"], ai_msg, max_tokens=700
+        )
+        # 最終訊息
+        await ai_msg.edit(content="**🤖 AI 風險評估**\n" + ai_text)
+        await interaction.channel.send(data["footer"])
+
     except Exception as e:
         print(f"❌ /期貨 例外：{e}", flush=True)
         try:
@@ -1255,7 +1352,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股 /期貨 /查權證 /分析權證", flush=True)
+    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /期貨(串流) /查權證 /分析權證", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     prewarm_cache()          # 背景預熱快取（優先用 DB，DB 過期才打 API）
