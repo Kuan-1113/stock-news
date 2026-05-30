@@ -81,16 +81,16 @@ def analyze_tw(news: list, session_info: dict, market_data: dict) -> str:
     weekend_note = "\n⚠️ 今日為週末，指數數據為上次交易日收盤價，僅供參考。" if is_weekend() else ""
     news_quality = f"✅ 新聞：共 {len(news)} 則" if news else "❌ 本時段無新聞資料"
 
-    prompt = f"""台股分析師。{weekend_note}
+    prompt = f"""你是一位資深台股分析師。請根據以下數據與新聞，以繁體中文撰寫台股分析。{weekend_note}
 時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
-禁空話，禁 Markdown 表格，全程 bullet（•），台灣慣例：🔴=漲，🟢=跌。
-不需按固定章節填寫，以邏輯流暢為主，總字數 1100 字以內。
 
-━━━ PHASE 1：資訊收斂 ━━━
-✅ [TWSE] 加權指數：{fmt_quote(twii) if twii else 'N/A'}
-{news_quality}
+【注意】：直接開始寫分析內容，禁空話，禁 Markdown 表格，全程 bullet（•），台灣慣例：🔴=漲，🟢=跌，總字數 1100 字以內。
 
-━━━ 台股新聞 ━━━
+【市場數據】
+• 加權指數：{fmt_quote(twii) if twii else 'N/A'}
+• 新聞筆數：{news_quality}
+
+【本時段台股新聞】
 {build_news_text(news)}
 
 ━━━ 核心任務（順序自由，篇幅自由調配）━━━
@@ -144,17 +144,17 @@ def analyze_us(news: list, session_info: dict, market_data: dict, vip_news: dict
             f"🟩 黃仁勳（Jensen Huang）：{_titles('jensen')}"
         )
 
-    prompt = f"""美股分析師。{weekend_note}
+    prompt = f"""你是一位資深美股分析師。請根據以下數據與新聞，以繁體中文撰寫美股分析。{weekend_note}
 時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
-禁空話，禁 Markdown 表格，全程 bullet（•），台灣慣例：🔴=漲，🟢=跌。
-不需按固定章節填寫，以邏輯流暢為主，總字數 1100 字以內。
 
-━━━ PHASE 1：資訊收斂 ━━━
-✅ [Yahoo Finance] 道瓊：{fmt_quote(dji) if dji else 'N/A'} ／ 納指：{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P：{fmt_quote(gspc) if gspc else 'N/A'}
-{news_quality}
+【注意】：直接開始寫分析內容，禁空話，禁 Markdown 表格，全程 bullet（•），台灣慣例：🔴=漲，🟢=跌，總字數 1100 字以內。
+
+【市場數據】
+• 道瓊：{fmt_quote(dji) if dji else 'N/A'} ／ 納指：{fmt_quote(ixic) if ixic else 'N/A'} ／ S&P 500：{fmt_quote(gspc) if gspc else 'N/A'}
+• 新聞筆數：{news_quality}
 {vip_block}
 
-━━━ 美股新聞 ━━━
+【本時段美股新聞】
 {build_news_text(news)}
 
 ━━━ 核心任務（順序自由，篇幅自由調配）━━━
@@ -194,45 +194,47 @@ def analyze_global(news: list, session_info: dict, market_data: dict, jin10_text
     btc   = crypto.get("BTC", {})
     eth   = crypto.get("ETH", {})
     weekend_note = "\n⚠️ 今日為週末，部分指標為上次交易日數值。" if is_weekend() else ""
-    news_quality = f"✅ 新聞：共 {len(news)} 則" if news else "❌ 本時段無新聞資料"
 
     def _fmt_crypto(d: dict) -> str:
         if not d:
             return "N/A"
         return f"{d.get('emoji','')} {d.get('price','N/A')} ({d.get('pct','N/A')})"
 
-    prompt = f"""國際財經分析師，採用三階段迭代分析框架。{weekend_note}
+    prompt = f"""你是一位國際財經分析師。請根據以下市場數據與新聞，以繁體中文撰寫國際財經分析。{weekend_note}
 時間：{now_str()}，時段：「{session_info['label']}」（{session_info['period']}）
-每個論點格式：「事件/數據（數值）→ 傳導機制 → 影響方向」。禁空話，禁 Markdown 表格，全程 bullet（•）。台灣慣例：🔴=漲/利多，🟢=跌/利空。
 
-━━━ PHASE 1：資訊收斂確認 ━━━
-✅ [Yahoo Finance] VIX：{fmt_quote(vix) if vix else 'N/A'} ／ 美債10Y：{fmt_quote(us10y) if us10y else 'N/A'} ／ DXY：{fmt_quote(dxy) if dxy else 'N/A'}
-✅ [Yahoo Finance] 黃金：{fmt_quote(gold) if gold else 'N/A'} ／ 原油：{fmt_quote(oil) if oil else 'N/A'}
-✅ [CoinGecko] BTC：{_fmt_crypto(btc)} ／ ETH：{_fmt_crypto(eth)}
-{news_quality}
-{'✅ [金十數據] 快訊已附入' if jin10_text else '⚠️ 金十數據：未取得（JIN10_TOKEN 未設定）'}
+【注意】：
+- 直接開始寫分析內容，不要輸出 PHASE / 階段 / 資訊收斂 等標籤
+- 禁空話，禁 Markdown 表格，全程 bullet（•）
+- 台灣慣例：🔴=漲/利多，🟢=跌/利空
+- 每個論點格式：「事件/數據（數值）→ 傳導機制 → 影響方向」
 
-━━━ 國際新聞 ━━━
+【市場數據】
+• VIX：{fmt_quote(vix) if vix else 'N/A'} ／ 美債10Y：{fmt_quote(us10y) if us10y else 'N/A'} ／ DXY：{fmt_quote(dxy) if dxy else 'N/A'}
+• 黃金：{fmt_quote(gold) if gold else 'N/A'} ／ 原油(WTI)：{fmt_quote(oil) if oil else 'N/A'}
+• BTC：{_fmt_crypto(btc)} ／ ETH：{_fmt_crypto(eth)}
+{'• 金十數據：快訊已附入（見下方）' if jin10_text else '• 金十數據：未取得'}
+
+【本時段國際新聞】
 {build_news_text(news)}
 {jin10_text if jin10_text else ''}
 
-━━━ 核心任務（900字以內，順序自由，篇幅自由調配）━━━
+請完整輸出以下五節（900字以內，篇幅自由調配）：
 
-**A. 全球歸因分析（必做）**
-全球市場今日的宏觀主軸是什麼？
-• VIX/美債/DXY 數值說明什麼？Risk-On 還是 Risk-Off？為什麼？
-• 識別 1-3 個最主要驅動事件，說明傳導路徑
+**A. 全球歸因分析**
+• VIX/美債/DXY 說明什麼？Risk-On 還是 Risk-Off？
+• 1-3 個最主要驅動事件 → 傳導路徑
 
-**B. 重大事件影響（必做）**
-• 事件（數值）→ 傳導路徑 → 🔴利多/🟢利空（高/中/低）
+**B. 重大事件影響**
+• 事件（數值）→ 傳導路徑 → 🔴利多/🟢利空
 
 **C. 大宗商品與加密**
 • 品項：漲跌 → 驅動因素 → 對通膨/央行政策的隱含訊號
 
-**D. 多空決策（必做）**
-• 多方力量（1-2個支撐因素）→ 受惠資產/族群
-• 空方風險（1-2個壓制因素）→ 受壓資產/族群
-• 對台股的具體傳導路徑：哪些族群（代號）受惠或受壓，為什麼？
+**D. 多空決策**
+• 多方力量（1-2個）→ 受惠資產/族群
+• 空方風險（1-2個）→ 受壓資產/族群
+• 對台股的具體傳導路徑：哪些族群（代號）受惠或受壓
 
 **E. 本週重要財經事件**（若有）
 • 數據名稱：預期值 → 若超預期/不如預期，影響方向

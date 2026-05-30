@@ -19,6 +19,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from shared.config import RSS_FEEDS, TAIPEI_TZ
 from shared.utils import now_tw
 
+# ── 簡體 → 繁體轉換（Jin10 數據為簡體中文）─────────────────────────
+try:
+    import zhconv
+    def _s2tw(text: str) -> str:
+        return zhconv.convert(text, "zh-tw")
+except ImportError:
+    def _s2tw(text: str) -> str:
+        return text  # 未安裝時原樣返回
+
 # ── Jin10 設定 ────────────────────────────────────────────────────
 JIN10_TOKEN = os.environ.get("JIN10_TOKEN", "")
 _jin10_session_id: str = ""
@@ -202,7 +211,7 @@ def fetch_jin10_flash() -> list:
         cutoff = now - datetime.timedelta(hours=24)
         result = []
         for item in items:
-            content  = item.get("content") or ""
+            content  = _s2tw(item.get("content") or "")
             time_raw = item.get("time") or ""
             if not content:
                 continue
@@ -242,11 +251,11 @@ def fetch_jin10_calendar() -> list:
             star = int(item.get("star", 0) or 0)
             if star < 2:
                 continue
-            event    = item.get("title") or ""
+            event    = _s2tw(item.get("title") or "")
             time_s   = item.get("pub_time") or item.get("time") or ""
             actual   = item.get("actual") or ""
             forecast = item.get("consensus") or ""
-            affect   = item.get("affect_txt") or ""
+            affect   = _s2tw(item.get("affect_txt") or "")
             if event:
                 result.append({
                     "event":    event[:60],

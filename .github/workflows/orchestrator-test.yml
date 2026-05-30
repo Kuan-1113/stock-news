@@ -23,7 +23,7 @@ jobs:
       - name: 📦 安裝相依套件
         run: |
           pip install --upgrade pip
-          pip install requests feedparser schedule anthropic pytz
+          pip install requests feedparser schedule anthropic pytz zhconv
 
       - name: 🕐 確認目前台北時間
         run: |

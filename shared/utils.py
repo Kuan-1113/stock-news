@@ -114,9 +114,18 @@ def build_market_table(market_data: dict) -> str:
 def send_discord_message(webhook_url: str, content: str) -> bool:
     if not content or not content.strip():
         return False
-    # 分割長訊息
+    # 分割長訊息：依換行符切割，單行超長時強制切
     chunks, current = [], ""
     for line in content.split("\n"):
+        # 單行本身就超過限制 → 強制每 MAX_CONTENT 字切一刀
+        while len(line) > MAX_CONTENT:
+            piece = line[:MAX_CONTENT]
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(piece)
+            line = line[MAX_CONTENT:]
+        # 正常行：累積到 current，超出時先存再重新開始
         if len(current) + len(line) + 1 > MAX_CONTENT:
             if current:
                 chunks.append(current)
