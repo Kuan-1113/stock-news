@@ -409,7 +409,245 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
 
 # ── 定時觸發日報（Railway 永遠在線，取代不可靠的 GitHub cron）────
 
-# ── 期貨試算功能 ─────────────────────────────────────────────────
+# ── 個股期貨工具函式 ──────────────────────────────────────────────
+
+def _stock_code_to_yf(code: str) -> str:
+    """台股代碼 → Yahoo Finance symbol（2330 → 2330.TW）"""
+    c = code.strip().upper()
+    if c.endswith(".TW") or c.endswith(".TWO"):
+        return c
+    if c.isdigit():
+        return f"{c}.TW"
+    return c   # 已是其他格式（NVDA 等）就直接回傳
+
+def _estimate_lot_size(price: float) -> int:
+    """
+    依股價估算 TAIFEX 個股期貨每口股數（lot size）。
+    實際規格請至 TAIFEX 官網確認；此為近似值。
+    TAIFEX 調整依據：讓每口合約市值約落在 50-150 萬元區間。
+    """
+    if price >= 1000:   return   500   # 台積電等超高價股
+    if price >= 500:    return  1000
+    if price >= 100:    return  2000   # 最常見：聯發科、廣達…
+    if price >= 50:     return  4000
+    if price >= 10:     return 10000
+    return 20000
+
+def _fetch_taifex_margin(stock_no: str) -> tuple[float, float]:
+    """
+    嘗試從 TAIFEX Open API 取得個股期貨保證金比率。
+    回傳 (原始保證金比率, 維持保證金比率)。
+    若 API 失敗回傳預設值（原始13.5%, 維持10.5%）。
+    TAIFEX 一般個股期貨保證金介於 10%~17%，依各股波動度設定。
+    """
+    try:
+        r = requests.get(
+            "https://openapi.taifex.com.tw/v1/DailyMarketInfo",
+            params={"commodity_id": f"SF{stock_no}"},   # 個股期貨代號格式
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and isinstance(data, list) and data[0]:
+                item = data[0]
+                orig  = float(item.get("OriginalMargin",  0)) or 0
+                maint = float(item.get("MaintenanceMargin", 0)) or 0
+                if orig > 0 and maint > 0:
+                    return orig, maint
+    except Exception:
+        pass
+    return 0.135, 0.105   # 預設近似比率
+
+def _prepare_individual_futures(
+    stock_code: str,
+    direction: str,
+    entry_price: float,
+    contracts: int,
+    custom_lot: int = 0,    # 0 = 自動估算
+) -> dict:
+    """
+    個股期貨試算（抓標的股票現價，計算 P&L / 保證金 / ATR / 情境）。
+    不含 Claude 呼叫，供串流版指令使用。
+    """
+    yf_sym     = _stock_code_to_yf(stock_code)
+    stock_no   = yf_sym.replace(".TW", "").replace(".TWO", "")
+
+    # ── 抓股票現價 ─────────────────────────────────────────────
+    quote = _fetch_quote(yf_sym)
+    if not quote:
+        return {"error": f"❌ 找不到股票代碼 `{stock_code}`\n格式：台股填數字（如 `2330`），美股填代碼（如 `NVDA`）"}
+
+    curr_price   = float(quote["price"].replace(",", ""))
+    stock_name   = quote.get("name", stock_code)
+    pct_today    = quote.get("pct", "")
+    chg_today    = quote.get("change", "")
+
+    # ── 合約規格 ───────────────────────────────────────────────
+    lot_size     = custom_lot if custom_lot > 0 else _estimate_lot_size(curr_price)
+    is_long      = "買" in direction or "多" in direction or direction.lower() in ("long","buy")
+    sign         = 1 if is_long else -1
+    dir_tag      = "🔴 買進（多）" if is_long else "🟢 賣出（空）"
+    currency     = quote.get("currency", "TWD")
+
+    contract_val = curr_price * lot_size          # 每口目前市值
+    pnl_per_tick = lot_size * contracts           # 股/每台幣1元變動
+
+    # ── 保證金（嘗試 TAIFEX API，失敗用估算）─────────────────
+    orig_ratio, maint_ratio = _fetch_taifex_margin(stock_no)
+    orig_m  = int(contract_val * orig_ratio  * contracts)
+    maint_m = int(contract_val * maint_ratio * contracts)
+    using_approx = (orig_ratio == 0.135)   # 是否為估算值
+
+    # ── P&L ────────────────────────────────────────────────────
+    pnl          = (curr_price - entry_price) * lot_size * contracts * sign
+    pnl_tag      = f"{'🟩 獲利' if pnl >= 0 else '🟥 虧損'} {pnl:+,.0f} {currency}"
+
+    # ── Margin Call 觸發價 ─────────────────────────────────────
+    diff_per_shr = (orig_m - maint_m) / (lot_size * contracts) if lot_size > 0 else 0
+    call_price   = entry_price - diff_per_shr * sign if diff_per_shr > 0 else None
+
+    # ── ATR（用股票歷史資料）──────────────────────────────────
+    hist = _fetch_fut_history(yf_sym, 15)   # 沿用同一函式，Yahoo v8
+    hist10 = hist[-10:] if len(hist) >= 10 else hist
+    atr    = _calc_atr(hist10) if hist10 else 0
+    highs  = [r["high"]  for r in hist10 if r.get("high")]
+    lows   = [r["low"]   for r in hist10 if r.get("low")]
+    amp_list = [(r["high"]-r["low"])/r["low"]*100
+                for r in hist10 if r.get("high") and r.get("low") and r["low"]>0]
+    period_hi = max(highs) if highs else None
+    period_lo = min(lows)  if lows  else None
+    avg_amp   = round(sum(amp_list)/len(amp_list), 1) if amp_list else 0
+
+    # ── 組合輸出文字 ───────────────────────────────────────────
+    margin_note = "（估算值，實際請至 TAIFEX 確認）" if using_approx else "（TAIFEX 即時數據）"
+
+    lines = [
+        f"## 📈 個股期貨試算 | {now_str()}",
+        f"**{stock_name}（{stock_no}）** — {dir_tag}　**{contracts} 口**",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "**📋 合約資訊**",
+        f"• 標的現價：**{curr_price:,.2f} {currency}**　今日漲跌：{chg_today}（{pct_today}）",
+        f"• 每口股數（lot）：**{lot_size:,} 股**（依現價自動估算）",
+        f"• {contracts} 口合計持股：**{lot_size*contracts:,} 股**",
+        f"• 每股漲跌 1 元 → 損益 **{pnl_per_tick:,} 元**",
+        f"• 目前合約市值（每口）：**{contract_val:,.0f} {currency}**",
+        "",
+        "**📊 目前損益**",
+        f"• 進場價格：**{entry_price:,.2f}**",
+        f"• 現價：**{curr_price:,.2f}**　→ {pnl_tag}（{(curr_price-entry_price)*sign:+.2f} 元/股）",
+    ]
+
+    if orig_m > 0:
+        lines += [
+            "",
+            f"**💰 保證金資訊** {margin_note}",
+            f"• 原始保證金（{orig_ratio:.1%}）：**{orig_m:,}** {currency}",
+            f"• 維持保證金（{maint_ratio:.1%}）：**{maint_m:,}** {currency}",
+        ]
+
+    if call_price is not None:
+        dir_word = "跌破" if is_long else "突破"
+        lines += [
+            "",
+            "**⚠️ 追加保證金觸發點（Margin Call）**",
+            f"• 當股價 {dir_word} **{call_price:,.2f}** 時，需追繳保證金",
+        ]
+
+    if atr > 0:
+        sl_1x  = entry_price - atr * sign
+        sl_15  = entry_price - atr * 1.5 * sign
+        loss_1x = atr * lot_size * contracts
+        lines += [
+            "",
+            f"**📐 停損建議（近10日 ATR = {atr:,.2f} 元）**",
+            f"• 1x ATR：**{sl_1x:,.2f}**　→ 最大虧損 **{loss_1x:,.0f} 元**",
+            f"• 1.5x ATR：**{sl_15:,.2f}**　→ 較寬鬆，適合波動大盤",
+        ]
+
+    if atr > 0:
+        steps = [round(atr*m, 2) for m in [0.5, 1, 2, 3]]
+        lines += ["", f"**💡 損益情境（ATR={atr:.2f}）**"]
+        for step in steps:
+            for s in [1, -1]:
+                ps  = round(entry_price + step*s, 2)
+                pl  = (ps - entry_price) * lot_size * contracts * sign
+                arr = "⬆️" if s > 0 else "⬇️"
+                mc  = call_price and ((is_long and ps <= call_price) or (not is_long and ps >= call_price))
+                mct = " ⚠️Margin Call!" if mc else ""
+                lines.append(f"• {arr} {s*step:+.2f}元 → 股價 {ps:,.2f}　損益 **{pl:+,.0f} 元**{mct}")
+
+    if hist10:
+        lines += ["", f"**📅 近 {len(hist10)} 個交易日行情**"]
+        for row in hist10:
+            amp = ((row["high"]-row["low"])/row["low"]*100
+                   if row.get("high") and row.get("low") and row["low"]>0 else 0)
+            lines.append(
+                f"• {row['date']}　高 {row['high']:,.2f}　低 {row['low']:,.2f}"
+                f"　收 {row['close']:,.2f}　振幅 {amp:.1f}%"
+            )
+        if period_hi and period_lo:
+            lines += [
+                "",
+                f"• 期間最高：**{period_hi:,.2f}**　最低：**{period_lo:,.2f}**",
+                f"• {len(hist10)} 日平均振幅：**{avg_amp:.1f}%**",
+            ]
+
+    # ── AI prompt ─────────────────────────────────────────────
+    price_ctx = f"現價 {curr_price:,.2f}"
+    sl_ctx    = f"1xATR 停損 {entry_price-atr*sign:,.2f}" if atr > 0 else ""
+    hi_ctx    = f"近10日高 {period_hi:,.2f} 低 {period_lo:,.2f}" if period_hi and period_lo else ""
+
+    ai_prompt = f"""你是一位台灣個股期貨交易風險分析師。根據以下試算數據，以繁體中文撰寫完整風險評估（禁 Markdown 表格，全程 bullet（•），500字以內）。
+
+標的：{stock_name}（{stock_no}）
+方向：{direction}（{dir_tag}）
+進場：{entry_price:,.2f}　口數：{contracts} 口（每口 {lot_size:,} 股）
+{price_ctx}　損益：{pnl:+,.0f} 元
+ATR（近10日）：{atr:,.2f} 元　{sl_ctx}　{hi_ctx}
+今日漲跌：{chg_today}（{pct_today}）　平均振幅：{avg_amp:.1f}%
+原始保證金：{orig_m:,} 元　Margin Call 觸發：{f'{call_price:,.2f}' if call_price else 'N/A'}
+
+請輸出以下五節：
+
+**📊 當前狀況評估**
+• 目前盈虧方向、個股目前技術面趨勢（多/空/整理）
+• 距 Margin Call 的緩衝空間（股價差＋百分比）
+
+**📐 關鍵價位分析**
+• 主要支撐位（帶數字，近10日低點/均線）
+• 主要壓力位（帶數字，近10日高點/均線）
+• 突破/跌破哪個價位才改變看法？
+
+**⚡ 風險管理建議**
+• 1x ATR vs 1.5x ATR 停損，哪個更適合這支股票的波動特性？
+• 個股期貨特有風險：流動性、強制平倉、除息調整
+• 若已盈利，移動停損的建議條件
+
+**⚖️ 多空論點**
+• 支持當前方向的 2 個最強理由（帶具體數值）
+• 威脅當前方向的 2 個最大風險（個股基本面或籌碼）
+
+**💡 操作建議**
+• 短期（1-3 日）：維持/減倉/出場？觸發條件？
+• 中期（5-10 日）：目標股價 → 出場計畫
+
+> ⚠️ 以上為 AI 生成試算，保證金為估算值，不構成投資建議。"""
+
+    return {
+        "error":     None,
+        "calc_text": "\n".join(lines),
+        "ai_prompt": ai_prompt,
+        "footer": (
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "> ⚠️ 個股期貨每口股數與保證金數字為估算值，"
+            "請至 [TAIFEX 個股期貨](https://www.taifex.com.tw/cht/2/stockFutures) 確認最新規格"
+        ),
+    }
+
+
+# ── 指數 / 商品期貨試算功能 ───────────────────────────────────────
 
 _FUT_SPEC = {
     "TX":  {"name": "臺股期貨（大台）",     "yf": "TXF=F",  "mult": 200,  "tick": 1,    "unit": "點"},
@@ -1101,6 +1339,68 @@ async def cmd_自選股(interaction: discord.Interaction):
         except Exception:
             pass
 
+# ── 個股期貨指令 ─────────────────────────────────────────────
+
+@tree.command(name="個股期", description="個股期貨試算：損益 / 保證金 / ATR停損 / 情境 / AI評估")
+@app_commands.describe(
+    stock       = "台股代碼（如 2330）或美股（NVDA）",
+    direction   = "買進（多）或 賣出（空）",
+    entry_price = "進場股價（如 895.0）",
+    contracts   = "口數（預設 1）",
+    lot_size    = "每口股數（選填，0=依現價自動估算）",
+)
+@app_commands.choices(direction=[
+    app_commands.Choice(name="買進（多）", value="買進"),
+    app_commands.Choice(name="賣出（空）", value="賣出"),
+])
+async def cmd_個股期(
+    interaction: discord.Interaction,
+    stock:       str,
+    direction:   app_commands.Choice[str],
+    entry_price: float,
+    contracts:   int = 1,
+    lot_size:    int = 0,
+):
+    dir_str = direction.value
+    print(f"⚡ /個股期 收到：{stock} {dir_str} @{entry_price} {contracts}口 lot={lot_size}", flush=True)
+    try:
+        await interaction.response.defer()
+    except discord.errors.NotFound:
+        return
+    except Exception as e:
+        print(f"❌ /個股期 defer 失敗：{e}", flush=True)
+        return
+    try:
+        # Phase 1：抓資料 + 計算（~2s）
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            None, _prepare_individual_futures,
+            stock.strip(), dir_str, entry_price, max(1, contracts), lot_size,
+        )
+        if data.get("error"):
+            await interaction.followup.send(data["error"])
+            return
+
+        # Phase 2：立刻顯示計算結果
+        calc_chunks = _split_messages(data["calc_text"])
+        await interaction.followup.send(calc_chunks[0])
+        for chunk in calc_chunks[1:]:
+            await interaction.channel.send(chunk)
+
+        # Phase 3：串流 AI 風險評估
+        ai_msg = await interaction.channel.send("**🤖 AI 風險評估**\n🔍 分析中... ▌")
+        ai_text = await _stream_to_discord(data["ai_prompt"], ai_msg, max_tokens=700)
+        await ai_msg.edit(content="**🤖 AI 風險評估**\n" + ai_text)
+        await interaction.channel.send(data["footer"])
+
+    except Exception as e:
+        print(f"❌ /個股期 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 試算失敗：{str(e)[:150]}")
+        except Exception:
+            pass
+
+
 # ── 期貨指令 ─────────────────────────────────────────────────
 
 @tree.command(name="期貨", description="期貨試算：損益 / 保證金 / ATR停損 / 情境分析 / AI評估")
@@ -1352,7 +1652,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /期貨(串流) /查權證 /分析權證", flush=True)
+    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨(串流) /查權證 /分析權證", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     prewarm_cache()          # 背景預熱快取（優先用 DB，DB 過期才打 API）
