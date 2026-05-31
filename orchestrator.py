@@ -118,7 +118,7 @@ def _run_watchlist_report(session_info: dict) -> None:
         analysis = _analyze_single_stock(symbol, name, quote, news_ctx)
         time.sleep(1)
 
-        stale_tag = " ⚠️未更新" if quote.get("stale") else ""
+        stale_tag = " 📅上一交易日" if quote.get("stale") else ""
         send_discord_message(
             DISCORD_WATCHLIST,
             f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — "

@@ -35,7 +35,7 @@ class PublisherAgent:
         ts             = now_str()
         weekend_banner = "（週末版）" if is_weekend() else ""
         session_tag    = f"{session_info['emoji']} {session_info['label']} {weekend_banner}| {session_info['period']}"
-        weekend_footer = "｜⚠️ 週末數據為上次交易日" if is_weekend() else ""
+        weekend_footer = "｜📅 週末數據為上次交易日收盤價" if is_weekend() else ""
 
         # 共用資料
         market_table = build_market_table(market_data)
@@ -89,7 +89,8 @@ class PublisherAgent:
         gspc = market_data.get("gspc", {})
 
         def _stale(q: dict) -> str:
-            return " ⚠️未更新" if q.get("stale") else ""
+            # 週末時 footer 已統一說明，個別項目不重複標記
+            return ""
 
         us_market_text = "\n".join([
             f"{dji['emoji']}  **道瓊**：{dji['price']} ({dji['pct']}){_stale(dji)}",

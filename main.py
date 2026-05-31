@@ -422,7 +422,7 @@ def _stock_code_to_yf(code: str) -> str:
 
 def _estimate_lot_size(price: float) -> int:
     """
-    依股價估算 TAIFEX 個股期貨每口股數（lot size）。
+    依股價估算 TAIFEX 個股期貨「標準口」每口股數（lot size）。
     實際規格請至 TAIFEX 官網確認；此為近似值。
     TAIFEX 調整依據：讓每口合約市值約落在 50-150 萬元區間。
     """
@@ -432,6 +432,26 @@ def _estimate_lot_size(price: float) -> int:
     if price >= 50:     return  4000
     if price >= 10:     return 10000
     return 20000
+
+# 合約規模倍率表（小型 = ½ 標準，微型 = ⅕ 標準）
+_SIZE_TYPE_INFO = {
+    "標準": {"ratio": 1.0,  "label": "標準",         "tag": ""},
+    "小型": {"ratio": 0.5,  "label": "🔸 小型（½）", "tag": "（半口）"},
+    "微型": {"ratio": 0.2,  "label": "🔹 微型（⅕）", "tag": "（迷你口）"},
+}
+
+def _resolve_lot_size(price: float, size_type: str, custom_lot: int = 0) -> tuple[int, str]:
+    """
+    回傳 (lot_size, display_label) 依合約類型計算每口股數。
+    custom_lot > 0 時優先使用（自訂模式）。
+    """
+    if custom_lot > 0:
+        return custom_lot, f"自訂（{custom_lot:,} 股/口）"
+    base   = _estimate_lot_size(price)
+    info   = _SIZE_TYPE_INFO.get(size_type, _SIZE_TYPE_INFO["標準"])
+    lot    = max(100, int(base * info["ratio"]))   # 最小 100 股
+    label  = f"{info['label']}　{lot:,} 股/口"
+    return lot, label
 
 def _fetch_taifex_margin(stock_no: str) -> tuple[float, float]:
     """
@@ -464,10 +484,12 @@ def _prepare_individual_futures(
     direction: str,
     entry_price: float,
     contracts: int,
-    custom_lot: int = 0,    # 0 = 自動估算
+    custom_lot: int = 0,      # 0 = 依 size_type 自動估算
+    size_type:  str = "標準", # 標準 / 小型 / 微型
 ) -> dict:
     """
     個股期貨試算（抓標的股票現價，計算 P&L / 保證金 / ATR / 情境）。
+    支援標準 / 小型（½）/ 微型（⅕）三種合約規模。
     不含 Claude 呼叫，供串流版指令使用。
     """
     yf_sym     = _stock_code_to_yf(stock_code)
@@ -483,12 +505,12 @@ def _prepare_individual_futures(
     pct_today    = quote.get("pct", "")
     chg_today    = quote.get("change", "")
 
-    # ── 合約規格 ───────────────────────────────────────────────
-    lot_size     = custom_lot if custom_lot > 0 else _estimate_lot_size(curr_price)
-    is_long      = "買" in direction or "多" in direction or direction.lower() in ("long","buy")
-    sign         = 1 if is_long else -1
-    dir_tag      = "🔴 買進（多）" if is_long else "🟢 賣出（空）"
-    currency     = quote.get("currency", "TWD")
+    # ── 合約規格（依 size_type 決定每口股數）─────────────────
+    lot_size, size_label = _resolve_lot_size(curr_price, size_type, custom_lot)
+    is_long  = "買" in direction or "多" in direction or direction.lower() in ("long","buy")
+    sign     = 1 if is_long else -1
+    dir_tag  = "🔴 買進（多）" if is_long else "🟢 賣出（空）"
+    currency = quote.get("currency", "TWD")
 
     contract_val = curr_price * lot_size          # 每口目前市值
     pnl_per_tick = lot_size * contracts           # 股/每台幣1元變動
@@ -525,12 +547,12 @@ def _prepare_individual_futures(
 
     lines = [
         f"## 📈 個股期貨試算 | {now_str()}",
-        f"**{stock_name}（{stock_no}）** — {dir_tag}　**{contracts} 口**",
+        f"**{stock_name}（{stock_no}）** — {dir_tag}　**{contracts} 口**　｜ {size_label}",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
         "**📋 合約資訊**",
         f"• 標的現價：**{curr_price:,.2f} {currency}**　今日漲跌：{chg_today}（{pct_today}）",
-        f"• 每口股數（lot）：**{lot_size:,} 股**（依現價自動估算）",
+        f"• 合約規格：**{size_label}**",
         f"• {contracts} 口合計持股：**{lot_size*contracts:,} 股**",
         f"• 每股漲跌 1 元 → 損益 **{pnl_per_tick:,} 元**",
         f"• 目前合約市值（每口）：**{contract_val:,.0f} {currency}**",
@@ -1371,6 +1393,92 @@ async def cmd_自選股分析(interaction: discord.Interaction):
     )
 
 
+# ── /看板（自選股即時看板）─────────────────────────────────────────
+
+@tree.command(name="看板", description="自選股即時看板：一次顯示所有自選股的漲跌 / 成交量 / 強弱排行")
+async def cmd_看板(interaction: discord.Interaction):
+    uid    = str(interaction.user.id)
+    gid    = str(interaction.guild_id or "dm")
+    stocks = watchlist_db.get_watchlist(uid, gid)
+
+    if not stocks:
+        await interaction.response.send_message(
+            "📋 你的自選股清單是空的！\n先用 `/自選股新增` 加入股票，再執行 `/看板`。",
+            ephemeral=True,
+        )
+        return
+
+    print(f"⚡ /看板 收到：{uid}，共 {len(stocks)} 支", flush=True)
+    try:
+        await interaction.response.defer()
+    except Exception:
+        return
+
+    # 並行抓取所有報價（executor 裡跑，避免阻塞 event loop）
+    import time as _t
+    loop   = asyncio.get_running_loop()
+
+    async def _fetch_one(sym: str, name: str):
+        q = await loop.run_in_executor(None, _fetch_quote, sym)
+        return sym, name, q
+
+    tasks  = [_fetch_one(s["symbol"], s["name"]) for s in stocks]
+    results = await asyncio.gather(*tasks)
+
+    # 整理、排序（漲幅由高到低）
+    rows = []
+    for sym, name, q in results:
+        if q:
+            label = name or sym
+            pct_f = 0.0
+            try:
+                pct_f = float(q["pct"].replace("%", "").replace("+", ""))
+            except Exception:
+                pass
+            rows.append((pct_f, sym, label, q))
+        else:
+            rows.append((-999, sym, name or sym, None))
+
+    rows.sort(key=lambda x: x[0], reverse=True)
+
+    # 組合顯示文字
+    ts    = now_str()
+    lines = [f"## 📊 自選股即時看板 | {ts}", "━━━━━━━━━━━━━━━━━━━━━━", ""]
+
+    winners, losers, flat = 0, 0, 0
+    for pct_f, sym, label, q in rows:
+        if q is None:
+            lines.append(f"• ❓ **{label}**（`{sym}`）— 無法取得報價")
+            continue
+        arrow = "▲" if pct_f > 0 else ("▼" if pct_f < 0 else "─")
+        if pct_f > 0:
+            winners += 1
+        elif pct_f < 0:
+            losers  += 1
+        else:
+            flat    += 1
+        vol_str = f"量 {q['volume']}" if q.get("volume") and q["volume"] != "N/A" else ""
+        bar = "█" * min(10, max(1, abs(int(pct_f * 2))))   # 視覺強度條
+        lines.append(
+            f"• {q['emoji']} **{label}**（`{sym}`）"
+            f"　{q['price']}　{arrow} **{q['pct']}**　{vol_str}"
+        )
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📈 上漲 **{winners}** 支　📉 下跌 **{losers}** 支　⬛ 持平 **{flat}** 支",
+        f"> 資料來源：Yahoo Finance　｜　共 {len(rows)} 支自選股",
+    ]
+
+    # 分割傳送
+    full = "\n".join(lines)
+    chunks = _split_messages(full)
+    await interaction.followup.send(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.channel.send(chunk)
+
+
 # ── /自選股 ──────────────────────────────────────────────────────
 
 @tree.command(name="自選股", description="觸發完整自選股分析（結果約 2 分鐘後出現）")
@@ -1405,17 +1513,23 @@ async def cmd_自選股(interaction: discord.Interaction):
 
 # ── 個股期貨指令 ─────────────────────────────────────────────
 
-@tree.command(name="個股期", description="個股期貨試算：損益 / 保證金 / ATR停損 / 情境 / AI評估")
+@tree.command(name="個股期", description="個股期貨試算：損益 / 保證金 / ATR停損 / 情境 / AI評估（支援標準/小型/微型）")
 @app_commands.describe(
     stock       = "台股代碼（如 2330）或美股（NVDA）",
     direction   = "買進（多）或 賣出（空）",
     entry_price = "進場股價（如 895.0）",
     contracts   = "口數（預設 1）",
-    lot_size    = "每口股數（選填，0=依現價自動估算）",
+    size_type   = "合約規模：標準／小型（½口）／微型（⅕口）",
+    lot_size    = "自訂每口股數（選填，覆蓋 size_type；0=自動）",
 )
 @app_commands.choices(direction=[
     app_commands.Choice(name="買進（多）", value="買進"),
     app_commands.Choice(name="賣出（空）", value="賣出"),
+])
+@app_commands.choices(size_type=[
+    app_commands.Choice(name="標準",         value="標準"),
+    app_commands.Choice(name="🔸 小型（½）", value="小型"),
+    app_commands.Choice(name="🔹 微型（⅕）", value="微型"),
 ])
 async def cmd_個股期(
     interaction: discord.Interaction,
@@ -1423,10 +1537,12 @@ async def cmd_個股期(
     direction:   app_commands.Choice[str],
     entry_price: float,
     contracts:   int = 1,
+    size_type:   app_commands.Choice[str] = None,
     lot_size:    int = 0,
 ):
-    dir_str = direction.value
-    print(f"⚡ /個股期 收到：{stock} {dir_str} @{entry_price} {contracts}口 lot={lot_size}", flush=True)
+    dir_str  = direction.value
+    size_str = size_type.value if size_type else "標準"
+    print(f"⚡ /個股期 收到：{stock} {dir_str} @{entry_price} {contracts}口 {size_str} lot={lot_size}", flush=True)
     try:
         await interaction.response.defer()
     except discord.errors.NotFound:
@@ -1439,7 +1555,7 @@ async def cmd_個股期(
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(
             None, _prepare_individual_futures,
-            stock.strip(), dir_str, entry_price, max(1, contracts), lot_size,
+            stock.strip(), dir_str, entry_price, max(1, contracts), lot_size, size_str,
         )
         if data.get("error"):
             await interaction.followup.send(data["error"])
@@ -1716,7 +1832,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股(串流) /新聞 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨(串流) /查權證 /分析權證", flush=True)
+    print(f"   指令：/查股 /新聞 /看板 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     prewarm_cache()          # 背景預熱快取（優先用 DB，DB 過期才打 API）

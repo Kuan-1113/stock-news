@@ -34,21 +34,21 @@ def get_session_info() -> dict:
     _sessions = {
         "morning": {
             "label": "盤前早報",
-            "period": "前日 22:00 ～ 今日 08:00",
+            "period": "22:00 ～ 08:00（隔夜）",
             "emoji": "🌅",
             "start_h": 22,
             "end_h": 8,
         },
         "afternoon": {
             "label": "盤中午報",
-            "period": "今日 08:00 ～ 14:00",
+            "period": "08:00 ～ 14:00",
             "emoji": "☀️",
             "start_h": 8,
             "end_h": 14,
         },
         "evening": {
             "label": "盤後晚報",
-            "period": "今日 14:00 ～ 22:00",
+            "period": "14:00 ～ 22:00",
             "emoji": "🌙",
             "start_h": 14,
             "end_h": 22,
@@ -71,7 +71,8 @@ def get_session_info() -> dict:
 # ── 格式化工具 ────────────────────────────────────────────────────
 
 def fmt_quote(q: dict) -> str:
-    stale_tag = " ⚠️未更新（上次交易日）" if q.get("stale") else ""
+    # 週末時僅用 footer 統一說明，不在每筆旁邊加 ⚠️
+    stale_tag = " 📅" if q.get("stale") else ""
     return f"{q['emoji']} {q['price']} ({q['pct']}){stale_tag}"
 
 def truncate(text: str, limit: int = MAX_EMBED_FIELD) -> str:
@@ -120,8 +121,8 @@ def build_market_table(market_data: dict) -> str:
     for key, label in mapping:
         q = market_data.get(key, {})
         if q and q.get("price") != "N/A":
-            stale = " ⚠️未更新" if q.get("stale") else ""
-            rows.append(f"{label}: {q['emoji']} **{q['price']}** ({q['pct']}){stale}")
+            # 週末數據改在 footer 統一說明，個別項目不加 ⚠️ 避免誤解
+            rows.append(f"{label}: {q['emoji']} **{q['price']}** ({q['pct']})")
     return "\n".join(rows) if rows else "暫無數據"
 
 
