@@ -1,0 +1,63 @@
+name: 策略 Agent — 每日盤後選股明牌
+
+on:
+  schedule:
+    # 台灣時間 17:00 = UTC 09:00（週一～週五）
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'dry-run 模式（不發 Discord，只列印報告）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+concurrency:
+  group: strategy-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Taipei
+
+    steps:
+      - name: 📥 Checkout 程式碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安裝相依套件
+        run: |
+          pip install --upgrade pip
+          pip install requests anthropic
+
+      - name: 🚀 執行策略 Agent
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_STRATEGY:   ${{ secrets.DISCORD_STRATEGY }}
+          DISCORD_TW:         ${{ secrets.DISCORD_TW }}
+          SIGNAL_DB_PATH:     /tmp/strategy_signals.db
+          PYTHONUTF8:         "1"
+          TZ:                 Asia/Taipei
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          if [ "$DRY_RUN" = "true" ]; then
+            python -X utf8 -m strategy_agent.runner --dry-run
+          else
+            python -X utf8 -m strategy_agent.runner
+          fi
+
+      # 注意：GitHub Actions 無持久儲存。
+      # signal_db.py 的資料在每次 run 後會遺失。
+      # 長期勝率追蹤請使用 Railway（設定 SIGNAL_DB_PATH=/mnt/volume/strategy_signals.db）。
+      # 此 workflow 主要用途：手動觸發測試 / 備用發送。

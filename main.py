@@ -57,6 +57,36 @@ def now_str():
 from shared.claude_client import simple_call as _sdk_call, stream_call as _async_stream
 import watchlist_db
 
+# ── Strategy Agent（延遲載入，避免啟動時 DB 不存在）────────────
+def _run_strategy_agent():
+    """在背景執行策略 Agent（盤後 17:00 觸發）"""
+    try:
+        from strategy_agent.runner import run as _strategy_run, init_db as _strategy_init
+        _strategy_init()
+        _strategy_run(dry_run=False)
+    except Exception as e:
+        print(f"❌ 策略 Agent 執行失敗：{e}", flush=True)
+
+def _get_strategy_today() -> str:
+    """取得今日策略信號摘要（給 /明牌 指令用）"""
+    try:
+        from strategy_agent.runner import get_today_summary
+        from strategy_agent.signal_db import init_db
+        init_db()
+        return get_today_summary()
+    except Exception as e:
+        return f"❌ 無法取得策略信號：{e}"
+
+def _get_strategy_winrate() -> str:
+    """取得策略勝率統計（給 /明牌 指令用）"""
+    try:
+        from strategy_agent.runner import get_winrate_summary
+        from strategy_agent.signal_db import init_db
+        init_db()
+        return get_winrate_summary()
+    except Exception as e:
+        return f"❌ 無法取得勝率統計：{e}"
+
 def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
     """
     Discord bot 同步 Claude 呼叫（不串流版）。
@@ -1135,6 +1165,15 @@ def _daily_scheduler():
                 threading.Thread(target=_update_warrant_prices_bg, daemon=True).start()
                 threading.Thread(target=warrant_db.sync_warrant_status, daemon=True).start()
 
+            # 17:00 盤後（週一～五）：執行策略 Agent（選股掃描 + 信號更新 + Discord 明牌）
+            strategy_key = f"strategy-{now.strftime('%Y-%m-%d')}"
+            if (now.hour == 17 and now.minute < 5
+                    and now.weekday() < 5          # 0=Mon … 4=Fri
+                    and strategy_key not in _triggered):
+                _triggered.add(strategy_key)
+                print("⏰ 啟動策略 Agent（盤後選股）", flush=True)
+                threading.Thread(target=_run_strategy_agent, daemon=True).start()
+
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
                 _triggered.clear()
@@ -1824,6 +1863,61 @@ async def cmd_分析權證(interaction: discord.Interaction, code: str):
             pass
 
 
+# ── /明牌 ────────────────────────────────────────────────────────
+
+@tree.command(name="明牌", description="策略 Agent 每日選股明牌 + 勝率統計")
+@app_commands.describe(查詢="選擇查詢模式")
+@app_commands.choices(查詢=[
+    app_commands.Choice(name="📊 今日信號",   value="today"),
+    app_commands.Choice(name="📈 勝率統計",   value="winrate"),
+    app_commands.Choice(name="🚀 立即執行",   value="run"),
+])
+async def cmd_明牌(interaction: discord.Interaction, 查詢: app_commands.Choice[str] = None):
+    mode = 查詢.value if 查詢 else "today"
+    print(f"⚡ /明牌 收到：mode={mode}", flush=True)
+    try:
+        await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /明牌 互動已過期，忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /明牌 defer 失敗：{e}", flush=True)
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        if mode == "today":
+            result = await loop.run_in_executor(None, _get_strategy_today)
+            chunks = _split_messages(result)
+            await interaction.followup.send(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.channel.send(chunk)
+
+        elif mode == "winrate":
+            result = await loop.run_in_executor(None, _get_strategy_winrate)
+            chunks = _split_messages(result)
+            await interaction.followup.send(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.channel.send(chunk)
+
+        elif mode == "run":
+            # 手動觸發策略 Agent（非同步背景執行，不等待完成）
+            await interaction.followup.send(
+                "🚀 **策略 Agent 啟動中...**\n"
+                "掃描 ETF 成分股 + 更新歷史勝率，約 **2～3 分鐘**後明牌結果會發送至明牌頻道。\n"
+                "（或直接用 `📊 今日信號` 查詢結果）"
+            )
+            threading.Thread(target=_run_strategy_agent, daemon=True).start()
+
+    except Exception as e:
+        print(f"❌ /明牌 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 發生錯誤：{str(e)[:150]}")
+        except Exception:
+            pass
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -1832,9 +1926,15 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股 /新聞 /看板 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證", flush=True)
+    print(f"   指令：/查股 /新聞 /看板 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
+    # 策略 Agent DB 初始化（Railway Volume 路徑由 SIGNAL_DB_PATH 環境變數控制）
+    try:
+        from strategy_agent.signal_db import init_db as _strategy_init_db
+        _strategy_init_db()
+    except Exception as e:
+        print(f"⚠️ 策略 DB 初始化失敗（非致命）：{e}", flush=True)
     prewarm_cache()          # 背景預熱快取（優先用 DB，DB 過期才打 API）
 
 if not DISCORD_BOT_TOKEN:
