@@ -37,9 +37,11 @@ if _ROOT not in sys.path:
 from strategy_agent.signal_db   import (
     init_db, add_signal, get_pending_signals, update_result,
     get_all_strategy_stats, get_today_signals, mark_sent, get_summary_stats,
+    update_confidence_stars,
 )
-from strategy_agent.strategies  import ALL_STRATEGIES
+from strategy_agent.strategies  import ALL_STRATEGIES, CHIP_STRATEGIES, ALL_STRATEGIES_COMBINED
 from strategy_agent.etf_universe import get_universe
+from strategy_agent.chip_data   import init_chip_db, update_chip_data, get_chip_map
 
 try:
     from shared.claude_client import simple_call as claude_call
@@ -242,34 +244,39 @@ def update_pending_results() -> int:
 # ── 步驟 5：執行策略掃描 ──────────────────────────────────────────
 
 def run_screener(
-    universe: dict[str, str],
+    universe:  dict[str, str],
     ohlcv_map: dict[str, list[dict]],
-    today: str,
+    today:     str,
+    chip_map:  dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     """
-    對每支股票逐策略掃描，回傳今日觸發信號清單。
-    每筆：{"symbol", "name", "etf_source", "strategy", "strategy_label",
-           "entry_price", "detail"}
-    """
-    signals = []
-    strategies = list(ALL_STRATEGIES.items())   # [(key, (label, fn)), ...]
+    對每支股票執行指標派 + 籌碼派策略掃描，計算信心星級後回傳。
 
+    每筆信號格式：
+      {"symbol", "name", "etf_source", "strategy", "strategy_label",
+       "strategy_type", "entry_price", "detail", "confidence_stars"}
+
+    信心星級定義：
+      ⭐   (1) 只有單一維度（純指標 或 純籌碼）
+      ⭐⭐  (2) 同支股票有兩個以上信號（同維度）
+      ⭐⭐⭐ (3) 同支股票同時有指標派 AND 籌碼派信號確認
+    """
+    chip_map = chip_map or {}
+    signals  = []
+
+    # ── 指標派（OHLCV）掃描 ───────────────────────────────────────
     for symbol, etf_source in universe.items():
         ohlcv = ohlcv_map.get(symbol, [])
-        if not ohlcv:
+        if not ohlcv or ohlcv[-1]["date"] != today:
             continue
-        # 確認今日有資料（最後一筆是今日）
-        if ohlcv[-1]["date"] != today:
-            continue
-
         entry_price = ohlcv[-1]["close"]
         name        = _NAME_CACHE.get(symbol, symbol)
 
-        for strat_key, (strat_label, strat_fn) in strategies:
+        for strat_key, (strat_label, strat_fn) in ALL_STRATEGIES.items():
             try:
                 triggered, detail = strat_fn(ohlcv)
             except Exception as e:
-                print(f"    ⚠️  {symbol} / {strat_key} 例外：{e}")
+                print(f"    ⚠️  {symbol}/{strat_key} 例外：{e}")
                 continue
             if triggered:
                 signals.append({
@@ -278,10 +285,66 @@ def run_screener(
                     "etf_source":     etf_source,
                     "strategy":       strat_key,
                     "strategy_label": strat_label,
+                    "strategy_type":  "technical",
                     "entry_price":    entry_price,
                     "detail":         detail,
+                    "confidence_stars": 1,
                 })
 
+    # ── 籌碼派掃描 ────────────────────────────────────────────────
+    chip_triggered: set[str] = set()   # 本次有籌碼信號的 symbol
+    for symbol, etf_source in universe.items():
+        chip_hist = chip_map.get(symbol, [])
+        if not chip_hist:
+            continue
+
+        # 抓 entry_price（從 OHLCV，若無則跳過）
+        ohlcv       = ohlcv_map.get(symbol, [])
+        entry_price = ohlcv[-1]["close"] if (ohlcv and ohlcv[-1]["date"] == today) else None
+        if entry_price is None:
+            continue
+        name = _NAME_CACHE.get(symbol, symbol)
+
+        for strat_key, (strat_label, strat_fn) in CHIP_STRATEGIES.items():
+            try:
+                triggered, detail = strat_fn(chip_hist)
+            except Exception as e:
+                print(f"    ⚠️  {symbol}/{strat_key} 例外：{e}")
+                continue
+            if triggered:
+                chip_triggered.add(symbol)
+                signals.append({
+                    "symbol":         symbol,
+                    "name":           name,
+                    "etf_source":     etf_source,
+                    "strategy":       strat_key,
+                    "strategy_label": strat_label,
+                    "strategy_type":  "chip",
+                    "entry_price":    entry_price,
+                    "detail":         detail,
+                    "confidence_stars": 1,
+                })
+
+    # ── 計算信心星級 ──────────────────────────────────────────────
+    from collections import defaultdict
+    sym_types: dict[str, set] = defaultdict(set)
+    sym_count: dict[str, int] = defaultdict(int)
+    for sig in signals:
+        sym_types[sig["symbol"]].add(sig["strategy_type"])
+        sym_count[sig["symbol"]] += 1
+
+    for sig in signals:
+        sym = sig["symbol"]
+        types = sym_types[sym]
+        if "technical" in types and "chip" in types:
+            sig["confidence_stars"] = 3   # ⭐⭐⭐ 指標 + 籌碼雙確認
+        elif sym_count[sym] >= 2:
+            sig["confidence_stars"] = 2   # ⭐⭐  同維度多個信號
+        else:
+            sig["confidence_stars"] = 1   # ⭐   單一信號
+
+    # 依星級 → 股票代號 排序（⭐⭐⭐ 優先顯示）
+    signals.sort(key=lambda s: (-s["confidence_stars"], s["symbol"]))
     return signals
 
 
@@ -301,48 +364,70 @@ def build_claude_report(
         return ""
 
     # ── 整理策略勝率表 ────────────────────────────────────────────
-    stats_lines = []
+    stats_lines = ["【指標派勝率】"]
     for key, (label, _) in ALL_STRATEGIES.items():
         wr, cnt, avg_r = strategy_stats.get(key, (None, 0, 0.0))
         if wr is not None:
-            stats_lines.append(
-                f"  {label}：勝率 {wr:.0f}%（{cnt} 筆，平均報酬 {avg_r:+.1f}%）"
-            )
+            bar = "█" * int(wr / 10) + "░" * (10 - int(wr / 10))
+            stats_lines.append(f"  {label}：[{bar}] {wr:.0f}%（{cnt}筆，均報酬{avg_r:+.1f}%）")
         else:
-            stats_lines.append(f"  {label}：無歷史資料")
+            stats_lines.append(f"  {label}：積累中")
+    stats_lines.append("【籌碼派勝率】")
+    for key, (label, _) in CHIP_STRATEGIES.items():
+        wr, cnt, avg_r = strategy_stats.get(key, (None, 0, 0.0))
+        if wr is not None:
+            bar = "█" * int(wr / 10) + "░" * (10 - int(wr / 10))
+            stats_lines.append(f"  {label}：[{bar}] {wr:.0f}%（{cnt}筆，均報酬{avg_r:+.1f}%）")
+        else:
+            stats_lines.append(f"  {label}：積累中")
     stats_text = "\n".join(stats_lines)
 
-    # ── 整理今日信號 ──────────────────────────────────────────────
+    # ── 整理今日信號（依星級分組）────────────────────────────────
+    star_emoji = {3: "⭐⭐⭐", 2: "⭐⭐", 1: "⭐"}
+    star_label = {3: "指標+籌碼雙確認", 2: "多重信號", 1: "單一信號"}
+
     sig_lines = []
+    current_stars = None
     for s in signals:
+        stars = s.get("confidence_stars", 1)
+        if stars != current_stars:
+            current_stars = stars
+            sig_lines.append(
+                f"\n{star_emoji[stars]} **{star_label[stars]}**"
+            )
         wr, cnt, avg_r = strategy_stats.get(s["strategy"], (None, 0, 0.0))
-        wr_str = f"（勝率{wr:.0f}%）" if wr else "（無歷史）"
+        wr_str  = f"勝率{wr:.0f}%" if wr else "無歷史"
+        type_tag = "📊指標" if s["strategy_type"] == "technical" else "💹籌碼"
         sig_lines.append(
-            f"  • {s['symbol']} {s['name']} [{s['strategy_label']}]{wr_str}"
-            f"  進場 ${s['entry_price']:.1f}，{s['detail']}"
-            f"  ETF：{s['etf_source']}"
+            f"  • **{s['symbol']} {s['name']}** [{type_tag}｜{s['strategy_label']}]（{wr_str}）\n"
+            f"    進場 ${s['entry_price']:.1f}　{s['detail']}"
         )
     sigs_text = "\n".join(sig_lines)
 
-    # ── Claude 提示 ───────────────────────────────────────────────
-    prompt = f"""你是台股量化策略助理，今天 {today} 的策略選股系統找到以下信號，請幫我整理成 Discord 明牌推薦報告。
+    # 計算星級分布
+    stars3 = sum(1 for s in signals if s.get("confidence_stars") == 3)
+    stars2 = sum(1 for s in signals if s.get("confidence_stars") == 2)
+    stars1 = sum(1 for s in signals if s.get("confidence_stars") == 1)
 
-【策略歷史勝率（近60筆信號）】
+    # ── Claude 提示 ───────────────────────────────────────────────
+    prompt = f"""你是台股量化策略助理，今天 {today} 同時使用了「指標派」和「籌碼派」雙系統選股。
+請整理成 Discord 明牌推薦報告。
+
+【策略歷史勝率】
 {stats_text}
 
-【今日觸發信號（{len(signals)} 筆）】
+【今日觸發信號（共 {len(signals)} 筆，⭐⭐⭐{stars3} / ⭐⭐{stars2} / ⭐{stars1}）】
 {sigs_text}
 
 【整體統計】
-總信號：{summary['total']}筆｜整體勝率：{summary.get('winrate') or '積累中'}%
+歷史總信號：{summary['total']}筆｜整體勝率：{summary.get('winrate') or '積累中'}%
 
-請依照以下要求輸出：
-1. 只推薦有正向勝率（>50%）或有強力技術面的股票，勝率不明的也可提（標示「無歷史，觀察中」）
-2. 每支股票給一句點評（技術面強弱、注意事項）
-3. 尾段加一句整體市場觀察（當日信號數量、哪種策略今日較多）
-4. 用繁體中文，Emoji 可適量使用，不超過 1800 字
-5. 開頭用：「📊 今日策略明牌 {today}」
-6. 末尾加：「⚠️ 以上為技術面信號，非投資建議，請自行評估風險」"""
+輸出規範：
+1. 開頭用「📊 今日策略明牌 {today}」，依星級排序（⭐⭐⭐優先）
+2. ⭐⭐⭐的股票重點分析（指標面+籌碼面各一句）；⭐⭐簡短點評；⭐僅列名觀察
+3. 指出今日哪個策略/族群信號最集中
+4. 末尾加：「⚠️ 量化信號，非投資建議，請自行評估風險」
+5. 繁體中文，1800 字以內，可用 Emoji"""
 
     print("  🤖 呼叫 Claude 生成明牌報告...")
     try:
@@ -360,16 +445,19 @@ def _fallback_report(
     summary: dict,
 ) -> str:
     """Claude 失敗時的備用純文字報告"""
+    star_emoji = {3: "⭐⭐⭐", 2: "⭐⭐", 1: "⭐"}
     lines = [f"📊 今日策略明牌 {today}\n"]
     for s in signals:
         wr, cnt, avg_r = strategy_stats.get(s["strategy"], (None, 0, 0.0))
         wr_str = f"勝率{wr:.0f}%" if wr else "無歷史"
+        stars  = star_emoji.get(s.get("confidence_stars", 1), "⭐")
+        type_tag = "📊指標" if s["strategy_type"] == "technical" else "💹籌碼"
         lines.append(
-            f"• **{s['symbol']} {s['name']}** [{s['strategy_label']}]（{wr_str}）\n"
+            f"{stars} **{s['symbol']} {s['name']}** [{type_tag}｜{s['strategy_label']}]（{wr_str}）\n"
             f"  進場：${s['entry_price']:.1f}　{s['detail']}\n"
         )
     lines.append(f"\n整體勝率：{summary.get('winrate') or '積累中'}%（共 {summary['total']} 筆歷史信號）")
-    lines.append("\n⚠️ 以上為技術面信號，非投資建議，請自行評估風險")
+    lines.append("\n⚠️ 量化信號，非投資建議，請自行評估風險")
     return "\n".join(lines)
 
 
@@ -396,8 +484,9 @@ def run(dry_run: bool = False) -> dict:
     print(f"🚀 Strategy Agent 啟動  {today}")
     print(f"{'='*55}")
 
-    # ── 1. 初始化 DB ──────────────────────────────────────────────
+    # ── 1. 初始化 DB（指標 + 籌碼）─────────────────────────────────
     init_db()
+    init_chip_db()
 
     # ── 2. 更新歷史信號結算 ───────────────────────────────────────
     print("\n[步驟 2] 更新歷史信號...")
@@ -408,55 +497,85 @@ def run(dry_run: bool = False) -> dict:
     universe = get_universe()
     print(f"  → 宇宙：{len(universe)} 支股票")
 
-    # ── 4. 批量抓取 OHLCV ────────────────────────────────────────
-    print(f"\n[步驟 4] 抓取日線資料（{len(universe)} 支，6 個月）...")
+    # ── 4. 並行抓取 OHLCV + 籌碼資料 ────────────────────────────
+    print(f"\n[步驟 4] 抓取日線資料 + TWSE 籌碼資料...")
     ohlcv_map: dict[str, list[dict]] = {}
 
     def _fetch_one(sym: str) -> tuple[str, list[dict]]:
         data = fetch_ohlcv(sym)
-        time.sleep(0.05)   # 輕微節流，避免 429
+        time.sleep(0.05)
         return sym, data
 
+    # OHLCV 與籌碼並行抓取
+    import concurrent.futures
     with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(_fetch_one, sym): sym for sym in universe}
+        ohlcv_futs = {ex.submit(_fetch_one, sym): sym for sym in universe}
+        chip_fut   = ex.submit(update_chip_data, today)   # 籌碼並行
+
         done = 0
-        for fut in as_completed(futs):
+        for fut in as_completed(ohlcv_futs):
             sym, data = fut.result()
             ohlcv_map[sym] = data
             done += 1
             if done % 10 == 0:
-                print(f"    進度：{done}/{len(universe)}")
+                print(f"    OHLCV 進度：{done}/{len(universe)}")
+
+        chip_stored = chip_fut.result()
 
     ok_count = sum(1 for v in ohlcv_map.values() if v)
-    print(f"  ✅ 成功抓取：{ok_count}/{len(universe)} 支")
+    print(f"  ✅ OHLCV：{ok_count}/{len(universe)} 支")
+    print(f"  ✅ 籌碼資料：{chip_stored} 支")
 
-    # ── 5. 策略掃描 ───────────────────────────────────────────────
-    print(f"\n[步驟 5] 執行策略掃描（{len(universe)} 支 × {len(ALL_STRATEGIES)} 策略）...")
-    new_signals = run_screener(universe, ohlcv_map, today)
-    print(f"  📡 今日觸發信號：{len(new_signals)} 筆")
+    # 取出籌碼歷史（最近 5 天）
+    chip_map = get_chip_map(days=5)
+    chip_covered = sum(1 for sym in universe if sym in chip_map)
+    print(f"  📊 有籌碼歷史的股票：{chip_covered}/{len(universe)} 支")
+
+    # ── 5. 策略掃描（指標 + 籌碼）───────────────────────────────
+    n_tech = len(ALL_STRATEGIES)
+    n_chip = len(CHIP_STRATEGIES)
+    print(f"\n[步驟 5] 執行策略掃描（{len(universe)} 支 × {n_tech} 指標 + {n_chip} 籌碼）...")
+    new_signals = run_screener(universe, ohlcv_map, today, chip_map)
+    stars3 = sum(1 for s in new_signals if s.get("confidence_stars") == 3)
+    stars2 = sum(1 for s in new_signals if s.get("confidence_stars") == 2)
+    stars1 = sum(1 for s in new_signals if s.get("confidence_stars") == 1)
+    print(f"  📡 今日觸發：{len(new_signals)} 筆（⭐⭐⭐{stars3} ⭐⭐{stars2} ⭐{stars1}）")
 
     # ── 6. 寫入新信號 ─────────────────────────────────────────────
     print("\n[步驟 6] 寫入信號資料庫...")
     added = 0
     for s in new_signals:
         ok = add_signal(
-            date        = today,
-            symbol      = s["symbol"],
-            name        = s["name"],
-            etf_source  = s["etf_source"],
-            strategy    = s["strategy"],
-            entry_price = s["entry_price"],
+            date             = today,
+            symbol           = s["symbol"],
+            name             = s["name"],
+            etf_source       = s["etf_source"],
+            strategy         = s["strategy"],
+            entry_price      = s["entry_price"],
+            confidence_stars = s.get("confidence_stars", 1),
+            strategy_type    = s.get("strategy_type", "technical"),
         )
         if ok:
             added += 1
+
+    # 更新信心星級（同股票可能有多個信號，需同步更新 DB）
+    from collections import defaultdict
+    sym_stars: dict[str, int] = {}
+    for s in new_signals:
+        sym = s["symbol"]
+        stars = s.get("confidence_stars", 1)
+        sym_stars[sym] = max(sym_stars.get(sym, 1), stars)
+    for sym, stars in sym_stars.items():
+        if stars > 1:
+            update_confidence_stars(today, sym, stars)
     print(f"  ✅ 新增 {added} 筆（含重複跳過）")
 
-    # ── 7. 計算勝率 ───────────────────────────────────────────────
+    # ── 7. 計算勝率（指標 + 籌碼）───────────────────────────────
     print("\n[步驟 7] 計算各策略勝率...")
-    strategy_keys = list(ALL_STRATEGIES.keys())
+    strategy_keys = list(ALL_STRATEGIES_COMBINED.keys())
     strategy_stats = get_all_strategy_stats(strategy_keys)
     for key, (wr, cnt, avg_r) in strategy_stats.items():
-        label = ALL_STRATEGIES[key][0]
+        label = ALL_STRATEGIES_COMBINED.get(key, (key,))[0]
         if wr is not None:
             print(f"  {label}：{wr:.0f}%（{cnt} 筆，均報酬 {avg_r:+.1f}%）")
         else:
@@ -510,18 +629,29 @@ def run(dry_run: bool = False) -> dict:
 # ── 純文字版勝率摘要（供 /明牌 Discord 指令用）──────────────────
 
 def get_winrate_summary() -> str:
-    """
-    回傳各策略勝率的 Discord 格式摘要文字。
-    供 /明牌 指令即時查詢。
-    """
+    """回傳各策略勝率的 Discord 格式摘要（指標派 + 籌碼派分組）"""
+    all_keys  = list(ALL_STRATEGIES_COMBINED.keys())
+    all_stats = get_all_strategy_stats(all_keys)
+
     lines = ["📊 **策略勝率統計**（近 60 筆有效信號）\n"]
+
+    lines.append("**📈 指標派**")
     for key, (label, _) in ALL_STRATEGIES.items():
-        wr, cnt, avg_r = get_all_strategy_stats([key]).get(key, (None, 0, 0.0))
+        wr, cnt, avg_r = all_stats.get(key, (None, 0, 0.0))
         if wr is not None:
             bar = "█" * int(wr / 10) + "░" * (10 - int(wr / 10))
-            lines.append(f"{label}\n  [{bar}] {wr:.0f}%，{cnt} 筆，均報酬 {avg_r:+.1f}%")
+            lines.append(f"{label}\n  [{bar}] {wr:.0f}%  {cnt}筆  均報酬{avg_r:+.1f}%")
         else:
-            lines.append(f"{label}\n  [──────────] 積累中（尚無足夠歷史）")
+            lines.append(f"{label}\n  [──────────] 積累中")
+
+    lines.append("\n**💹 籌碼派**")
+    for key, (label, _) in CHIP_STRATEGIES.items():
+        wr, cnt, avg_r = all_stats.get(key, (None, 0, 0.0))
+        if wr is not None:
+            bar = "█" * int(wr / 10) + "░" * (10 - int(wr / 10))
+            lines.append(f"{label}\n  [{bar}] {wr:.0f}%  {cnt}筆  均報酬{avg_r:+.1f}%")
+        else:
+            lines.append(f"{label}\n  [──────────] 積累中（籌碼派初期）")
 
     summary = get_summary_stats()
     lines.append(
@@ -534,28 +664,38 @@ def get_winrate_summary() -> str:
 
 
 def get_today_summary() -> str:
-    """
-    回傳今日信號摘要（供 /明牌 指令使用）。
-    """
+    """回傳今日信號摘要（供 /明牌 指令使用，依星級排序）"""
     today = datetime.date.today().isoformat()
-    sigs = get_today_signals(today)
+    sigs  = get_today_signals(today)
     if not sigs:
-        return f"📭 今日（{today}）尚無策略信號\n（策略 Agent 每日盤後自動執行）"
+        return f"📭 今日（{today}）尚無策略信號\n（策略 Agent 每日 17:00 盤後自動執行）"
 
-    strategy_keys = list(ALL_STRATEGIES.keys())
+    strategy_keys = list(ALL_STRATEGIES_COMBINED.keys())
     stats = get_all_strategy_stats(strategy_keys)
 
+    star_emoji = {3: "⭐⭐⭐", 2: "⭐⭐", 1: "⭐"}
+    # 依星級排序
+    sorted_sigs = sorted(sigs, key=lambda s: -(s["confidence_stars"] or 1))
+
     lines = [f"📊 今日策略信號 {today}（{len(sigs)} 筆）\n"]
-    for s in sigs:
+    prev_stars = None
+    for s in sorted_sigs:
+        stars = s["confidence_stars"] or 1
         key   = s["strategy"]
-        label = ALL_STRATEGIES[key][0] if key in ALL_STRATEGIES else key
+        label = ALL_STRATEGIES_COMBINED.get(key, (key,))[0]
+        stype = s.get("strategy_type", "technical")
+        type_tag = "📊" if stype == "technical" else "💹"
         wr, cnt, _ = stats.get(key, (None, 0, 0.0))
         wr_str = f"勝率{wr:.0f}%" if wr else "無歷史"
+
+        if stars != prev_stars:
+            prev_stars = stars
+            lines.append(f"\n{star_emoji[stars]}")
         lines.append(
-            f"• **{s['symbol']} {s['name']}** [{label}]（{wr_str}）"
-            f"  進場 ${s['entry_price']:.1f}｜ETF：{s['etf_source']}"
+            f"• **{s['symbol']} {s['name']}** {type_tag}[{label}]（{wr_str}）"
+            f"  @${s['entry_price']:.1f}"
         )
-    lines.append("\n⚠️ 技術面信號，非投資建議")
+    lines.append("\n⚠️ 量化信號，非投資建議")
     return "\n".join(lines)
 
 

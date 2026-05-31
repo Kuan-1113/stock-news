@@ -39,36 +39,43 @@ def _conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """建立資料表（冪等）"""
+    """建立資料表（冪等），並自動 migration 加欄位"""
     with _lock:
         with _conn() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date         TEXT    NOT NULL,          -- 信號日期 YYYY-MM-DD
-                    symbol       TEXT    NOT NULL,          -- 股票代號
-                    name         TEXT    NOT NULL DEFAULT '',
-                    etf_source   TEXT    NOT NULL DEFAULT '', -- 來自哪個 ETF
-                    strategy     TEXT    NOT NULL,          -- 策略代號
-                    entry_price  REAL    NOT NULL,          -- 進場收盤價
-                    price_5d     REAL,                      -- 5 日後收盤價
-                    price_10d    REAL,                      -- 10 日後收盤價
-                    result_5d    REAL,                      -- 5 日報酬率 %
-                    result_10d   REAL,                      -- 10 日報酬率 %
-                    win_5d       INTEGER,                   -- 1=win 0=loss NULL=neutral/pending
-                    win_10d      INTEGER,
-                    sent_discord INTEGER NOT NULL DEFAULT 0,
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date             TEXT    NOT NULL,
+                    symbol           TEXT    NOT NULL,
+                    name             TEXT    NOT NULL DEFAULT '',
+                    etf_source       TEXT    NOT NULL DEFAULT '',
+                    strategy         TEXT    NOT NULL,
+                    entry_price      REAL    NOT NULL,
+                    price_5d         REAL,
+                    price_10d        REAL,
+                    result_5d        REAL,
+                    result_10d       REAL,
+                    win_5d           INTEGER,
+                    win_10d          INTEGER,
+                    sent_discord     INTEGER NOT NULL DEFAULT 0,
+                    confidence_stars INTEGER NOT NULL DEFAULT 1,  -- ⭐1/⭐⭐2/⭐⭐⭐3
+                    strategy_type    TEXT    NOT NULL DEFAULT 'technical', -- technical/chip
                     UNIQUE(date, symbol, strategy)
                 )
             """)
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sig_date
-                ON signals(date DESC)
-            """)
-            c.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sig_strategy
-                ON signals(strategy, date DESC)
-            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sig_date     ON signals(date DESC)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sig_strategy ON signals(strategy, date DESC)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_sig_stars    ON signals(confidence_stars DESC)")
+
+            # ── 既有 DB 自動 migration（加新欄位）──────────────────
+            existing_cols = {row[1] for row in c.execute("PRAGMA table_info(signals)")}
+            if "confidence_stars" not in existing_cols:
+                c.execute("ALTER TABLE signals ADD COLUMN confidence_stars INTEGER NOT NULL DEFAULT 1")
+                print("  ✅ migration: 加入 confidence_stars 欄位")
+            if "strategy_type" not in existing_cols:
+                c.execute("ALTER TABLE signals ADD COLUMN strategy_type TEXT NOT NULL DEFAULT 'technical'")
+                print("  ✅ migration: 加入 strategy_type 欄位")
+
     print(f"  ✅ signal_db 初始化完成（{DB_PATH}）")
 
 
@@ -77,16 +84,30 @@ def init_db() -> None:
 def add_signal(
     date: str, symbol: str, name: str,
     etf_source: str, strategy: str, entry_price: float,
+    confidence_stars: int = 1,
+    strategy_type: str = "technical",
 ) -> bool:
     """新增信號（IGNORE ON CONFLICT 確保冪等）"""
     with _lock:
         with _conn() as c:
             cur = c.execute("""
                 INSERT OR IGNORE INTO signals
-                  (date, symbol, name, etf_source, strategy, entry_price)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (date, symbol, name, etf_source, strategy, round(entry_price, 2)))
+                  (date, symbol, name, etf_source, strategy, entry_price,
+                   confidence_stars, strategy_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (date, symbol, name, etf_source, strategy,
+                  round(entry_price, 2), confidence_stars, strategy_type))
             return cur.rowcount > 0
+
+
+def update_confidence_stars(date: str, symbol: str, stars: int) -> None:
+    """更新同一標的當日所有信號的信心星級"""
+    with _lock:
+        with _conn() as c:
+            c.execute(
+                "UPDATE signals SET confidence_stars=? WHERE date=? AND symbol=?",
+                (stars, date, symbol),
+            )
 
 
 # ── 更新歷史結果 ───────────────────────────────────────────────────

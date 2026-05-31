@@ -186,3 +186,90 @@ ALL_STRATEGIES: dict[str, tuple[str, callable]] = {
     "pullback_ma20":    ("💪 強勢回檔 MA20 支撐",     strategy_pullback_ma20),
     "weekly_momentum":  ("📊 週線強勢量縮收紅",       strategy_weekly_momentum),
 }
+
+
+# ── 籌碼派策略（輸入：chip_history list，由舊到新）─────────────────
+# chip_history 每筆格式：
+#   {"date": str, "foreign_net": int, "trust_net": int,
+#    "dealer_net": int, "total_net": int}
+# 單位與 TWSE 資料相同（通常為千股，正 = 買超，負 = 賣超）
+
+def strategy_chip_foreign(chip_hist: list) -> tuple[bool, str]:
+    """
+    外資連續淨買超 3 個交易日以上。
+    台股最重要的籌碼訊號，外資連買通常代表有基本面或產業邏輯支撐。
+    """
+    if len(chip_hist) < 3:
+        return False, ""
+
+    # 計算從最近一天往回算連續買超天數
+    consecutive = 0
+    for rec in reversed(chip_hist):
+        if rec["foreign_net"] > 0:
+            consecutive += 1
+        else:
+            break
+
+    if consecutive >= 3:
+        recent3_total = sum(r["foreign_net"] for r in chip_hist[-3:])
+        today_val     = chip_hist[-1]["foreign_net"]
+        return True, (
+            f"外資連買 {consecutive} 日"
+            f"，今日 {today_val:+,}（近3日合計 {recent3_total:+,}）"
+        )
+    return False, ""
+
+
+def strategy_chip_trust(chip_hist: list) -> tuple[bool, str]:
+    """
+    投信連續淨買超 3 個交易日以上。
+    投信連買常出現在月底作帳或法人佈局早期，短線上漲概率高。
+    """
+    if len(chip_hist) < 3:
+        return False, ""
+
+    consecutive = 0
+    for rec in reversed(chip_hist):
+        if rec["trust_net"] > 0:
+            consecutive += 1
+        else:
+            break
+
+    if consecutive >= 3:
+        recent3_total = sum(r["trust_net"] for r in chip_hist[-3:])
+        today_val     = chip_hist[-1]["trust_net"]
+        return True, (
+            f"投信連買 {consecutive} 日"
+            f"，今日 {today_val:+,}（近3日合計 {recent3_total:+,}）"
+        )
+    return False, ""
+
+
+def strategy_chip_dual(chip_hist: list) -> tuple[bool, str]:
+    """
+    外資 + 投信今日同步淨買超（雙主力同向）。
+    外資和投信同時買是非常罕見的強力信號，籌碼高度集中。
+    """
+    if not chip_hist:
+        return False, ""
+
+    today = chip_hist[-1]
+    if today["foreign_net"] > 0 and today["trust_net"] > 0:
+        return True, (
+            f"外資+投信同買：外資 {today['foreign_net']:+,}"
+            f" / 投信 {today['trust_net']:+,}"
+            f" / 合計 {today['total_net']:+,}"
+        )
+    return False, ""
+
+
+# ── 籌碼策略字典 ──────────────────────────────────────────────────
+
+CHIP_STRATEGIES: dict[str, tuple[str, callable]] = {
+    "chip_foreign": ("🏛️ 外資連買3日+",     strategy_chip_foreign),
+    "chip_trust":   ("📦 投信連買3日+",     strategy_chip_trust),
+    "chip_dual":    ("🔗 外資+投信同買",    strategy_chip_dual),
+}
+
+# 所有策略合集（指標 + 籌碼），供統計用
+ALL_STRATEGIES_COMBINED = {**ALL_STRATEGIES, **CHIP_STRATEGIES}
