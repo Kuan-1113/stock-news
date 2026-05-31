@@ -1,0 +1,57 @@
+name: 每週市場回顧（週五盤後）
+
+on:
+  schedule:
+    # 台灣時間 17:30 週五 = UTC 09:30 週五
+    - cron: '30 9 * * 5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'dry-run（不發 Discord）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+concurrency:
+  group: weekly-review
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Taipei
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 安裝套件
+        run: pip install requests anthropic
+
+      - name: 📅 執行週線回顧
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_TW:        ${{ secrets.DISCORD_TW }}
+          DISCORD_WATCHLIST: ${{ secrets.DISCORD_WATCHLIST }}
+          DISCORD_WEEKLY:    ${{ secrets.DISCORD_WEEKLY }}
+          SIGNAL_DB_PATH:    /tmp/strategy_signals.db
+          PYTHONUTF8:        "1"
+          TZ:                Asia/Taipei
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          if [ "$DRY_RUN" = "true" ]; then
+            python -X utf8 weekly_review.py --dry-run
+          else
+            python -X utf8 weekly_review.py
+          fi

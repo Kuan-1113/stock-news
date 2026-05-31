@@ -67,6 +67,14 @@ def _run_strategy_agent():
     except Exception as e:
         print(f"❌ 策略 Agent 執行失敗：{e}", flush=True)
 
+def _run_weekly_review():
+    """在背景執行每週回顧報告（週五 17:30 觸發）"""
+    try:
+        from weekly_review import run as _weekly_run
+        _weekly_run()
+    except Exception as e:
+        print(f"❌ 週線回顧報告執行失敗：{e}", flush=True)
+
 def _get_strategy_today() -> str:
     """取得今日策略信號摘要（給 /明牌 指令用）"""
     try:
@@ -292,6 +300,113 @@ def _fetch_tech_fast(symbol: str) -> str:
         return "（技術指標暫時無法取得）"
 
 
+# ── 財報基本面抓取 ────────────────────────────────────────────────
+
+# TWSE P/E 快取（每次 Bot 啟動後第一次查詢時載入，有效 4 小時）
+_TWSE_FUND_CACHE: dict[str, dict] = {}
+_TWSE_FUND_TS: float = 0.0
+_TWSE_FUND_TTL: float = 4 * 3600   # 4 小時
+
+
+def _load_twse_fundamentals() -> dict[str, dict]:
+    """
+    從 TWSE OpenAPI 批次取得所有上市股票的 P/E、殖利率、P/B 比。
+    endpoint：https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL
+    結果格式：{代碼: {"pe": float, "yield_pct": float, "pb": float}}
+    """
+    global _TWSE_FUND_CACHE, _TWSE_FUND_TS
+    now = time.time()
+    if _TWSE_FUND_CACHE and now - _TWSE_FUND_TS < _TWSE_FUND_TTL:
+        return _TWSE_FUND_CACHE
+
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return _TWSE_FUND_CACHE
+        data = {}
+        for item in r.json():
+            code = str(item.get("Code", "")).strip()
+            if not code:
+                continue
+            try:
+                data[code] = {
+                    "pe":        float(item["PEratio"])       if item.get("PEratio")       else None,
+                    "yield_pct": float(item["DividendYield"]) if item.get("DividendYield") else None,
+                    "pb":        float(item["PBratio"])       if item.get("PBratio")       else None,
+                }
+            except (ValueError, KeyError):
+                pass
+        _TWSE_FUND_CACHE = data
+        _TWSE_FUND_TS    = now
+        print(f"  📊 TWSE 財報快取更新：{len(data)} 支", flush=True)
+        return data
+    except Exception as e:
+        print(f"⚠️ TWSE 財報 API 失敗：{e}", flush=True)
+        return _TWSE_FUND_CACHE
+
+
+def _fetch_fundamentals(symbol: str) -> dict:
+    """
+    取得財報基本面數據。
+    台股 (*.TW / 4碼純數字)：TWSE OpenAPI（P/E、殖利率、P/B）
+    所有標的：Yahoo Finance v8 meta（52 週高低）
+    回傳 dict（找不到時回傳空 dict）
+    """
+    result: dict = {}
+
+    # 判斷是否為台灣股票
+    is_tw = symbol.upper().endswith(".TW") or (symbol.isdigit() and len(symbol) in (4, 5))
+    tw_code = symbol.upper().removesuffix(".TW") if is_tw else ""
+
+    # ── 台股：TWSE API ─────────────────────────────────────────
+    if is_tw and tw_code:
+        fund_map = _load_twse_fundamentals()
+        if tw_code in fund_map:
+            f = fund_map[tw_code]
+            result.update({k: v for k, v in f.items() if v is not None})
+
+    # ── 所有標的：Yahoo Finance v8 meta（52 週高低）────────────
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            params={"interval": "1d", "range": "5d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            meta = r.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            if meta.get("fiftyTwoWeekHigh"):
+                result["hi52"] = meta["fiftyTwoWeekHigh"]
+            if meta.get("fiftyTwoWeekLow"):
+                result["lo52"] = meta["fiftyTwoWeekLow"]
+    except Exception:
+        pass
+
+    return result
+
+
+def _fmt_fundamentals(fund: dict, currency: str = "") -> str:
+    """格式化財報數據為單行顯示"""
+    if not fund:
+        return ""
+    parts = []
+    if fund.get("pe"):
+        parts.append(f"本益比 {fund['pe']:.1f}x")
+    if fund.get("yield_pct"):
+        parts.append(f"殖利率 {fund['yield_pct']:.2f}%")
+    if fund.get("pb"):
+        parts.append(f"P/B {fund['pb']:.2f}x")
+    if fund.get("hi52") and fund.get("lo52"):
+        is_lg = fund["hi52"] > 1000
+        fmt   = (lambda v: f"{v:,.0f}") if is_lg else (lambda v: f"{v:.2f}")
+        parts.append(f"52W {fmt(fund['lo52'])}～{fmt(fund['hi52'])}")
+    return "　｜　".join(parts) if parts else ""
+
+
 def _prepare_analysis(symbol: str, name: str) -> dict:
     """
     抓取股票資料並組好 prompt，供串流版 / 同步版共用。
@@ -308,8 +423,10 @@ def _prepare_analysis(symbol: str, name: str) -> dict:
             )
         }
     display_name = name or quote.get("name", symbol)
-    news     = _fetch_news(symbol, display_name)
-    tech_txt = _fetch_tech_fast(symbol)
+    news      = _fetch_news(symbol, display_name)
+    tech_txt  = _fetch_tech_fast(symbol)
+    fund      = _fetch_fundamentals(symbol)
+    fund_line = _fmt_fundamentals(fund, quote.get("currency", ""))
 
     closes = quote.get("closes", [])
     price_history = ""
@@ -317,6 +434,10 @@ def _prepare_analysis(symbol: str, name: str) -> dict:
         is_lg = float(closes[-1]) > 1000
         fmt_p = (lambda v: f"{v:,.0f}") if is_lg else (lambda v: f"{v:,.2f}")
         price_history = "近5日收盤：" + " → ".join([fmt_p(c) for c in closes[-5:]])
+
+    fund_section = ""
+    if fund:
+        fund_section = f"\n【財報基本面】\n{fund_line}" if fund_line else ""
 
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析。
 
@@ -329,7 +450,7 @@ def _prepare_analysis(symbol: str, name: str) -> dict:
 【標的資訊】
 代碼：{symbol}　名稱：{display_name}
 現價：{quote['price']} {quote.get('currency', '')}　漲跌：{quote['change']}（{quote['pct']}）
-{price_history}
+{price_history}{fund_section}
 
 【技術指標（近3個月，Yahoo Finance + 純 Python 計算）】
 {tech_txt}
@@ -363,10 +484,13 @@ def _prepare_analysis(symbol: str, name: str) -> dict:
 
 > ⚠️ AI 生成分析，不構成投資建議。"""
 
+    # 財報資訊行（加在 header 裡）
+    fund_display = f"\n📊 {fund_line}" if fund_line else ""
+
     header = (
         f"## {quote['emoji']} **{display_name}（{symbol}）** | {now_str()}\n"
         f"**現價：{quote['price']} {quote.get('currency','')}**　"
-        f"漲跌：{quote['change']}（{quote['pct']}）\n"
+        f"漲跌：{quote['change']}（{quote['pct']}）{fund_display}\n"
         f"{'─' * 28}\n\n"
     )
     return {"error": None, "header": header, "prompt": prompt}
@@ -400,23 +524,24 @@ _MARKET_NEWS_FEEDS: dict[str, list[str]] = {
     ],
 }
 
-def _fetch_market_news(market_type: str) -> list[str]:
-    """抓取市場新聞標題（去重，最多 10 則）"""
+def _fetch_market_news(market_type: str) -> list[dict]:
+    """抓取市場新聞（去重，最多 15 則），每則含 title + link"""
     urls = _MARKET_NEWS_FEEDS.get(market_type, _MARKET_NEWS_FEEDS["台股"])
-    titles, seen = [], set()
+    articles, seen = [], set()
     for url in urls:
         try:
             feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-            for e in feed.entries[:6]:
+            for e in feed.entries[:8]:
                 t = getattr(e, "title", "").strip()
+                l = getattr(e, "link", "").strip()
                 key = re.sub(r"\s+", "", t.lower())[:30]
                 if t and key not in seen:
                     seen.add(key)
-                    titles.append(t)
+                    articles.append({"title": t, "link": l})
             time.sleep(0.3)
         except Exception:
             pass
-    return titles[:10]
+    return articles[:15]
 
 def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
     if not GITHUB_PAT:
@@ -1174,6 +1299,15 @@ def _daily_scheduler():
                 print("⏰ 啟動策略 Agent（盤後選股）", flush=True)
                 threading.Thread(target=_run_strategy_agent, daemon=True).start()
 
+            # 17:30 週五盤後：週線回顧報告
+            weekly_key = f"weekly-{now.strftime('%Y-%m-%d')}"
+            if (now.hour == 17 and 30 <= now.minute < 35
+                    and now.weekday() == 4         # 4=Friday
+                    and weekly_key not in _triggered):
+                _triggered.add(weekly_key)
+                print("⏰ 啟動週線回顧報告", flush=True)
+                threading.Thread(target=_run_weekly_review, daemon=True).start()
+
             # 每天 00:00 清除已觸發記錄
             if now.hour == 0 and now.minute == 0:
                 _triggered.clear()
@@ -1278,14 +1412,16 @@ async def cmd_新聞(interaction: discord.Interaction, 市場: app_commands.Choi
     except Exception:
         return
     try:
-        loop   = asyncio.get_running_loop()
-        titles = await loop.run_in_executor(None, _fetch_market_news, mtype)
-        if not titles:
+        loop     = asyncio.get_running_loop()
+        articles = await loop.run_in_executor(None, _fetch_market_news, mtype)
+        if not articles:
             await interaction.followup.send(f"❌ 目前無法取得 {mtype} 新聞，請稍後再試。")
             return
 
-        news_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
-        prompt = f"""你是財經新聞分析師。以下是最新的{mtype}財經新聞標題，請用繁體中文寫簡明摘要（500字以內）。
+        # 純標題清單（餵給 Claude）
+        news_text = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
+
+        prompt = f"""你是財經新聞分析師。以下是最新的{mtype}財經新聞標題，請用繁體中文寫簡明摘要（600字以內）。
 
 禁用 Markdown 表格，全程 bullet（• 開頭）。
 {mtype}慣例：🔴=漲/利多，🟢=跌/利空。
@@ -1293,23 +1429,47 @@ async def cmd_新聞(interaction: discord.Interaction, 市場: app_commands.Choi
 【新聞標題】
 {news_text}
 
-請輸出兩節：
+請輸出三節：
 
-**🔥 重要事件（3-5條最重要的）**
-• 事件 → 影響方向 → 重要性（高/中/低）
+**🔥 重點事件（3-5條最重要）**
+• 事件 → 影響方向（利多/利空）→ 重要性（高/中/低）
 
 **📊 市場影響研判**
-• 整體偏多或偏空？重點受惠/受壓族群？
+• 整體偏多或偏空？哪些族群受惠/受壓？
+
+**💡 本日觀察重點**
+• 投資人今天最需要留意的 1-2 個核心變數
 
 > ⚠️ AI 生成摘要，不構成投資建議。"""
 
         header = (
-            f"## 📰 {mtype}最新財經新聞摘要 | {now_str()}\n"
+            f"## 📰 {mtype}最新財經新聞 | {now_str()}\n"
             f"{'─' * 28}\n\n"
         )
+
+        # Phase 1：串流 AI 分析
         msg = await interaction.followup.send(header + "🔍 AI 分析新聞中... ▌")
-        full_text = await _stream_to_discord(prompt, msg, prefix=header, max_tokens=900)
-        await msg.edit(content=full_text[:2000])
+        full_text = await _stream_to_discord(prompt, msg, prefix=header, max_tokens=1000)
+
+        # Phase 2：完成後補發新聞標題清單（含連結）
+        title_lines = [f"\n📋 **新聞來源（{len(articles)} 則）**"]
+        for i, a in enumerate(articles, 1):
+            t = a["title"][:60] + ("…" if len(a["title"]) > 60 else "")
+            if a.get("link"):
+                title_lines.append(f"{i}. [{t}]({a['link']})")
+            else:
+                title_lines.append(f"{i}. {t}")
+        titles_block = "\n".join(title_lines)
+
+        # 更新主訊息（截到1900保留空間）+ 補貼標題
+        main_text = full_text[:1900]
+        chunks = _split_messages(main_text)
+        await msg.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
+        # 標題清單獨立發送
+        for chunk in _split_messages(titles_block):
+            await interaction.channel.send(chunk)
 
     except Exception as e:
         print(f"❌ /新聞 例外：{e}", flush=True)
@@ -1863,6 +2023,59 @@ async def cmd_分析權證(interaction: discord.Interaction, code: str):
             pass
 
 
+# ── /說明 ────────────────────────────────────────────────────────
+
+@tree.command(name="說明", description="所有 Discord 斜線指令說明與範例")
+async def cmd_說明(interaction: discord.Interaction):
+    text = """## 📖 指令說明手冊
+
+━━━━━━━━━━━━━━━━━━━━━━
+
+**📊 行情查詢**
+• `/查股 [代碼]` — 即時行情 + 技術指標 + AI 深度分析 + 財報數據
+  範例：`/查股 2330.TW 台積電`　`/查股 NVDA`　`/查股 ^TWII`
+• `/看板` — 個人自選股即時看板（漲跌排行，並行抓取）
+
+**📰 新聞分析**
+• `/新聞 [市場]` — 最新財經新聞 + AI 摘要 + 新聞來源連結
+  市場選項：台股 ｜ 美股 ｜ 國際
+
+**📋 個人自選股**
+• `/自選股新增 [代碼] [名稱]` — 加入自選股（最多 20 支）
+  範例：`/自選股新增 2330.TW 台積電`
+• `/自選股刪除 [代碼]` — 從清單刪除
+• `/自選股清單` — 查看目前清單
+• `/自選股分析` — 對清單所有股票做 AI 分析
+• `/自選股` — 觸發完整自選股分析報告（約 2 分鐘後在自選股頻道出現）
+
+**📈 策略明牌**
+• `/明牌 今日信號` — 查看策略 Agent 今日選出的股票
+• `/明牌 勝率統計` — 各策略近期勝率（需累積 1-2 個月）
+• `/明牌 立即執行` — 手動觸發策略掃描（背景執行，2-3 分鐘後見結果）
+
+**📉 期貨工具**
+• `/個股期 [代碼] [方向] [進場價] [口數] [規模]` — 個股期貨試算
+  規模：標準 ｜ 小型（½口）｜ 微型（⅕口）
+  範例：`/個股期 2330 買進 880 1 小型`
+• `/期貨 [商品] [方向] [進場價] [口數]` — 大盤期貨試算
+  商品：台指期 ｜ 小台 ｜ 那斯達克 ｜ S&P500 ｜ 道瓊
+
+**📜 認購權證**
+• `/查權證 [股票]` — 查詢股票的推薦認購權證（含排名分析）
+  範例：`/查權證 台積電`　`/查權證 2330`
+• `/分析權證 [代號]` — 深度分析特定權證 + 比較替代選項
+  範例：`/分析權證 038542`
+
+━━━━━━━━━━━━━━━━━━━━━━
+> 💡 **小提示**：台股格式 `代碼.TW`（如 `2330.TW`）｜ 美股直接代號（如 `NVDA`）
+> ⚠️ 所有分析均為 AI 生成，不構成投資建議"""
+
+    chunks = _split_messages(text)
+    await interaction.response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.channel.send(chunk)
+
+
 # ── /明牌 ────────────────────────────────────────────────────────
 
 @tree.command(name="明牌", description="策略 Agent 每日選股明牌 + 勝率統計")
@@ -1926,7 +2139,7 @@ async def on_ready():
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
     print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股 /新聞 /看板 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌", flush=True)
+    print(f"   指令：/查股 /新聞 /看板 /說明 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     # 策略 Agent DB 初始化（Railway Volume 路徑由 SIGNAL_DB_PATH 環境變數控制）
