@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import json
 import threading
 import asyncio
 import datetime
@@ -57,23 +58,96 @@ def now_str():
 from shared.claude_client import simple_call as _sdk_call, stream_call as _async_stream
 import watchlist_db
 
+# ── 持久化觸發紀錄（跨重啟防重複/防遺漏）──────────────────────────
+# 儲存路徑：Railway Volume 用 TRIGGER_LOG_PATH=/mnt/volume/trigger_log.json
+_TRIGGER_LOG_PATH: str = os.environ.get(
+    "TRIGGER_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "trigger_log.json"),
+)
+
+def _load_trigger_log() -> dict:
+    """讀取持久化觸發紀錄"""
+    try:
+        with open(_TRIGGER_LOG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_trigger_log(task: str, status: str = "ok") -> None:
+    """記錄任務觸發時間與狀態（持久化，保留 14 天）"""
+    today = datetime.date.today().isoformat()
+    log   = _load_trigger_log()
+    log.setdefault(today, {})[task] = {
+        "time":   datetime.datetime.now(TW_TZ).isoformat(),
+        "status": status,
+    }
+    cutoff = (datetime.date.today() - datetime.timedelta(days=14)).isoformat()
+    log    = {d: v for d, v in log.items() if d >= cutoff}
+    try:
+        with open(_TRIGGER_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ trigger_log 寫入失敗：{e}", flush=True)
+
+def _was_triggered_today(task: str) -> bool:
+    """檢查今日是否已成功觸發過該任務"""
+    today = datetime.date.today().isoformat()
+    entry = _load_trigger_log().get(today, {}).get(task, {})
+    return isinstance(entry, dict) and entry.get("status") == "ok"
+
+def _alert_task_failure(task_name: str, error_msg: str, attempt: int = 1) -> None:
+    """任務失敗時發 Discord 警報（發到 #明牌 或 DISCORD_TW）"""
+    webhook = (os.environ.get("DISCORD_STRATEGY", "")
+               or os.environ.get("DISCORD_TW", ""))
+    if not webhook:
+        return
+    ts  = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+    msg = (f"⚠️ **排程任務失敗** | `{task_name}`\n"
+           f"> 時間：{ts} TW　第 {attempt} 次嘗試\n"
+           f"```\n{str(error_msg)[:350]}\n```")
+    try:
+        requests.post(webhook, json={"content": msg}, timeout=10)
+    except Exception:
+        pass
+
 # ── Strategy Agent（延遲載入，避免啟動時 DB 不存在）────────────
 def _run_strategy_agent():
-    """在背景執行策略 Agent（盤後 17:00 觸發）"""
-    try:
-        from strategy_agent.runner import run as _strategy_run, init_db as _strategy_init
-        _strategy_init()
-        _strategy_run(dry_run=False)
-    except Exception as e:
-        print(f"❌ 策略 Agent 執行失敗：{e}", flush=True)
+    """執行策略 Agent，失敗自動重試一次，並通知 Discord"""
+    for attempt in range(1, 3):
+        try:
+            from strategy_agent.runner import run as _strategy_run
+            from strategy_agent.signal_db import init_db as _strategy_init
+            _strategy_init()
+            _strategy_run(dry_run=False)
+            _save_trigger_log("strategy", "ok")
+            print("✅ 策略 Agent 完成", flush=True)
+            return
+        except Exception as e:
+            print(f"❌ 策略 Agent 第{attempt}次失敗：{e}", flush=True)
+            if attempt < 2:
+                print("   5 分鐘後重試...", flush=True)
+                time.sleep(300)
+            else:
+                _save_trigger_log("strategy", f"failed:{e}")
+                _alert_task_failure("策略 Agent", str(e), attempt)
 
 def _run_weekly_review():
-    """在背景執行每週回顧報告（週五 17:30 觸發）"""
-    try:
-        from weekly_review import run as _weekly_run
-        _weekly_run()
-    except Exception as e:
-        print(f"❌ 週線回顧報告執行失敗：{e}", flush=True)
+    """執行週回顧報告，失敗自動重試一次，並通知 Discord"""
+    for attempt in range(1, 3):
+        try:
+            from weekly_review import run as _weekly_run
+            _weekly_run()
+            _save_trigger_log("weekly", "ok")
+            print("✅ 週回顧報告完成", flush=True)
+            return
+        except Exception as e:
+            print(f"❌ 週回顧第{attempt}次失敗：{e}", flush=True)
+            if attempt < 2:
+                print("   5 分鐘後重試...", flush=True)
+                time.sleep(300)
+            else:
+                _save_trigger_log("weekly", f"failed:{e}")
+                _alert_task_failure("週回顧報告", str(e), attempt)
 
 def _get_strategy_today() -> str:
     """取得今日策略信號摘要（給 /明牌 指令用）"""
@@ -94,6 +168,36 @@ def _get_strategy_winrate() -> str:
         return get_winrate_summary()
     except Exception as e:
         return f"❌ 無法取得勝率統計：{e}"
+
+def _startup_recovery() -> None:
+    """
+    開機時補跑遺漏的排程任務。
+    場景：Railway 在 17:01 重啟 → 前一個 process 已觸發但剛好崩潰
+          → trigger_log 顯示「未成功」→ 新 process 啟動後自動補跑。
+    補跑窗口：距原定時間 60 分鐘內才補（避免太晚補跑干擾使用者）。
+    """
+    now     = datetime.datetime.now(TW_TZ)
+    weekday = now.weekday()
+    if weekday >= 5:   # 週末不補跑
+        return
+
+    def _in_window(sched_hour: int, sched_min: int, window_min: int = 60) -> bool:
+        sched    = now.replace(hour=sched_hour, minute=sched_min, second=0, microsecond=0)
+        deadline = sched + datetime.timedelta(minutes=window_min)
+        return sched <= now < deadline
+
+    # 策略 Agent：17:00，補跑窗口 60 分鐘
+    if not _was_triggered_today("strategy") and _in_window(17, 0):
+        ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
+        print(f"⚠️ 補跑：策略 Agent（遺漏偵測，現在 {ts}）", flush=True)
+        _alert_task_failure("策略 Agent — 補跑啟動", f"偵測到今日 17:00 任務未成功，現在 {ts} 補跑。", 0)
+        threading.Thread(target=_run_strategy_agent, daemon=True).start()
+
+    # 週回顧：週五 17:30，補跑窗口 60 分鐘
+    if weekday == 4 and not _was_triggered_today("weekly") and _in_window(17, 30):
+        ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
+        print(f"⚠️ 補跑：週回顧報告（遺漏偵測，現在 {ts}）", flush=True)
+        threading.Thread(target=_run_weekly_review, daemon=True).start()
 
 def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
     """
@@ -561,6 +665,19 @@ def _trigger_workflow(workflow_file: str, inputs: dict) -> tuple[bool, str]:
         return False, f"HTTP {r.status_code}"
     except Exception as e:
         return False, str(e)[:80]
+
+def _trigger_workflow_with_retry(workflow_file: str, inputs: dict,
+                                  max_attempts: int = 3) -> tuple[bool, str]:
+    """觸發 GitHub Actions workflow，失敗自動重試（指數退避 30s / 60s）"""
+    err = "未知錯誤"
+    for attempt in range(1, max_attempts + 1):
+        ok, err = _trigger_workflow(workflow_file, inputs)
+        if ok:
+            return True, ""
+        print(f"⚠️ 觸發 {workflow_file} 失敗（第{attempt}次）：{err}", flush=True)
+        if attempt < max_attempts:
+            time.sleep(30 * (2 ** (attempt - 1)))   # 30s → 60s
+    return False, err
 
 # ── 定時觸發日報（Railway 永遠在線，取代不可靠的 GitHub cron）────
 
@@ -1244,80 +1361,102 @@ def _update_warrant_prices_bg():
 
 
 def _daily_scheduler():
-    """在 TW 08:00 / 15:00 / 22:00 觸發 GitHub Actions 日報；16:30 更新權證收盤價"""
-    _triggered   = set()
-    _trigger_ts  = {}   # key → datetime，防止重啟後雙實例在 10 分鐘內重複觸發
-    DAILY_HOURS   = {8: "morning", 15: "afternoon", 22: "evening"}
+    """
+    定時排程主迴圈（30 秒輪詢）
+    ─────────────────────────────────────────────────────────
+    日報：08:00 / 15:00 / 22:00  → 觸發 GitHub Actions（帶重試）
+    Podcast：09:00 / 21:00       → 觸發 GitHub Actions（帶重試）
+    收盤更新：16:30              → 本地執行（權證價格 + 生命週期）
+    策略 Agent：17:00 週一～五   → 本地執行（帶重試 + 持久化紀錄）
+    週回顧報告：17:30 週五       → 本地執行（帶重試 + 持久化紀錄）
+
+    防重複機制（雙層）：
+      Layer 1（in-memory）：_triggered set — 同 process 內不重複
+      Layer 2（persistent）：trigger_log.json — 跨重啟不重複、不遺漏
+    ─────────────────────────────────────────────────────────
+    """
+    _triggered   = set()      # Layer 1：in-memory（process 重啟後清空）
+    _trigger_ts  = {}         # 時間戳記，防 10 分鐘內雙送
+    DAILY_HOURS   = {8: "早報", 15: "午報", 22: "晚報"}
     PODCAST_HOURS = {9, 21}
 
-    # ── 啟動保護：隨機等待 0-8 秒，避免重啟時兩個實例同時觸發 ──
     import random
-    time.sleep(random.uniform(0, 8))
+    time.sleep(random.uniform(0, 8))   # 啟動保護：避免多個 process 同時觸發
 
     while True:
         try:
             now = datetime.datetime.now(TW_TZ)
             key = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
 
+            # ── 日報 / Podcast（整點觸發，:00～:04）────────────────
             if now.minute < 5 and key not in _triggered:
-                # 額外保護：同一 key 10 分鐘內不重複觸發（防重啟雙實例）
-                last_ts = _trigger_ts.get(key)
+                last_ts  = _trigger_ts.get(key)
                 too_soon = last_ts and (now - last_ts).total_seconds() < 600
 
                 if not too_soon:
                     if now.hour in DAILY_HOURS and GITHUB_PAT:
-                        ok, err = _trigger_workflow("stock-daily.yml", {})
-                        status  = '✅' if ok else f'❌ {err}'
-                        print(f"⏰ 觸發{DAILY_HOURS[now.hour]}日報 {status}", flush=True)
+                        ok, err = _trigger_workflow_with_retry("stock-daily.yml", {})
+                        status  = "✅" if ok else f"❌ {err}"
+                        print(f"⏰ 觸發{DAILY_HOURS[now.hour]} {status}", flush=True)
+                        if not ok:
+                            _alert_task_failure(f"日報觸發（{DAILY_HOURS[now.hour]}）", err)
                         _triggered.add(key)
                         if ok:
                             _trigger_ts[key] = now
+
                     elif now.hour in PODCAST_HOURS and GITHUB_PAT:
-                        ok, err = _trigger_workflow("podcast.yml", {})
-                        status  = '✅' if ok else f'❌ {err}'
-                        print(f"⏰ 觸發Podcast追蹤 {status}", flush=True)
+                        ok, err = _trigger_workflow_with_retry("podcast.yml", {})
+                        status  = "✅" if ok else f"❌ {err}"
+                        print(f"⏰ 觸發Podcast {status}", flush=True)
                         _triggered.add(key)
                         if ok:
                             _trigger_ts[key] = now
                 else:
-                    print(f"⏰ 排程：{key} 10分鐘內已觸發，跳過（防重啟雙送）", flush=True)
+                    print(f"⏰ {key} 10分鐘內已觸發，跳過", flush=True)
                     _triggered.add(key)
 
-            # 16:30 收盤後：批量更新價格 + 同步生命週期狀態
+            # ── 收盤更新 16:30（Layer 1 防重複即可）────────────────
             price_key = f"price-{now.strftime('%Y-%m-%d')}"
             if now.hour == 16 and 30 <= now.minute < 35 and price_key not in _triggered:
                 _triggered.add(price_key)
                 threading.Thread(target=_update_warrant_prices_bg, daemon=True).start()
                 threading.Thread(target=warrant_db.sync_warrant_status, daemon=True).start()
 
-            # 17:00 盤後（週一～五）：執行策略 Agent（選股掃描 + 信號更新 + Discord 明牌）
+            # ── 策略 Agent 17:00 週一～五（雙層防重複）──────────────
             strategy_key = f"strategy-{now.strftime('%Y-%m-%d')}"
             if (now.hour == 17 and now.minute < 5
-                    and now.weekday() < 5          # 0=Mon … 4=Fri
-                    and strategy_key not in _triggered):
+                    and now.weekday() < 5
+                    and strategy_key not in _triggered
+                    and not _was_triggered_today("strategy")):   # ← Layer 2
                 _triggered.add(strategy_key)
                 print("⏰ 啟動策略 Agent（盤後選股）", flush=True)
                 threading.Thread(target=_run_strategy_agent, daemon=True).start()
 
-            # 17:30 週五盤後：週線回顧報告
+            # ── 週回顧報告 17:30 週五（雙層防重複）──────────────────
             weekly_key = f"weekly-{now.strftime('%Y-%m-%d')}"
             if (now.hour == 17 and 30 <= now.minute < 35
-                    and now.weekday() == 4         # 4=Friday
-                    and weekly_key not in _triggered):
+                    and now.weekday() == 4
+                    and weekly_key not in _triggered
+                    and not _was_triggered_today("weekly")):     # ← Layer 2
                 _triggered.add(weekly_key)
-                print("⏰ 啟動週線回顧報告", flush=True)
+                print("⏰ 啟動週回顧報告", flush=True)
                 threading.Thread(target=_run_weekly_review, daemon=True).start()
 
-            # 每天 00:00 清除已觸發記錄
-            if now.hour == 0 and now.minute == 0:
-                _triggered.clear()
-                _trigger_ts.clear()
+            # ── 每天 00:00 清空 in-memory set（持久化 log 自然滾動）─
+            if now.hour == 0 and now.minute < 1:
+                if _triggered:
+                    _triggered.clear()
+                    _trigger_ts.clear()
+                    print("⏰ 每日 00:00 清空觸發記錄", flush=True)
+
         except Exception as e:
             print(f"⚠️ 排程例外：{e}", flush=True)
         time.sleep(30)
 
+# ── 開機補跑：若在排程窗口內啟動，自動補跑遺漏任務 ─────────────
+threading.Thread(target=_startup_recovery, daemon=True).start()
 threading.Thread(target=_daily_scheduler, daemon=True).start()
-print("⏰ 排程啟動（日報 08/15/22:00、Podcast 09/21:00 TW）", flush=True)
+print("⏰ 排程啟動（日報 08/15/22:00、Podcast 09/21:00 TW；策略 17:00；週回顧 Fri 17:30）", flush=True)
 
 # ── Discord Bot ───────────────────────────────────────────────
 
