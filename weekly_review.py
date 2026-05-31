@@ -56,6 +56,7 @@ except ImportError:
 
 DISCORD_URL = (
     os.environ.get("DISCORD_WEEKLY", "")
+    or os.environ.get("DISCORD_STRATEGY", "")   # 明牌頻道優先
     or os.environ.get("DISCORD_TW", "")
     or os.environ.get("DISCORD_WATCHLIST", "")
 )

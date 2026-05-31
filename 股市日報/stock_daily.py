@@ -1222,7 +1222,7 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
     t1_count = sum(1 for v in tier_result['classifications'].values() if v == 'tier1')
 
     prompt = f"""你是資深股票分析師。以下提供程式預處理後的結構化資料，請用你的分析判斷力進行深度研判。
-禁空話，禁 Markdown 表格，全程 bullet（•）。總字數 1400 字以內。{stale_note}
+禁空話，禁 Markdown 表格，全程 bullet（•）。總字數 1800 字以內。{stale_note}
 
 ━━━ 標的 ━━━
 {name}（{symbol}）現價 {quote.get('price','N/A')} {quote.get('currency','')} 漲跌 {quote.get('change','N/A')}（{quote.get('pct','N/A')}）{' ' + price_history if price_history else ''}
@@ -1243,41 +1243,36 @@ def analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = ""
 {news_ctx if news_ctx else '（暫無新聞）'}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PHASE 2 與 3 格式說明：
-• 不需要按固定章節逐一填寫，以邏輯流暢為主
-• 必須涵蓋以下四個核心任務，順序與篇幅由你自由調配
-• 數值帶括號標注來源（技術/籌碼/基本面/消息/期貨）
+以下五個章節為【必填】，每節至少 2-3 bullet，數值務必帶括號標注來源（技術/籌碼/基本面/消息）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## ▌PHASE 2：邏輯推論層
+## ▌近期走勢解讀
+• 近 5 日價格行為的核心驅動力（技術突破？籌碼主導？消息催化？估值修正？）— 識別 1-2 個主因及其相對重要性
+• 此驅動力屬於「短暫脈衝」（1-5 日消散）還是「持續結構」（趨勢改變）？說明判斷依據
+• Tier 1 訊號整合：多個訊號是互相強化還是存在矛盾？整合後的整體方向為何？
 
-**核心任務 A — 歸因分析（Attribution Analysis）**
-這支股票近期的價格表現，主要由什麼驅動？
-• 請識別 1-3 個主因，說明：是技術突破？籌碼主導？消息催化？總體環境？估值修正？
-• 各因素的相對重要性（哪個主導、哪個輔助）
-• 這個驅動力是「短暫脈衝」（1-5日消散）還是「持續結構」（趨勢改變）？判斷依據？
-• 若驅動力尚不明確，列出 2-3 個競爭性假說，並標注目前哪個最有支持證據
+## ▌技術面深度分析
+• 趨勢結構：目前位於上升 / 下降 / 盤整哪種趨勢？關鍵均線（MA5/MA20/MA60）排列與支撐壓力（帶具體價位）
+• 量價型態：成交量配合程度，近期是否出現量能異常（爆量 / 縮量 / 背離）？
+• 重要技術位：近一個月最強支撐位與最重壓力位（帶具體價格）、目前距離各自幾 %
+• 動能指標解讀：RSI 目前數值與方向、MACD 柱體縮擴、布林帶開口變化，各自傳遞何種訊號
 
-**核心任務 B — 分級訊號整合**
-以 Tier 1 訊號為主軸，整合各維度的觀察：
-• Tier 1 訊號互相強化還是矛盾？整合後的方向是什麼？
-• 哪些 Tier 2 訊號最值得關注（不需全部列舉，選最相關的 1-2 個）
-• 若有訊號衝突，說明以哪個為主及理由
+## ▌籌碼面分析
+• 三大法人近 5 日動向（若有資料）：外資 / 投信 / 自營商各自買賣超方向與金額
+• 若籌碼資料不足，說明替代觀察指標（如：融資融券餘額、大戶持股比例、法人連買/連賣天數）
+• 籌碼面整體是否支持目前的價格方向？給出明確判斷
 
-**核心任務 C — AI 自由觀察（框架外洞見）**
-在上述分析之外，你還注意到什麼值得關注的異常或模式？
-（可以是：量價型態、歷史類比、跨資產訊號、行為偏誤、籌碼異常、產業週期定位等任何觀察）
-若確實無特別洞察，這段可以省略，不強制。
+## ▌基本面概況
+• 產業定位：在所屬族群中的競爭地位（龍頭 / 跟隨者 / 利基廠），主要護城河
+• 近期基本面事件：最新財報重點、法說重點、重大訂單或合作（若消息欄有提及，帶具體數字）
+• 估值合理性：若有 P/E、殖利率、P/B 等數據，說明目前是否合理偏高/偏低
+• 近期潛在催化劑或下行風險（產業週期、政策、競爭對手動態）
 
-## ▌PHASE 3：決策層
-
-**核心任務 D — 多空並陳與操作框架**
-基於以上推論，形成判斷。以下內容必須涵蓋，但格式自由：
-• 多方核心論點（主要理由 + 目標價位）
-• 空方核心論點（主要風險 + 關鍵壓力位）
-• 若你的結論是錯的，最脆弱的假設是什麼？
-• 操作框架：進場條件 → 目標 → 停損（帶具體價位），風報比
-• 信心水準（高/中/低）+ 最大不確定因子
+## ▌操作建議
+• 多方論點（至少 2 點，帶具體目標價與理由）
+• 空方風險（至少 2 點，帶關鍵壓力位 / 停損位與觸發條件）
+• 操作框架：進場條件 → 短線目標（帶價位） → 停損（帶價位），預估風報比
+• 信心水準（高 / 中 / 低）+ 最大不確定因子（一句話點出最重要的未知變數）
   ※ 本次 Tier 1 訊號共 {t1_count} 個，作為信心評估基礎
 
 > ⚠️ AI 生成，不構成投資建議。"""
@@ -1285,33 +1280,72 @@ PHASE 2 與 3 格式說明：
     return _strip_md_tables(raw)
 
 def ai_pick_watchlist(candidates: list, market_ctx: str) -> list:
-    """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔"""
+    """讓 Claude 從候選股中挑選當日最值得追蹤的 2-3 檔，提供詳細選股理由"""
     cand_list = "\n".join([f"{s['name']}（{s['symbol']}）" for s in candidates])
     prompt = f"""台股選股，{now_str()}。從候選股選2-3檔今日最值得追蹤的個股。
-優先：①今日有催化劑（法說/財報/訂單）②技術關鍵位 ③當日主旋律龍頭
+選股準則：①今日有催化劑（法說/財報/訂單/AI題材）②技術關鍵位突破或守穩 ③當日市場主旋律龍頭
 
-【今日行情】
+【今日大盤行情】
 {market_ctx}
-【候選股】
+
+【候選股清單】
 {cand_list}
 
-只輸出格式，不加其他文字：
-PICK:代號|原因（一句話帶具體數字）
-範例：PICK:2330.TW|CoWoS爆單，本周站穩1000元"""
-    response = claude_call(prompt, max_tokens=200, model=CLAUDE_MINI_MODEL)
+輸出格式（每檔一段，嚴格遵守，不加其他文字）：
+
+PICK:代號|股票名稱
+理由1: 技術面 — （說明技術訊號，帶具體數字，如：站上20日均線，RSI由32反彈至48）
+理由2: 催化劑 — （說明消息面或基本面催化；無重大消息則填「技術主導，無重大消息面」）
+理由3: 大盤配合度 — （今日大盤環境是否有利，說明族群聯動或資金流向）
+理由4: 目標位 — （短線目標價或上方壓力位，以及停損參考位）
+理由5: 風險提示 — （一個最大下行風險，如法規、競爭、總經）
+
+---（每檔之間用三條橫線隔開）---
+
+範例：
+PICK:2330.TW|台積電
+理由1: 技術面 — 站回1000元整數關卡，5日均線向上穿越20日均線形成黃金交叉，RSI 55仍有上行空間
+理由2: 催化劑 — CoWoS封裝需求強勁，法人預估Q3 EPS上修至15元，外資連買3日共10萬張
+理由3: 大盤配合度 — 費城半導體指數昨大漲2.3%，AI族群資金回流，台積電ADR溢價1.5%
+理由4: 目標位 — 短線目標1050-1080元（前高壓力），跌破980元止損
+理由5: 風險提示 — 美中科技管制升溫恐影響先進製程出口許可，需注意地緣政治新聞"""
+
+    response = claude_call(prompt, max_tokens=800, model=CLAUDE_MINI_MODEL)
     picks = []
+    current_symbol: str | None = None
+    current_candidate: dict | None = None
+    current_reasons: list[str] = []
+
+    def _save_current():
+        nonlocal current_symbol, current_candidate, current_reasons
+        if current_symbol and current_candidate and current_reasons:
+            reason_text = "\n".join(current_reasons)
+            picks.append({**current_candidate, "ai_reason": reason_text})
+        current_symbol = None
+        current_candidate = None
+        current_reasons = []
+
     for line in response.split("\n"):
         line = line.strip()
+        if not line or line.startswith("---"):
+            if current_symbol:
+                _save_current()
+            continue
         if line.startswith("PICK:"):
+            _save_current()
             try:
                 parts = line[5:].split("|", 1)
-                symbol = parts[0].strip()
-                reason = parts[1].strip() if len(parts) > 1 else ""
-                match = next((c for c in candidates if c["symbol"] == symbol), None)
-                if match:
-                    picks.append({**match, "ai_reason": reason})
+                current_symbol = parts[0].strip()
+                current_candidate = next((c for c in candidates if c["symbol"] == current_symbol), None)
+                current_reasons = []
             except Exception:
-                pass
+                current_symbol = None
+                current_candidate = None
+        elif line.startswith("理由") and current_candidate is not None:
+            current_reasons.append(line)
+
+    _save_current()  # 儲存最後一檔
+
     if not picks:  # fallback：AI 解析失敗就取前兩名
         picks = [{**c, "ai_reason": "AI 精選"} for c in candidates[:2]]
     return picks[:3]
@@ -1343,10 +1377,15 @@ def run_watchlist_report():
     fixed_syms = {w["symbol"] for w in watchlist}
     full_list  = list(watchlist) + [p for p in ai_picks if p["symbol"] not in fixed_syms]
 
-    picks_desc = "\n".join([
-        f"• **{p['name']}（{p['symbol']}）** — {p.get('ai_reason', 'AI 精選')}"
-        for p in ai_picks
-    ])
+    def _fmt_pick_summary(p: dict) -> str:
+        reason_lines = [l for l in p.get("ai_reason", "AI 精選").split("\n") if l.strip()]
+        header = f"▸ **{p['name']}（{p['symbol']}）**"
+        if len(reason_lines) <= 1:
+            return f"{header} — {reason_lines[0] if reason_lines else 'AI 精選'}"
+        body = "\n".join(f"　{l}" for l in reason_lines)
+        return f"{header}\n{body}"
+
+    picks_desc = "\n\n".join([_fmt_pick_summary(p) for p in ai_picks])
 
     send_embed(DISCORD_WATCHLIST, {
         "title":       f"📊 自選股日報 {session_info['emoji']} {session_info['label']} {weekend_banner}| {ts}",
@@ -1375,7 +1414,11 @@ def run_watchlist_report():
         time.sleep(1)
 
         stale_tag = " ⚠️未更新" if quote.get("stale") else ""
-        ai_tag    = f"\n> 🤖 AI 精選理由：{stock.get('ai_reason', '')}" if stock.get("ai_reason") else ""
+        if stock.get("ai_reason"):
+            reason_lines = [l for l in stock["ai_reason"].split("\n") if l.strip()]
+            ai_tag = "\n**🤖 AI 精選理由：**\n" + "\n".join(f"> {l}" for l in reason_lines)
+        else:
+            ai_tag = ""
         send_discord_message(
             DISCORD_WATCHLIST,
             f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — {quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}{ai_tag}\n\n{analysis}"
