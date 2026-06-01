@@ -205,38 +205,44 @@ def _get_strategy_winrate() -> str:
 def _startup_recovery() -> None:
     """
     開機時補跑遺漏的排程任務。
-    場景：Railway 在 17:01 重啟 → 前一個 process 已觸發但剛好崩潰
-          → trigger_log 顯示「未成功」→ 新 process 啟動後自動補跑。
-    補跑窗口：距原定時間 60 分鐘內才補（避免太晚補跑干擾使用者）。
+    ─────────────────────────────────────────────────────────────
+    窗口設計：「±5 分鐘」，非「45/60 分鐘」
+    ─────────────────────────────────────────────────────────────
+    舊問題（45 分鐘窗口）：
+      Railway 在任意時間重新部署（push 程式碼）→ bot 重啟
+      → 補跑誤判 → 在 18:xx 或 01:xx 多送一條訊息
+
+    新設計（5 分鐘窗口）：
+      只有 bot 在觸發時間「前後 5 分鐘」內重啟，才觸發補跑
+      例：Railway 在 14:56～15:02 重啟 → 補跑午報 ✅
+          Railway 在 18:xx 重啟 → 窗口早已過，不觸發 ✅
     """
-    now     = datetime.datetime.now(TW_TZ)
-    weekday = now.weekday()
-    if weekday >= 5:   # 週末不補跑
-        return
+    now = datetime.datetime.now(TW_TZ)
 
-    def _in_window(sched_hour: int, sched_min: int, window_min: int = 60) -> bool:
-        sched    = now.replace(hour=sched_hour, minute=sched_min, second=0, microsecond=0)
-        deadline = sched + datetime.timedelta(minutes=window_min)
-        return sched <= now < deadline
+    def _in_narrow_window(trigger_hour: int, trigger_min: int, window_min: int = 5) -> bool:
+        """觸發點前 1 分鐘 ~ 後 window_min 分鐘"""
+        trigger_dt = now.replace(hour=trigger_hour, minute=trigger_min, second=0, microsecond=0)
+        start      = trigger_dt - datetime.timedelta(minutes=1)
+        end        = trigger_dt + datetime.timedelta(minutes=window_min)
+        return start <= now < end
 
-    # 日報補跑（補跑窗口 45 分鐘）
-    for sched_h, (label, session) in {8: ("早報", "morning"), 15: ("午報", "afternoon"), 22: ("晚報", "evening")}.items():
-        if not _was_triggered_today(f"daily_{session}") and _in_window(sched_h, 0, window_min=45):
-            ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
-            print(f"⚠️ 補跑：{label}（遺漏偵測，現在 {ts}）", flush=True)
+    # 日報補跑（觸發時間 :57，窗口 :56～:02，僅 5 分鐘）
+    for trigger_h, (label, session) in {7: ("早報", "morning"), 14: ("午報", "afternoon"), 21: ("晚報", "evening")}.items():
+        if not _was_triggered_today(f"daily_{session}") and _in_narrow_window(trigger_h, 57):
+            ts = now.strftime("%H:%M")
+            print(f"⚠️ 補跑：{label}（窗口內重啟偵測，現在 {ts}）", flush=True)
             threading.Thread(target=_run_daily_report, args=(session,), daemon=True).start()
 
-    # 策略 Agent：17:00，補跑窗口 60 分鐘
-    if not _was_triggered_today("strategy") and _in_window(17, 0):
-        ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
-        print(f"⚠️ 補跑：策略 Agent（遺漏偵測，現在 {ts}）", flush=True)
-        _alert_task_failure("策略 Agent — 補跑啟動", f"偵測到今日 17:00 任務未成功，現在 {ts} 補跑。", 0)
+    # 策略 Agent：17:00，補跑窗口 5 分鐘（16:59～17:05）
+    if not _was_triggered_today("strategy") and _in_narrow_window(17, 0):
+        ts = now.strftime("%H:%M")
+        print(f"⚠️ 補跑：策略 Agent（現在 {ts}）", flush=True)
         threading.Thread(target=_run_strategy_agent, daemon=True).start()
 
-    # 週回顧：週五 17:30，補跑窗口 60 分鐘
-    if weekday == 4 and not _was_triggered_today("weekly") and _in_window(17, 30):
-        ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
-        print(f"⚠️ 補跑：週回顧報告（遺漏偵測，現在 {ts}）", flush=True)
+    # 週回顧：週五 17:30，補跑窗口 5 分鐘
+    if now.weekday() == 4 and not _was_triggered_today("weekly") and _in_narrow_window(17, 30):
+        ts = now.strftime("%H:%M")
+        print(f"⚠️ 補跑：週回顧報告（現在 {ts}）", flush=True)
         threading.Thread(target=_run_weekly_review, daemon=True).start()
 
 def _claude_call(prompt: str, max_tokens: int = 1600) -> str:
@@ -1504,11 +1510,8 @@ def _daily_scheduler():
             print(f"⚠️ 排程例外：{e}", flush=True)
         time.sleep(15)   # 縮短輪詢間隔：30s → 15s（減少最大誤差）
 
-# ── 開機補跑：已停用 ────────────────────────────────────────────
-# 排程訊息已準時到達，補跑反而在 Railway 重新部署後觸發額外訊息
-# 每次 push 程式碼 → bot 重啟 → 補跑誤判 → 在奇怪的時間多送一條
-# 停用後：只有固定時間（07:57/14:57/21:57/17:00/17:30）才會發訊息
-# threading.Thread(target=_startup_recovery, daemon=True).start()
+# ── 開機補跑：±5 分鐘窄窗口（防止 18:xx/01:xx 誤觸發）──────────
+threading.Thread(target=_startup_recovery, daemon=True).start()
 threading.Thread(target=_daily_scheduler, daemon=True).start()
 print("⏰ 排程啟動（日報 07:57/14:57/21:57 提前啟動→08/15/22:00 準時到達；策略 17:00；週回顧 Fri 17:30）", flush=True)
 
