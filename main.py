@@ -1414,26 +1414,30 @@ def _daily_scheduler():
     """
     _triggered   = set()      # Layer 1：in-memory（process 重啟後清空）
     _trigger_ts  = {}         # 時間戳記，防 10 分鐘內雙送
-    # 時間 → (顯示名稱, report_session 參數)
+    # ──────────────────────────────────────────────────────────────
+    # 觸發時間「提前 3 分鐘」設計：
+    #   日報任務執行需 3~5 分鐘（API 抓取 + Claude + 多頻道發送）
+    #   07:57 啟動 → Discord 訊息約 08:00 準時到達
+    #   key 仍用 trigger_hour 避免與策略 Agent key 衝突
     # ⚠️ GitHub Actions cron 已停用（延遲不可控），由 Railway 統一排程
-    # Railway 觸發時明確傳入 report_session，避免 GitHub 排隊後跑錯時段
+    # ──────────────────────────────────────────────────────────────
     DAILY_HOURS   = {
-        8:  ("早報", "morning"),
-        15: ("午報", "afternoon"),
-        22: ("晚報", "evening"),
+        7:  ("早報", "morning"),    # 07:57 啟動 → 08:00 準時到達
+        14: ("午報", "afternoon"),  # 14:57 啟動 → 15:00 準時到達
+        21: ("晚報", "evening"),    # 21:57 啟動 → 22:00 準時到達
     }
-    PODCAST_HOURS = {9, 21}
+    PODCAST_HOURS = {8, 20}        # Podcast：08:57/20:57 啟動（原 09/21）
 
     import random
-    time.sleep(random.uniform(0, 8))   # 啟動保護：避免多個 process 同時觸發
+    time.sleep(random.uniform(0, 5))   # 啟動保護：縮短到 5 秒
 
     while True:
         try:
             now = datetime.datetime.now(TW_TZ)
             key = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
 
-            # ── 日報 / Podcast（整點觸發，:00～:04）────────────────
-            if now.minute < 5 and key not in _triggered:
+            # ── 日報 / Podcast（整點前 3 分鐘觸發，:57～:59）─────────
+            if 57 <= now.minute and key not in _triggered:
                 last_ts  = _trigger_ts.get(key)
                 too_soon = last_ts and (now - last_ts).total_seconds() < 600
 
@@ -1443,7 +1447,7 @@ def _daily_scheduler():
                         # 直接在 Railway 執行，不透過 GitHub Actions（消除排隊延遲）
                         _triggered.add(key)
                         _trigger_ts[key] = now
-                        print(f"⏰ 啟動{label}（Railway 直接執行）", flush=True)
+                        print(f"⏰ 啟動{label}（提前 3 分鐘，Railway 直接執行）", flush=True)
                         threading.Thread(
                             target=_run_daily_report, args=(session,), daemon=True
                         ).start()
@@ -1495,12 +1499,12 @@ def _daily_scheduler():
 
         except Exception as e:
             print(f"⚠️ 排程例外：{e}", flush=True)
-        time.sleep(30)
+        time.sleep(15)   # 縮短輪詢間隔：30s → 15s（減少最大誤差）
 
 # ── 開機補跑：若在排程窗口內啟動，自動補跑遺漏任務 ─────────────
 threading.Thread(target=_startup_recovery, daemon=True).start()
 threading.Thread(target=_daily_scheduler, daemon=True).start()
-print("⏰ 排程啟動（日報 08/15/22:00、Podcast 09/21:00 TW；策略 17:00；週回顧 Fri 17:30）", flush=True)
+print("⏰ 排程啟動（日報 07:57/14:57/21:57 提前啟動→08/15/22:00 準時到達；策略 17:00；週回顧 Fri 17:30）", flush=True)
 
 # ── Discord Bot ───────────────────────────────────────────────
 
