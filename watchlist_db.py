@@ -132,3 +132,34 @@ def clear_watchlist(user_id: str, guild_id: str) -> int:
                 (user_id, guild_id),
             )
             return r.rowcount
+
+
+def get_all_symbols(guild_id: str | None = None) -> list[dict]:
+    """
+    取得 DB 中所有不重複的自選股（供日報使用）。
+    guild_id 非空時只取該伺服器的，留空取全部。
+    回傳格式：[{"symbol": str, "name": str}, ...]，依 symbol 排序。
+    name 欄位取各用戶填入的最長名稱（較有意義的那個）。
+    """
+    try:
+        with _conn() as c:
+            if guild_id:
+                rows = c.execute("""
+                    SELECT symbol,
+                           MAX(CASE WHEN LENGTH(name) > 0 THEN name ELSE symbol END) AS name
+                    FROM user_watchlist
+                    WHERE guild_id = ?
+                    GROUP BY symbol
+                    ORDER BY symbol
+                """, (guild_id,)).fetchall()
+            else:
+                rows = c.execute("""
+                    SELECT symbol,
+                           MAX(CASE WHEN LENGTH(name) > 0 THEN name ELSE symbol END) AS name
+                    FROM user_watchlist
+                    GROUP BY symbol
+                    ORDER BY symbol
+                """).fetchall()
+        return [{"symbol": r["symbol"], "name": r["name"]} for r in rows]
+    except Exception:
+        return []

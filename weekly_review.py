@@ -207,7 +207,7 @@ def build_report(
         d = market_data.get(sym)
         if not d:
             continue
-        emoji = "🔴" if d["weekly_pct"] > 0 else ("🟢" if d["weekly_pct"] < 0 else "⬛")
+        emoji = "🟢" if d["weekly_pct"] > 0 else ("🔴" if d["weekly_pct"] < 0 else "⬛")
         # 特殊指標（VIX 上升 = 恐慌，用反色）
         if "VIX" in label or "恐慌" in label:
             emoji = "⚠️" if d["weekly_pct"] > 5 else ("📉" if d["weekly_pct"] < -5 else "🟡")

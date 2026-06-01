@@ -1,17 +1,12 @@
 name: 台股日報自動發送（每天含週六日）
 
 on:
-  schedule:
-    # 台灣時間 08:00 = UTC 00:00 前5分鐘（加上排隊延遲約到 08:00±5min）
-    - cron: '55 23 * * *'
-    # 台灣時間 14:00 = UTC 06:00 前5分鐘
-    - cron: '55 5 * * *'
-    # 台灣時間 22:00 = UTC 14:00 前5分鐘
-    - cron: '55 13 * * *'
+  # ⚠️ GitHub Actions cron 已停用：延遲不可控（最差可達數小時），改由 Railway bot 定時觸發
+  # Railway bot 在 08:00 / 15:00 / 22:00 TW 呼叫 workflow_dispatch 並明確指定 report_session
   workflow_dispatch:
     inputs:
       report_session:
-        description: '指定時段（空白=自動偵測）'
+        description: '指定時段（morning=早報 / afternoon=午報 / evening=晚報 / 空白=自動偵測）'
         required: false
         default: ''
         type: choice

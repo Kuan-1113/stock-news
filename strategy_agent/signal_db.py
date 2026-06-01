@@ -60,6 +60,7 @@ def init_db() -> None:
                     sent_discord     INTEGER NOT NULL DEFAULT 0,
                     confidence_stars INTEGER NOT NULL DEFAULT 1,  -- ⭐1/⭐⭐2/⭐⭐⭐3
                     strategy_type    TEXT    NOT NULL DEFAULT 'technical', -- technical/chip
+                    is_backtest      INTEGER NOT NULL DEFAULT 0,  -- 0=真實信號 1=歷史回測
                     UNIQUE(date, symbol, strategy)
                 )
             """)
@@ -75,6 +76,9 @@ def init_db() -> None:
             if "strategy_type" not in existing_cols:
                 c.execute("ALTER TABLE signals ADD COLUMN strategy_type TEXT NOT NULL DEFAULT 'technical'")
                 print("  ✅ migration: 加入 strategy_type 欄位")
+            if "is_backtest" not in existing_cols:
+                c.execute("ALTER TABLE signals ADD COLUMN is_backtest INTEGER NOT NULL DEFAULT 0")
+                print("  ✅ migration: 加入 is_backtest 欄位")
 
     print(f"  ✅ signal_db 初始化完成（{DB_PATH}）")
 
@@ -86,6 +90,7 @@ def add_signal(
     etf_source: str, strategy: str, entry_price: float,
     confidence_stars: int = 1,
     strategy_type: str = "technical",
+    is_backtest: int = 0,
 ) -> bool:
     """新增信號（IGNORE ON CONFLICT 確保冪等）"""
     with _lock:
@@ -93,10 +98,40 @@ def add_signal(
             cur = c.execute("""
                 INSERT OR IGNORE INTO signals
                   (date, symbol, name, etf_source, strategy, entry_price,
-                   confidence_stars, strategy_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   confidence_stars, strategy_type, is_backtest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (date, symbol, name, etf_source, strategy,
-                  round(entry_price, 2), confidence_stars, strategy_type))
+                  round(entry_price, 2), confidence_stars, strategy_type, is_backtest))
+            return cur.rowcount > 0
+
+
+def add_backtest_signal(
+    date: str, symbol: str, name: str,
+    etf_source: str, strategy: str, entry_price: float,
+    price_5d: float | None = None,
+    price_10d: float | None = None,
+    result_5d: float | None = None,
+    result_10d: float | None = None,
+    win_5d: int | None = None,
+    win_10d: int | None = None,
+) -> bool:
+    """
+    新增回測信號（含預計算 5d/10d 結果，is_backtest=1）。
+    供 backtest.py 一次性寫入歷史回測資料使用。
+    """
+    with _lock:
+        with _conn() as c:
+            cur = c.execute("""
+                INSERT OR IGNORE INTO signals
+                  (date, symbol, name, etf_source, strategy, entry_price,
+                   is_backtest, confidence_stars, strategy_type,
+                   price_5d, price_10d, result_5d, result_10d, win_5d, win_10d)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'technical', ?, ?, ?, ?, ?, ?)
+            """, (date, symbol, name, etf_source, strategy,
+                  round(entry_price, 2),
+                  price_5d, price_10d,
+                  result_5d, result_10d,
+                  win_5d, win_10d))
             return cur.rowcount > 0
 
 
@@ -114,8 +149,9 @@ def update_confidence_stars(date: str, symbol: str, stars: int) -> None:
 
 def get_pending_signals(max_days: int = 15) -> list:
     """
-    取得還沒更新 result 的歷史信號。
+    取得還沒更新 result 的真實信號（is_backtest=0）。
     只看 max_days 天內（太久以前就跳過）。
+    回測信號的 result 在寫入時已預計算，不需二次更新。
     """
     cutoff = (datetime.date.today() - datetime.timedelta(days=max_days)).isoformat()
     with _conn() as c:
@@ -124,6 +160,7 @@ def get_pending_signals(max_days: int = 15) -> list:
             FROM signals
             WHERE date >= ?
               AND (win_5d IS NULL OR win_10d IS NULL)
+              AND is_backtest = 0
             ORDER BY date ASC
         """, (cutoff,)).fetchall()
 
@@ -209,14 +246,22 @@ def mark_sent(signal_ids: list[int]) -> None:
 # ── 統計摘要 ──────────────────────────────────────────────────────
 
 def get_summary_stats() -> dict:
-    """取得整體統計（給 /明牌 指令顯示）"""
+    """
+    取得整體統計（給 /明牌 指令顯示）。
+    真實信號（is_backtest=0）的計數單獨顯示；
+    勝率統計（get_strategy_winrate）則同時包含回測信號。
+    """
     with _conn() as c:
-        total   = c.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        pending = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d IS NULL").fetchone()[0]
-        wins    = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d=1").fetchone()[0]
-        losses  = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d=0").fetchone()[0]
+        total    = c.execute("SELECT COUNT(*) FROM signals WHERE is_backtest=0").fetchone()[0]
+        pending  = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d IS NULL AND is_backtest=0").fetchone()[0]
+        wins     = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d=1 AND is_backtest=0").fetchone()[0]
+        losses   = c.execute("SELECT COUNT(*) FROM signals WHERE win_10d=0 AND is_backtest=0").fetchone()[0]
+        bt_total = c.execute("SELECT COUNT(*) FROM signals WHERE is_backtest=1").fetchone()[0]
     return {
-        "total": total, "pending": pending,
-        "wins": wins, "losses": losses,
-        "winrate": round(wins/(wins+losses)*100, 1) if (wins+losses) > 0 else None,
+        "total":         total,
+        "pending":       pending,
+        "wins":          wins,
+        "losses":        losses,
+        "winrate":       round(wins/(wins+losses)*100, 1) if (wins+losses) > 0 else None,
+        "backtest_total": bt_total,
     }

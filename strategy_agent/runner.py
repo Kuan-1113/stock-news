@@ -108,7 +108,11 @@ def fetch_ohlcv(symbol: str, months: int = 6) -> list[dict]:
        "low": float, "close": float, "volume": int}
     由舊到新排列。
     """
-    yf_sym = f"{symbol}.TW"
+    # 若代碼已含「.」（如 2330.TW）或以「^」開頭（指數），直接使用；否則補 .TW
+    if symbol.startswith("^") or "." in symbol:
+        yf_sym = symbol
+    else:
+        yf_sym = f"{symbol}.TW"
     range_str = f"{months}mo"
     try:
         r = requests.get(
@@ -244,13 +248,18 @@ def update_pending_results() -> int:
 # ── 步驟 5：執行策略掃描 ──────────────────────────────────────────
 
 def run_screener(
-    universe:  dict[str, str],
-    ohlcv_map: dict[str, list[dict]],
-    today:     str,
-    chip_map:  dict[str, list[dict]] | None = None,
+    universe:           dict[str, str],
+    ohlcv_map:          dict[str, list[dict]],
+    today:              str,
+    chip_map:           dict[str, list[dict]] | None = None,
+    active_strategies:  frozenset | None = None,
 ) -> list[dict]:
     """
     對每支股票執行指標派 + 籌碼派策略掃描，計算信心星級後回傳。
+
+    Args:
+        active_strategies: 限制只跑這些指標派策略 key（None = 全部）。
+                           籌碼派策略不受此限制（市況無關）。
 
     每筆信號格式：
       {"symbol", "name", "etf_source", "strategy", "strategy_label",
@@ -273,6 +282,9 @@ def run_screener(
         name        = _NAME_CACHE.get(symbol, symbol)
 
         for strat_key, (strat_label, strat_fn) in ALL_STRATEGIES.items():
+            # 市場狀態過濾：若有 active_strategies 限制，跳過不在清單的策略
+            if active_strategies is not None and strat_key not in active_strategies:
+                continue
             try:
                 triggered, detail = strat_fn(ohlcv)
             except Exception as e:
@@ -355,6 +367,7 @@ def build_claude_report(
     signals: list[dict],
     strategy_stats: dict,
     summary: dict,
+    regime: str = "unknown",
 ) -> str:
     """
     呼叫 Claude 對今日信號做審核與摘要，回傳 Discord 可直接發送的文字。
@@ -410,7 +423,9 @@ def build_claude_report(
     stars1 = sum(1 for s in signals if s.get("confidence_stars") == 1)
 
     # ── Claude 提示 ───────────────────────────────────────────────
+    regime_zh = {"trend": "趨勢市（ADX≥25）📈", "range": "震盪盤（ADX<25）📉"}.get(regime, "狀態未知")
     prompt = f"""你是台股量化策略助理，今天 {today} 同時使用了「指標派」和「籌碼派」雙系統選股。
+大盤市場狀態：{regime_zh}（已自動過濾適合本狀態的策略）
 請整理成 Discord 明牌推薦報告。
 
 【策略歷史勝率】
@@ -461,6 +476,48 @@ def _fallback_report(
     return "\n".join(lines)
 
 
+# ── ⭐⭐⭐ 即時警報 ─────────────────────────────────────────────────
+
+def _fire_immediate_alert(signals_3star: list[dict], today: str) -> None:
+    """
+    ⭐⭐⭐ 即時警報：指標派 + 籌碼派雙重確認時立即發送 Discord，
+    不等每日 17:00 匯總報告，讓用戶第一時間知道最高信心的機會。
+    """
+    if not signals_3star:
+        return
+
+    # 以股票為單位，彙整所有信號細節
+    sym_info: dict[str, dict] = {}
+    for s in signals_3star:
+        sym = s["symbol"]
+        if sym not in sym_info:
+            sym_info[sym] = {
+                "name":        s["name"],
+                "entry_price": s["entry_price"],
+                "details":     [],
+            }
+        type_tag = "📊指標" if s["strategy_type"] == "technical" else "💹籌碼"
+        sym_info[sym]["details"].append(
+            f"[{type_tag}｜{s['strategy_label']}] {s['detail']}"
+        )
+
+    n = len(sym_info)
+    lines = [
+        f"⚡ **⭐⭐⭐ 即時警報** — {today}",
+        f"以下 **{n}** 支獲指標派 + 籌碼派雙重確認，建議優先關注",
+        "",
+    ]
+    for sym, info in sym_info.items():
+        lines.append(f"**{sym} {info['name']}**  進場 ${info['entry_price']:.1f}")
+        for d in info["details"]:
+            lines.append(f"  • {d}")
+        lines.append("")
+    lines.append("⚠️ 量化信號，非投資建議，請自行評估風險")
+
+    send_discord("\n".join(lines))
+    print(f"  ⚡ 即時警報已發送：{n} 支 ⭐⭐⭐ 雙確認")
+
+
 # ── 主流程 ────────────────────────────────────────────────────────
 
 def run(dry_run: bool = False) -> dict:
@@ -497,6 +554,23 @@ def run(dry_run: bool = False) -> dict:
     universe = get_universe()
     print(f"  → 宇宙：{len(universe)} 支股票")
 
+    # ── 3b. 市場狀態感知（ADX Regime Filter）─────────────────────
+    print("\n[步驟 3b] 偵測大盤市場狀態（ADX）...")
+    from strategy_agent.strategies import (
+        get_market_regime, TREND_STRATEGIES, MEAN_REVERSION_STRATEGIES
+    )
+    twii_ohlcv = fetch_ohlcv("^TWII", months=3)
+    regime = get_market_regime(twii_ohlcv)
+    if regime == "trend":
+        active_strats: frozenset | None = TREND_STRATEGIES | frozenset(CHIP_STRATEGIES.keys())
+        print(f"  📈 趨勢市（ADX≥25）→ 啟用動量策略 + 籌碼策略")
+    elif regime == "range":
+        active_strats = MEAN_REVERSION_STRATEGIES | frozenset(CHIP_STRATEGIES.keys())
+        print(f"  📉 震盪盤（ADX<25）→ 啟用均值回歸策略 + 籌碼策略")
+    else:
+        active_strats = None  # unknown → 全部策略均啟用
+        print(f"  ❓ 狀態未知（大盤資料不足）→ 啟用全部策略")
+
     # ── 4. 並行抓取 OHLCV + 籌碼資料 ────────────────────────────
     print(f"\n[步驟 4] 抓取日線資料 + TWSE 籌碼資料...")
     ohlcv_map: dict[str, list[dict]] = {}
@@ -507,7 +581,6 @@ def run(dry_run: bool = False) -> dict:
         return sym, data
 
     # OHLCV 與籌碼並行抓取
-    import concurrent.futures
     with ThreadPoolExecutor(max_workers=6) as ex:
         ohlcv_futs = {ex.submit(_fetch_one, sym): sym for sym in universe}
         chip_fut   = ex.submit(update_chip_data, today)   # 籌碼並行
@@ -532,10 +605,11 @@ def run(dry_run: bool = False) -> dict:
     print(f"  📊 有籌碼歷史的股票：{chip_covered}/{len(universe)} 支")
 
     # ── 5. 策略掃描（指標 + 籌碼）───────────────────────────────
-    n_tech = len(ALL_STRATEGIES)
+    n_tech = len(ALL_STRATEGIES) if active_strats is None else len(active_strats & set(ALL_STRATEGIES))
     n_chip = len(CHIP_STRATEGIES)
-    print(f"\n[步驟 5] 執行策略掃描（{len(universe)} 支 × {n_tech} 指標 + {n_chip} 籌碼）...")
-    new_signals = run_screener(universe, ohlcv_map, today, chip_map)
+    regime_label = {"trend": "趨勢市", "range": "震盪盤", "unknown": "未知"}.get(regime, regime)
+    print(f"\n[步驟 5] 執行策略掃描（{len(universe)} 支 × {n_tech} 指標 + {n_chip} 籌碼 | {regime_label}）...")
+    new_signals = run_screener(universe, ohlcv_map, today, chip_map, active_strats)
     stars3 = sum(1 for s in new_signals if s.get("confidence_stars") == 3)
     stars2 = sum(1 for s in new_signals if s.get("confidence_stars") == 2)
     stars1 = sum(1 for s in new_signals if s.get("confidence_stars") == 1)
@@ -570,6 +644,12 @@ def run(dry_run: bool = False) -> dict:
             update_confidence_stars(today, sym, stars)
     print(f"  ✅ 新增 {added} 筆（含重複跳過）")
 
+    # ── 6b. ⭐⭐⭐ 即時警報（雙確認立即通知，不等 17:00 匯總）────
+    stars3_new = [s for s in new_signals if s.get("confidence_stars") == 3]
+    if stars3_new and not dry_run:
+        print(f"\n[步驟 6b] ⭐⭐⭐ 即時警報（{len(stars3_new)} 筆雙確認信號）...")
+        _fire_immediate_alert(stars3_new, today)
+
     # ── 7. 計算勝率（指標 + 籌碼）───────────────────────────────
     print("\n[步驟 7] 計算各策略勝率...")
     strategy_keys = list(ALL_STRATEGIES_COMBINED.keys())
@@ -585,7 +665,7 @@ def run(dry_run: bool = False) -> dict:
 
     # ── 8. Claude 生成報告 ────────────────────────────────────────
     print("\n[步驟 8] 生成 Discord 明牌報告...")
-    report = build_claude_report(today, new_signals, strategy_stats, summary)
+    report = build_claude_report(today, new_signals, strategy_stats, summary, regime)
 
     if not report:
         print("  ℹ️  今日無信號，略過 Discord 發送")
@@ -595,6 +675,7 @@ def run(dry_run: bool = False) -> dict:
             "stats":        strategy_stats,
             "discord_sent": False,
             "report":       "",
+            "regime":       regime,
         }
 
     # ── 9. 發送 Discord ───────────────────────────────────────────
@@ -623,6 +704,7 @@ def run(dry_run: bool = False) -> dict:
         "stats":        strategy_stats,
         "discord_sent": sent,
         "report":       report,
+        "regime":       regime,
     }
 
 

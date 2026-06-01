@@ -155,25 +155,52 @@ def load_watchlist(path: str = None) -> list:
 WATCHLIST = load_watchlist()
 
 # ─────────────────────────────────────────────────────────────
-# AI 動態選股候選池（0050 / 00878 共同大市值成分股）
+# AI 動態選股候選池 — 每次執行時從 00981A 當日成分股動態抓取
 # ─────────────────────────────────────────────────────────────
-CANDIDATE_STOCKS = [
-    {"symbol": "2330.TW", "name": "台積電"},      # 半導體龍頭
-    {"symbol": "2317.TW", "name": "鴻海"},        # AI伺服器供應鏈
-    {"symbol": "2454.TW", "name": "聯發科"},      # IC設計/AI邊緣
-    {"symbol": "2382.TW", "name": "廣達"},        # AI伺服器
-    {"symbol": "2308.TW", "name": "台達電"},      # 電源/散熱
-    {"symbol": "2881.TW", "name": "富邦金"},      # 金融龍頭
-    {"symbol": "2882.TW", "name": "國泰金"},      # 金融
-    {"symbol": "2891.TW", "name": "中信金"},      # 金融
-    {"symbol": "2412.TW", "name": "中華電"},      # 電信/防禦
-    {"symbol": "6669.TW", "name": "緯穎"},        # AI伺服器
-    {"symbol": "2376.TW", "name": "技嘉"},        # AI主機板
-    {"symbol": "3711.TW", "name": "日月光投控"},  # 封裝測試
-    {"symbol": "2303.TW", "name": "聯電"},        # 晶圓代工
-    {"symbol": "2002.TW", "name": "中鋼"},        # 鋼鐵/傳產
-    {"symbol": "2609.TW", "name": "陽明"},        # 航運
-]
+
+def _load_candidate_stocks() -> list[dict]:
+    """
+    從 00981A 野村台灣趨勢動能 ETF 取得當日成分股作為候選池。
+    此 ETF 為主動型，每個交易日更新持倉，能反映當天市場趨勢。
+    失敗時回傳備用靜態清單。
+    """
+    import sys, os
+    # 讓 stock_daily.py 可以 import strategy_agent（跨目錄）
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+    try:
+        from strategy_agent.etf_universe import fetch_00981A_stocks
+        stocks = fetch_00981A_stocks()
+        if stocks:
+            # 轉成 {"symbol": "XXXX.TW", "name": "股票名稱"} 格式
+            result = [{"symbol": s["symbol"], "name": s["name"]} for s in stocks]
+            print(f"  ✅ 候選池：00981A 當日成分股 {len(result)} 支")
+            return result
+    except Exception as e:
+        print(f"  ⚠️ 動態抓取 00981A 失敗：{e}，改用靜態備用清單")
+
+    # 備用靜態清單（00981A 常見成分股）
+    return [
+        {"symbol": "2330.TW", "name": "台積電"},
+        {"symbol": "2454.TW", "name": "聯發科"},
+        {"symbol": "2308.TW", "name": "台達電"},
+        {"symbol": "2382.TW", "name": "廣達"},
+        {"symbol": "6669.TW", "name": "緯穎"},
+        {"symbol": "2317.TW", "name": "鴻海"},
+        {"symbol": "3711.TW", "name": "日月光投控"},
+        {"symbol": "2379.TW", "name": "瑞昱"},
+        {"symbol": "3034.TW", "name": "聯詠"},
+        {"symbol": "2303.TW", "name": "聯電"},
+        {"symbol": "2327.TW", "name": "國巨"},
+        {"symbol": "2357.TW", "name": "華碩"},
+        {"symbol": "6415.TW", "name": "矽力-KY"},
+        {"symbol": "2376.TW", "name": "技嘉"},
+        {"symbol": "2395.TW", "name": "研華"},
+    ]
+
+
+CANDIDATE_STOCKS: list[dict] = []  # 執行時由 run_watchlist_report() 動態載入
 
 # ─────────────────────────────────────────────────────────────
 # 時段判斷
@@ -1360,17 +1387,19 @@ def run_watchlist_report():
     ts            = now_str()
     weekend_banner = "（週末版 — 數據為上次交易日）" if is_weekend() else ""
 
-    # ── AI 動態選股：快速抓候選股行情後由 Claude 選 2-3 檔 ──
-    print("  🤖 AI 從候選股動態選股中...")
+    # ── AI 動態選股：每次執行時抓 00981A 當日成分股作為候選池 ──
+    print("  🤖 載入 00981A 今日成分股候選池...")
+    candidates = _load_candidate_stocks()   # 每日動態，不用靜態清單
+    print(f"  🤖 AI 從 {len(candidates)} 支候選股中選股中...")
     market_lines = []
-    for s in CANDIDATE_STOCKS:
+    for s in candidates:
         q = fetch_yahoo(s["symbol"], s["name"])
         if q.get("price") != "N/A":
             market_lines.append(f"{s['name']}（{s['symbol']}）：{fmt_quote(q)}")
         time.sleep(0.15)
 
     market_ctx = "\n".join(market_lines) if market_lines else "（行情暫時無法取得）"
-    ai_picks   = ai_pick_watchlist(CANDIDATE_STOCKS, market_ctx)
+    ai_picks   = ai_pick_watchlist(candidates, market_ctx)
     print(f"  AI 精選：{', '.join([p['name'] for p in ai_picks])}")
 
     # 合併清單（固定 + AI 精選，去重）
@@ -1391,41 +1420,56 @@ def run_watchlist_report():
         "title":       f"📊 自選股日報 {session_info['emoji']} {session_info['label']} {weekend_banner}| {ts}",
         "description": (
             f"**時段：** {session_info['period']}\n"
-            f"固定追蹤 **{len(watchlist)}** 檔 ＋ AI 精選 **{len(ai_picks)}** 檔\n\n"
+            f"固定追蹤 **{len(watchlist)}** 檔 ＋ AI 精選 **{len(ai_picks)}** 檔\n"
+            f"候選池：**00981A 野村台灣趨勢動能 ETF** 當日成分股（{len(candidates)} 支）\n\n"
             f"**🤖 今日 AI 精選理由：**\n{picks_desc}\n\n"
             f"由 Claude AI 生成，不構成投資建議。"
         ),
         "color":  0xF39C12,
-        "footer": {"text": "資料來源：Yahoo Finance + Google News + Claude AI"},
+        "footer": {"text": "資料來源：TWSE + Yahoo Finance + Google News + Claude AI"},
     })
     time.sleep(1.2)
 
+    ok_count = fail_count = 0
     for stock in full_list:
         symbol = stock["symbol"]
         name   = stock["name"]
         print(f"  分析 {name}（{symbol}）...")
+        try:
+            quote    = fetch_yahoo(symbol, name)
+            print(f"  價格：{fmt_quote(quote)}")
+            news_ctx = fetch_stock_news(symbol, name)
+            time.sleep(0.5)
 
-        quote    = fetch_yahoo(symbol, name)
-        print(f"  價格：{fmt_quote(quote)}")
-        news_ctx = fetch_stock_news(symbol, name)
-        time.sleep(0.5)
+            analysis = analyze_single_stock(symbol, name, quote, news_ctx)
+            time.sleep(1)
 
-        analysis = analyze_single_stock(symbol, name, quote, news_ctx)
-        time.sleep(1)
-
-        stale_tag = " ⚠️未更新" if quote.get("stale") else ""
-        if stock.get("ai_reason"):
-            reason_lines = [l for l in stock["ai_reason"].split("\n") if l.strip()]
-            ai_tag = "\n**🤖 AI 精選理由：**\n" + "\n".join(f"> {l}" for l in reason_lines)
-        else:
-            ai_tag = ""
-        send_discord_message(
-            DISCORD_WATCHLIST,
-            f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — {quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}{ai_tag}\n\n{analysis}"
-        )
+            stale_tag = " ⚠️未更新" if quote.get("stale") else ""
+            if stock.get("ai_reason"):
+                reason_lines = [l for l in stock["ai_reason"].split("\n") if l.strip()]
+                ai_tag = "\n**🤖 AI 精選理由：**\n" + "\n".join(f"> {l}" for l in reason_lines)
+            else:
+                ai_tag = ""
+            send_discord_message(
+                DISCORD_WATCHLIST,
+                f"## {quote.get('emoji','📊')} **{name}（{symbol}）** — "
+                f"{quote.get('price','N/A')} ({quote.get('pct','N/A')}){stale_tag}{ai_tag}\n\n{analysis}"
+            )
+            ok_count += 1
+        except Exception as e:
+            fail_count += 1
+            print(f"  ❌ {name}（{symbol}）分析失敗，跳過：{e}", flush=True)
+            # 仍發一則簡短錯誤訊息，讓用戶知道這支有問題
+            try:
+                send_discord_message(
+                    DISCORD_WATCHLIST,
+                    f"⚠️ **{name}（{symbol}）** — 分析暫時失敗（{str(e)[:80]}），已跳過。"
+                )
+            except Exception:
+                pass
         time.sleep(1.5)
 
-    print("  ✅ 自選股分析完成")
+    print(f"  ✅ 自選股分析完成（成功 {ok_count} / 失敗 {fail_count}）")
 
 # ─────────────────────────────────────────────────────────────
 # Discord 傳送

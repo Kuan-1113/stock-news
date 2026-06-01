@@ -110,6 +110,36 @@ def _alert_task_failure(task_name: str, error_msg: str, attempt: int = 1) -> Non
     except Exception:
         pass
 
+# ── 日報（直接在 Railway 執行，不透過 GitHub Actions）──────────
+_DAILY_LABEL = {"morning": "早報", "afternoon": "午報", "evening": "晚報"}
+
+def _run_daily_report(session: str) -> None:
+    """
+    直接在 Railway 跑 orchestrator.run_report()，和策略 Agent 同樣模式。
+    - 不再透過 GitHub Actions workflow_dispatch（消除排隊延遲問題）
+    - 設定 REPORT_SESSION 環境變數，確保時段正確（不靠執行時間自動偵測）
+    - 失敗自動重試一次，並發 Discord 警報
+    """
+    label = _DAILY_LABEL.get(session, session)
+    for attempt in range(1, 3):
+        try:
+            import os as _os
+            _os.environ["REPORT_SESSION"] = session   # 強制指定時段
+            from orchestrator import run_report as _orch_run
+            _orch_run()
+            _save_trigger_log(f"daily_{session}", "ok")
+            print(f"✅ {label}完成", flush=True)
+            return
+        except Exception as e:
+            print(f"❌ {label}第{attempt}次失敗：{e}", flush=True)
+            if attempt < 2:
+                print("   1 分鐘後重試...", flush=True)
+                time.sleep(60)
+            else:
+                _save_trigger_log(f"daily_{session}", f"failed:{e}")
+                _alert_task_failure(f"日報（{label}）", str(e), attempt)
+
+
 # ── Strategy Agent（延遲載入，避免啟動時 DB 不存在）────────────
 def _run_strategy_agent():
     """執行策略 Agent，失敗自動重試一次，並通知 Discord"""
@@ -185,6 +215,13 @@ def _startup_recovery() -> None:
         sched    = now.replace(hour=sched_hour, minute=sched_min, second=0, microsecond=0)
         deadline = sched + datetime.timedelta(minutes=window_min)
         return sched <= now < deadline
+
+    # 日報補跑（補跑窗口 45 分鐘）
+    for sched_h, (label, session) in {8: ("早報", "morning"), 15: ("午報", "afternoon"), 22: ("晚報", "evening")}.items():
+        if not _was_triggered_today(f"daily_{session}") and _in_window(sched_h, 0, window_min=45):
+            ts = datetime.datetime.now(TW_TZ).strftime("%H:%M")
+            print(f"⚠️ 補跑：{label}（遺漏偵測，現在 {ts}）", flush=True)
+            threading.Thread(target=_run_daily_report, args=(session,), daemon=True).start()
 
     # 策略 Agent：17:00，補跑窗口 60 分鐘
     if not _was_triggered_today("strategy") and _in_window(17, 0):
@@ -1377,7 +1414,14 @@ def _daily_scheduler():
     """
     _triggered   = set()      # Layer 1：in-memory（process 重啟後清空）
     _trigger_ts  = {}         # 時間戳記，防 10 分鐘內雙送
-    DAILY_HOURS   = {8: "早報", 15: "午報", 22: "晚報"}
+    # 時間 → (顯示名稱, report_session 參數)
+    # ⚠️ GitHub Actions cron 已停用（延遲不可控），由 Railway 統一排程
+    # Railway 觸發時明確傳入 report_session，避免 GitHub 排隊後跑錯時段
+    DAILY_HOURS   = {
+        8:  ("早報", "morning"),
+        15: ("午報", "afternoon"),
+        22: ("晚報", "evening"),
+    }
     PODCAST_HOURS = {9, 21}
 
     import random
@@ -1394,15 +1438,15 @@ def _daily_scheduler():
                 too_soon = last_ts and (now - last_ts).total_seconds() < 600
 
                 if not too_soon:
-                    if now.hour in DAILY_HOURS and GITHUB_PAT:
-                        ok, err = _trigger_workflow_with_retry("stock-daily.yml", {})
-                        status  = "✅" if ok else f"❌ {err}"
-                        print(f"⏰ 觸發{DAILY_HOURS[now.hour]} {status}", flush=True)
-                        if not ok:
-                            _alert_task_failure(f"日報觸發（{DAILY_HOURS[now.hour]}）", err)
+                    if now.hour in DAILY_HOURS:
+                        label, session = DAILY_HOURS[now.hour]
+                        # 直接在 Railway 執行，不透過 GitHub Actions（消除排隊延遲）
                         _triggered.add(key)
-                        if ok:
-                            _trigger_ts[key] = now
+                        _trigger_ts[key] = now
+                        print(f"⏰ 啟動{label}（Railway 直接執行）", flush=True)
+                        threading.Thread(
+                            target=_run_daily_report, args=(session,), daemon=True
+                        ).start()
 
                     elif now.hour in PODCAST_HOURS and GITHUB_PAT:
                         ok, err = _trigger_workflow_with_retry("podcast.yml", {})
@@ -1503,16 +1547,53 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
         print(f"❌ /查股 defer 失敗：{e}", flush=True)
         return
     try:
-        # ── Phase 1：抓取資料（同步，不阻塞 event loop）─────────────
         loop = asyncio.get_running_loop()
+        sym  = symbol.strip().upper()
+        nm   = name.strip()
+
+        # ── 嘗試 Managed Agents SDK（C1）──────────────────────────
+        # 環境變數 USE_AGENT_SDK=1 時啟用（Railway 設定）
+        # 未設定或 SDK 失敗時自動 fallback 到傳統模式
+        use_sdk = os.environ.get("USE_AGENT_SDK", "0") == "1" and ANTHROPIC_API_KEY
+
+        if use_sdk:
+            try:
+                from agents.stock_analysis_agent_sdk import analyze_stock_sdk
+                msg = await interaction.followup.send(
+                    f"🤖 **Agent 模式** — 分析 `{sym}` 中，AI 自主決定工具呼叫... ▌"
+                )
+                sdk_result = await loop.run_in_executor(
+                    None, analyze_stock_sdk, sym, nm
+                )
+                if sdk_result.get("error"):
+                    raise RuntimeError(sdk_result["error"])
+
+                header   = sdk_result["header"] or f"## 📊 **{nm or sym}**（{sym}）\n\n"
+                analysis = sdk_result["analysis"]
+                tools    = sdk_result.get("tools_used", [])
+                tools_line = f"\n\n---\n🔧 工具：{', '.join(tools)}" if tools else ""
+                full_text  = header + analysis + tools_line
+
+                chunks = _split_messages(full_text)
+                await msg.edit(content=chunks[0])
+                for chunk in chunks[1:]:
+                    await interaction.channel.send(chunk)
+                print(f"✅ /查股 SDK Agent 完成：{sym}", flush=True)
+                return   # SDK 成功，結束
+
+            except Exception as sdk_err:
+                print(f"⚠️ SDK Agent 失敗，fallback 傳統模式：{sdk_err}", flush=True)
+                # fallback 繼續往下走
+
+        # ── 傳統模式（Phase 1-3）─────────────────────────────────
         data = await loop.run_in_executor(
-            None, _prepare_analysis, symbol.strip().upper(), name.strip()
+            None, _prepare_analysis, sym, nm
         )
         if data["error"]:
             await interaction.followup.send(data["error"])
             return
 
-        # ── Phase 2：傳送初始訊息 + 串流 AI 分析 ──────────────────
+        # Phase 2：傳送初始訊息 + 串流 AI 分析
         msg = await interaction.followup.send(
             data["header"] + "🔍 AI 分析中，請稍候... ▌"
         )
@@ -1521,7 +1602,7 @@ async def cmd_查股(interaction: discord.Interaction, symbol: str, name: str = 
             prefix=data["header"], max_tokens=2400
         )
 
-        # ── Phase 3：最終確認 + 處理超長訊息 ─────────────────────
+        # Phase 3：最終確認 + 處理超長訊息
         chunks = _split_messages(full_text)
         await msg.edit(content=chunks[0])
         for chunk in chunks[1:]:
@@ -1819,7 +1900,7 @@ async def cmd_看板(interaction: discord.Interaction):
 
 # ── /自選股 ──────────────────────────────────────────────────────
 
-@tree.command(name="自選股", description="觸發完整自選股分析（結果約 2 分鐘後出現）")
+@tree.command(name="自選股", description="觸發自選股分析 + AI 精選（結果即時出現在頻道）")
 async def cmd_自選股(interaction: discord.Interaction):
     print("⚡ /自選股 收到", flush=True)
     try:
@@ -1830,22 +1911,28 @@ async def cmd_自選股(interaction: discord.Interaction):
     except Exception as e:
         print(f"❌ /自選股 defer 失敗：{e}", flush=True)
         return
+
+    await interaction.followup.send(
+        "⏳ 自選股分析啟動！報告將逐步出現在自選股頻道（約 **5~10 分鐘**）\n"
+        "• 📋 自選股個股深度分析\n"
+        "• 🤖 AI 精選（00981A 每日成分股）"
+    )
+
+    def _run_watchlist_now():
+        from orchestrator import run_watchlist_now as _orch_watchlist
+        _orch_watchlist()
+
+    loop = asyncio.get_running_loop()
     try:
-        loop       = asyncio.get_running_loop()
-        ok, errmsg = await loop.run_in_executor(None, _trigger_workflow, "query_watchlist.yml", {})
-        if ok:
-            await interaction.followup.send("⏳ 自選股分析啟動！約 **2 分鐘**後報告會出現在自選股頻道。")
-        elif not GITHUB_PAT:
-            await interaction.followup.send(
-                "⚠️ 尚未設定 `GITHUB_PAT`，無法觸發自選股分析。\n"
-                "請在 Bot 環境變數中加入 `GITHUB_PAT`（需 `workflow` 權限的 GitHub PAT）。"
-            )
-        else:
-            await interaction.followup.send(f"❌ 觸發失敗：`{errmsg}`")
-    except Exception as e:
-        print(f"❌ /自選股 例外：{e}", flush=True)
+        await loop.run_in_executor(None, _run_watchlist_now)
         try:
-            await interaction.followup.send(f"❌ 發生錯誤：{str(e)[:100]}")
+            await interaction.channel.send("✅ 自選股分析 + AI 精選完成！")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"❌ /自選股 執行失敗：{e}", flush=True)
+        try:
+            await interaction.channel.send(f"❌ 自選股分析失敗：{str(e)[:100]}")
         except Exception:
             pass
 
@@ -2185,7 +2272,7 @@ async def cmd_說明(interaction: discord.Interaction):
 • `/自選股刪除 [代碼]` — 從清單刪除
 • `/自選股清單` — 查看目前清單
 • `/自選股分析` — 對清單所有股票做 AI 分析
-• `/自選股` — 觸發完整自選股分析報告（約 2 分鐘後在自選股頻道出現）
+• `/自選股` — 觸發自選股分析 + 🤖 AI 精選（直接在 Railway 執行，約 5~10 分鐘）
 
 **📈 策略明牌**
 • `/明牌 今日信號` — 查看策略 Agent 今日選出的股票
@@ -2204,6 +2291,9 @@ async def cmd_說明(interaction: discord.Interaction):
   範例：`/查權證 台積電`　`/查權證 2330`
 • `/分析權證 [代號]` — 深度分析特定權證 + 比較替代選項
   範例：`/分析權證 038542`
+
+**🔧 系統工具**
+• `/診斷` — 系統健康診斷：排程觸發紀錄 / 信號庫統計 / 籌碼資料更新狀態 / 環境變數檢查
 
 ━━━━━━━━━━━━━━━━━━━━━━
 > 💡 **小提示**：台股格式 `代碼.TW`（如 `2330.TW`）｜ 美股直接代號（如 `NVDA`）
@@ -2270,6 +2360,173 @@ async def cmd_明牌(interaction: discord.Interaction, 查詢: app_commands.Choi
             pass
 
 
+def _get_diagnostics() -> str:
+    """
+    收集系統診斷資訊，回傳格式化文字（給 /診斷 指令用）。
+    涵蓋：trigger_log、signals DB、chip DB、環境變數狀態。
+    """
+    lines = [f"## 🔧 系統診斷 | {now_str()}"]
+    ts = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"> 診斷時間：{ts} TW\n")
+
+    # ── 1. 排程觸發紀錄（trigger_log.json）──────────────────────
+    lines.append("**📋 排程觸發紀錄（近 7 天）**")
+    try:
+        log = _load_trigger_log()
+        if not log:
+            lines.append("• （無任何觸發紀錄，可能是首次啟動）")
+        else:
+            # 取近 7 天
+            cutoff = (datetime.date.today() - datetime.timedelta(days=6)).isoformat()
+            recent = {d: v for d, v in sorted(log.items()) if d >= cutoff}
+            if not recent:
+                lines.append("• 近 7 天無觸發紀錄")
+            for date_str, tasks in sorted(recent.items(), reverse=True):
+                lines.append(f"• **{date_str}**")
+                for task, info in tasks.items():
+                    if isinstance(info, dict):
+                        t    = info.get("time", "?")[:16].replace("T", " ")
+                        st   = info.get("status", "?")
+                        icon = "✅" if st == "ok" else "❌"
+                        lines.append(f"  {icon} `{task}`　{t}　狀態：`{st}`")
+    except Exception as e:
+        lines.append(f"• ⚠️ 讀取失敗：{e}")
+
+    lines.append("")
+
+    # ── 2. 策略信號庫（signals DB）──────────────────────────────
+    lines.append("**📊 策略信號庫（signals）**")
+    try:
+        from strategy_agent.signal_db import get_summary_stats, get_today_signals
+        stats = get_summary_stats()
+        today_sigs = get_today_signals()
+        lines.append(f"• 總信號數：**{stats['total']}**")
+        lines.append(f"• 今日信號：**{len(today_sigs)}**")
+        pending = stats['pending']
+        lines.append(f"• 待追蹤（未結算）：**{pending}**")
+        if stats.get("winrate") is not None:
+            wr_icon = "🟢" if stats["winrate"] >= 55 else ("🟡" if stats["winrate"] >= 45 else "🔴")
+            lines.append(
+                f"• 整體勝率：{wr_icon} **{stats['winrate']}%**"
+                f"　（贏 {stats['wins']} / 輸 {stats['losses']}）"
+            )
+        else:
+            lines.append(f"• 整體勝率：**待累積**（贏 {stats['wins']} / 輸 {stats['losses']}）")
+    except Exception as e:
+        lines.append(f"• ⚠️ 讀取失敗：{e}")
+
+    lines.append("")
+
+    # ── 3. 籌碼資料庫（chip_daily）──────────────────────────────
+    lines.append("**💹 籌碼資料庫（chip_daily）**")
+    try:
+        from strategy_agent.signal_db import _conn as _sig_conn
+        with _sig_conn() as c:
+            # 最新日期
+            row = c.execute(
+                "SELECT date, COUNT(*) as cnt FROM chip_daily ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+            if row and row["date"]:
+                lines.append(f"• 最新日期：**{row['date']}**　股票數：**{row['cnt']}**")
+                # 資料日期距今天數
+                latest_d = datetime.date.fromisoformat(row["date"])
+                days_ago = (datetime.date.today() - latest_d).days
+                freshness = "🟢 當日" if days_ago == 0 else (
+                    f"🟡 {days_ago} 日前" if days_ago <= 2 else f"🔴 {days_ago} 日前（可能異常）"
+                )
+                lines.append(f"• 資料新鮮度：{freshness}")
+                # 近 5 天覆蓋日數
+                cnt_days = c.execute(
+                    "SELECT COUNT(DISTINCT date) as d FROM chip_daily"
+                    " WHERE date >= date('now', '-7 days')"
+                ).fetchone()["d"]
+                lines.append(f"• 近 7 天有籌碼資料天數：**{cnt_days}**")
+            else:
+                lines.append("• ⚠️ 尚無籌碼資料（等待首次 17:00 掃描後填入）")
+    except Exception as e:
+        lines.append(f"• ⚠️ 讀取失敗（可能 chip_daily 表尚未建立）：{e}")
+
+    lines.append("")
+
+    # ── 4. 環境變數檢查 ──────────────────────────────────────────
+    lines.append("**🔑 環境變數狀態**")
+    env_checks = [
+        ("DISCORD_BOT_TOKEN",  "Discord Bot Token"),
+        ("ANTHROPIC_API_KEY",  "Anthropic API Key"),
+        ("GITHUB_PAT",         "GitHub PAT（Podcast 用，日報已改Railway直跑）"),
+        ("DISCORD_TW",         "Discord 台股頻道 Webhook"),
+        ("DISCORD_US",         "Discord 美股頻道 Webhook"),
+        ("DISCORD_GLOBAL",     "Discord 國際頻道 Webhook"),
+        ("DISCORD_WATCHLIST",  "Discord 自選股頻道 Webhook"),
+        ("DISCORD_STRATEGY",   "Discord 明牌頻道 Webhook"),
+        ("SIGNAL_DB_PATH",     "策略信號庫路徑"),
+        ("TRIGGER_LOG_PATH",   "觸發紀錄路徑"),
+    ]
+    for env_key, label in env_checks:
+        val = os.environ.get(env_key, "")
+        if val:
+            # 只顯示前 6 字元，保護敏感資訊
+            preview = val[:6] + "…" if len(val) > 6 else val
+            lines.append(f"• ✅ `{env_key}`　已設定（`{preview}`）")
+        else:
+            # GITHUB_PAT 和 DISCORD_* 只是警告，不是致命缺失
+            icon = "⚠️" if env_key in ("GITHUB_PAT", "DISCORD_STRATEGY",
+                                        "DISCORD_US", "DISCORD_GLOBAL") else "❌"
+            lines.append(f"• {icon} `{env_key}`　**未設定**")
+
+    lines.append("")
+    lines.append(f"• trigger_log 路徑：`{_TRIGGER_LOG_PATH}`")
+
+    # ── 5. 今日狀態摘要 ──────────────────────────────────────────
+    lines.append("")
+    lines.append("**🗓 今日任務狀態**")
+    today_str = datetime.date.today().isoformat()
+    weekday   = datetime.date.today().weekday()
+    for s_hour, (s_label, s_session) in {8: ("早報", "morning"), 15: ("午報", "afternoon"), 22: ("晚報", "evening")}.items():
+        ok = _was_triggered_today(f"daily_{s_session}")
+        lines.append(f"• {s_label}（{s_hour:02d}:00）：{'✅ 已完成' if ok else '⏳ 尚未執行'}")
+    strategy_ok = _was_triggered_today("strategy")
+    weekly_ok   = _was_triggered_today("weekly")
+    lines.append(
+        f"• 策略 Agent（17:00）：{'✅ 已完成' if strategy_ok else '⏳ 今日尚未執行'}"
+    )
+    if weekday == 4:  # 週五
+        lines.append(
+            f"• 週回顧報告（17:30）：{'✅ 已完成' if weekly_ok else '⏳ 今日尚未執行'}"
+        )
+    else:
+        lines.append(f"• 週回顧報告：（非週五，不執行）")
+
+    return "\n".join(lines)
+
+
+@tree.command(name="診斷", description="系統診斷：排程狀態 / DB 統計 / 籌碼資料 / 環境變數檢查")
+async def cmd_診斷(interaction: discord.Interaction):
+    print("⚡ /診斷 收到", flush=True)
+    try:
+        await interaction.response.defer()
+    except discord.errors.NotFound:
+        print("⚠️ /診斷 互動已過期，忽略", flush=True)
+        return
+    except Exception as e:
+        print(f"❌ /診斷 defer 失敗：{e}", flush=True)
+        return
+
+    try:
+        loop   = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _get_diagnostics)
+        chunks = _split_messages(result)
+        await interaction.followup.send(chunks[0])
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk)
+    except Exception as e:
+        print(f"❌ /診斷 例外：{e}", flush=True)
+        try:
+            await interaction.followup.send(f"❌ 診斷失敗：{str(e)[:200]}")
+        except Exception:
+            pass
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -2277,8 +2534,8 @@ async def on_ready():
     print(f"✅ Bot 啟動：{client.user}（ID: {client.user.id}）", flush=True)
     print(f"   指令：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
-    print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（/自選股 不可用）'}", flush=True)
-    print(f"   指令：/查股 /新聞 /看板 /說明 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌", flush=True)
+    print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（舊版 /自選股 GitHub Actions 模式不可用，已改為 Railway 直接執行）'}", flush=True)
+    print(f"   指令：/查股 /新聞 /看板 /說明 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌 /診斷", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     # 策略 Agent DB 初始化（Railway Volume 路徑由 SIGNAL_DB_PATH 環境變數控制）

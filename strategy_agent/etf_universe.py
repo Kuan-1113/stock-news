@@ -110,6 +110,15 @@ def _try_twse_etf_api(stock_no: str) -> list[str]:
     嘗試從 TWSE ETF 成分股 API 取得最新成分股代號。
     endpoint：https://www.twse.com.tw/fund/ETF_CCNY
     """
+    stocks = _try_twse_etf_api_with_names(stock_no)
+    return [s["code"] for s in stocks]
+
+
+def _try_twse_etf_api_with_names(stock_no: str) -> list[dict]:
+    """
+    從 TWSE ETF 成分股 API 取得代號 + 名稱。
+    回傳格式：[{"code": "2330", "name": "台積電"}, ...]
+    """
     today = datetime.date.today().strftime("%Y%m%d")
     try:
         r = requests.get(
@@ -123,13 +132,14 @@ def _try_twse_etf_api(stock_no: str) -> list[str]:
         data = r.json()
         rows = data.get("data", [])
         # 格式：[["代號", "股票名稱", "持股比例%", ...], ...]
-        symbols = []
+        result = []
         for row in rows:
             if row and row[0]:
                 sym = str(row[0]).strip()
                 if sym.isdigit() and len(sym) in (4, 5, 6):
-                    symbols.append(sym)
-        return symbols
+                    name = str(row[1]).strip() if len(row) > 1 else sym
+                    result.append({"code": sym, "name": name})
+        return result
     except Exception as e:
         print(f"  ⚠️  TWSE ETF API 失敗（{stock_no}）：{e}")
         return []
@@ -165,24 +175,36 @@ def _try_yuanta_fund_api(stock_no: str) -> list[str]:
 
 def fetch_00981A() -> list[str]:
     """
-    嘗試多個來源取得 00981A 今日成分股。
+    嘗試多個來源取得 00981A 今日成分股代號清單。
     失敗時回傳備用清單。
     """
-    # 嘗試 1：TWSE API
-    syms = _try_twse_etf_api("00981A")
-    if syms:
-        print(f"  ✅ 00981A 成分（TWSE API）：{len(syms)} 支")
-        return syms
+    stocks = fetch_00981A_stocks()
+    return [s["code"] for s in stocks]
 
-    # 嘗試 2：基金公司 API
+
+def fetch_00981A_stocks() -> list[dict]:
+    """
+    取得 00981A 今日成分股，含代號與名稱。
+    回傳格式：[{"code": "2330", "name": "台積電", "symbol": "2330.TW"}, ...]
+    失敗時回傳備用清單（名稱欄留空，由呼叫端處理）。
+    """
+    # 嘗試 1：TWSE API（有名稱）
+    stocks = _try_twse_etf_api_with_names("00981A")
+    if stocks:
+        print(f"  ✅ 00981A 成分（TWSE API）：{len(stocks)} 支")
+        for s in stocks:
+            s["symbol"] = s["code"] + ".TW"
+        return stocks
+
+    # 嘗試 2：基金公司 API（只有代號）
     syms = _try_yuanta_fund_api("00981A")
     if syms:
         print(f"  ✅ 00981A 成分（基金公司 API）：{len(syms)} 支")
-        return syms
+        return [{"code": s, "name": s, "symbol": s + ".TW"} for s in syms]
 
     # 降級：備用清單
     print(f"  ⚠️  00981A API 無法取得，使用備用清單（{len(ETF_00981A_FALLBACK)} 支）")
-    return ETF_00981A_FALLBACK
+    return [{"code": s, "name": s, "symbol": s + ".TW"} for s in ETF_00981A_FALLBACK]
 
 
 # ── 主函式 ────────────────────────────────────────────────────────
