@@ -281,13 +281,20 @@ def _run_watchlist_report(session_info: dict) -> None:
     _watchlist_db.init_db()
     db_stocks = _watchlist_db.get_all_symbols(guild_id or None)
 
-    if db_stocks:
-        stocks   = db_stocks
-        src_note = f"來自 Discord 自選股（{len(stocks)} 支）"
-    else:
-        # Fallback：DB 還沒有資料，用 config.py 預設清單
-        stocks   = WATCHLIST
-        src_note = f"預設清單（{len(stocks)} 支）"
+    if not db_stocks:
+        print("  ℹ️ 自選股 DB 無資料，跳過（請用 /新增自選股 加入股票）", flush=True)
+        # 仍執行 AI 精選與加密快照（不依賴自選股）
+        time.sleep(2)
+        _run_ai_pick(session_info)
+        time.sleep(2)
+        try:
+            CryptoAgent().run()
+        except Exception as e:
+            print(f"  ⚠️ CryptoAgent 失敗（不影響其他功能）：{e}")
+        return
+
+    stocks   = db_stocks
+    src_note = f"來自 Discord 自選股（{len(stocks)} 支）"
     print(f"  📋 自選股來源：{src_note}", flush=True)
 
     send_embed(DISCORD_WATCHLIST, {
