@@ -1504,8 +1504,11 @@ def _daily_scheduler():
             print(f"⚠️ 排程例外：{e}", flush=True)
         time.sleep(15)   # 縮短輪詢間隔：30s → 15s（減少最大誤差）
 
-# ── 開機補跑：若在排程窗口內啟動，自動補跑遺漏任務 ─────────────
-threading.Thread(target=_startup_recovery, daemon=True).start()
+# ── 開機補跑：已停用 ────────────────────────────────────────────
+# 排程訊息已準時到達，補跑反而在 Railway 重新部署後觸發額外訊息
+# 每次 push 程式碼 → bot 重啟 → 補跑誤判 → 在奇怪的時間多送一條
+# 停用後：只有固定時間（07:57/14:57/21:57/17:00/17:30）才會發訊息
+# threading.Thread(target=_startup_recovery, daemon=True).start()
 threading.Thread(target=_daily_scheduler, daemon=True).start()
 print("⏰ 排程啟動（日報 07:57/14:57/21:57 提前啟動→08/15/22:00 準時到達；策略 17:00；週回顧 Fri 17:30）", flush=True)
 
