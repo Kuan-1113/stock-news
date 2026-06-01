@@ -1,9 +1,9 @@
 name: 策略 Agent — 每日盤後選股明牌
 
 on:
-  schedule:
-    # 台灣時間 17:00 = UTC 09:00（週一～週五）
-    - cron: '0 9 * * 1-5'
+  # ⚠️ GHA cron 已停用：Railway bot 在 17:00 TW 直接執行（精準準時）
+  # GHA free runner 排隊延遲可達 1-2 小時，會導致訊息在 18:xx 才到達
+  # 保留 workflow_dispatch 供手動測試用
   workflow_dispatch:
     inputs:
       dry_run:

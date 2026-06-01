@@ -1,9 +1,9 @@
 name: 每週市場回顧（週五盤後）
 
 on:
-  schedule:
-    # 台灣時間 17:30 週五 = UTC 09:30 週五
-    - cron: '30 9 * * 5'
+  # ⚠️ GHA cron 已停用：Railway bot 在週五 17:30 TW 直接執行（精準準時）
+  # GHA free runner 排隊延遲可達 1-2 小時，導致訊息在 18:xx 才到達
+  # 保留 workflow_dispatch 供手動測試用
   workflow_dispatch:
     inputs:
       dry_run:

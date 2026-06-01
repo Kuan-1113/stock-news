@@ -75,13 +75,16 @@ def _load_trigger_log() -> dict:
 
 def _save_trigger_log(task: str, status: str = "ok") -> None:
     """記錄任務觸發時間與狀態（持久化，保留 14 天）"""
-    today = datetime.date.today().isoformat()
+    # ⚠️ 使用台灣時區日期：Railway 伺服器在 UTC，UTC 00:00 = TW 08:00
+    #    若用 date.today()（UTC），早報在 07:57 TW（= UTC 前一天 23:57）存入前一天
+    #    導致 _was_triggered_today 在 TW 08:00 以後查「今天」找不到，誤觸補跑
+    today = datetime.datetime.now(TW_TZ).date().isoformat()
     log   = _load_trigger_log()
     log.setdefault(today, {})[task] = {
         "time":   datetime.datetime.now(TW_TZ).isoformat(),
         "status": status,
     }
-    cutoff = (datetime.date.today() - datetime.timedelta(days=14)).isoformat()
+    cutoff = (datetime.datetime.now(TW_TZ).date() - datetime.timedelta(days=14)).isoformat()
     log    = {d: v for d, v in log.items() if d >= cutoff}
     try:
         with open(_TRIGGER_LOG_PATH, "w", encoding="utf-8") as f:
@@ -90,8 +93,8 @@ def _save_trigger_log(task: str, status: str = "ok") -> None:
         print(f"⚠️ trigger_log 寫入失敗：{e}", flush=True)
 
 def _was_triggered_today(task: str) -> bool:
-    """檢查今日是否已成功觸發過該任務"""
-    today = datetime.date.today().isoformat()
+    """檢查今日是否已成功觸發過該任務（台灣時區日期）"""
+    today = datetime.datetime.now(TW_TZ).date().isoformat()
     entry = _load_trigger_log().get(today, {}).get(task, {})
     return isinstance(entry, dict) and entry.get("status") == "ok"
 
