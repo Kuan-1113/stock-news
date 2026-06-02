@@ -1516,10 +1516,28 @@ def _daily_scheduler():
             print(f"⚠️ 排程例外：{e}", flush=True)
         time.sleep(15)   # 縮短輪詢間隔：30s → 15s（減少最大誤差）
 
-# ── 開機補跑：±5 分鐘窄窗口（防止 18:xx/01:xx 誤觸發）──────────
-threading.Thread(target=_startup_recovery, daemon=True).start()
-threading.Thread(target=_daily_scheduler, daemon=True).start()
-print("⏰ 排程啟動（日報 07:57/14:57/21:57 提前啟動→08/15/22:00 準時到達；策略 17:00；週回顧 Fri 17:30）", flush=True)
+# ── SchedulerAgent：集中管理所有排程 ────────────────────────────
+from agents.scheduler_agent import SchedulerAgent as _SchedulerAgent, format_status_for_discord as _fmt_sched_status
+
+def _discord_alert(msg: str) -> None:
+    """發送排程告警到 DISCORD_GLOBAL（若有設定）"""
+    try:
+        from shared.config import DISCORD_GLOBAL
+        from shared.utils import send_discord_message
+        if DISCORD_GLOBAL:
+            send_discord_message(DISCORD_GLOBAL, msg)
+    except Exception:
+        pass
+
+_scheduler_agent = _SchedulerAgent(
+    run_daily_report = _run_daily_report,
+    run_strategy     = _run_strategy_agent,
+    run_weekly       = _run_weekly_review,
+    trigger_podcast  = (lambda: _trigger_workflow_with_retry("podcast.yml", {})) if GITHUB_PAT else None,
+    notify_discord   = _discord_alert,
+)
+_scheduler_agent.start()
+print("⏰ [SchedulerAgent] 排程守衛已啟動（07:57/14:57/21:57/17:00/17:30 TW）", flush=True)
 
 # ── Discord Bot ───────────────────────────────────────────────
 
@@ -2425,6 +2443,10 @@ def _get_diagnostics() -> str:
     lines = [f"## 🔧 系統診斷 | {now_str()}"]
     ts = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     lines.append(f"> 診斷時間：{ts} TW\n")
+
+    # ── 0. 排程守衛健康狀態（SchedulerAgent）───────────────────
+    lines.append(_fmt_sched_status())
+    lines.append("")
 
     # ── 1. 排程觸發紀錄（trigger_log.json）──────────────────────
     lines.append("**📋 排程觸發紀錄（近 7 天）**")
