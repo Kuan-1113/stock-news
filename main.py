@@ -212,34 +212,35 @@ def _startup_recovery() -> None:
       Railway 在任意時間重新部署（push 程式碼）→ bot 重啟
       → 補跑誤判 → 在 18:xx 或 01:xx 多送一條訊息
 
-    新設計（5 分鐘窗口）：
-      只有 bot 在觸發時間「前後 5 分鐘」內重啟，才觸發補跑
-      例：Railway 在 14:56～15:02 重啟 → 補跑午報 ✅
+    新設計（15 分鐘窗口）：
+      只有 bot 在觸發時間「前後 15 分鐘」內重啟，才觸發補跑
+      例：Railway 在 07:45～08:12 重啟 → 補跑早報 ✅
           Railway 在 18:xx 重啟 → 窗口早已過，不觸發 ✅
+      Railway Trial 維護重啟通常在數分鐘內完成，15 分鐘足夠涵蓋
     """
     now = datetime.datetime.now(TW_TZ)
 
-    def _in_narrow_window(trigger_hour: int, trigger_min: int, window_min: int = 5) -> bool:
-        """觸發點前 1 分鐘 ~ 後 window_min 分鐘"""
+    def _in_narrow_window(trigger_hour: int, trigger_min: int, window_min: int = 15) -> bool:
+        """觸發點前 2 分鐘 ~ 後 window_min 分鐘"""
         trigger_dt = now.replace(hour=trigger_hour, minute=trigger_min, second=0, microsecond=0)
-        start      = trigger_dt - datetime.timedelta(minutes=1)
+        start      = trigger_dt - datetime.timedelta(minutes=2)
         end        = trigger_dt + datetime.timedelta(minutes=window_min)
         return start <= now < end
 
-    # 日報補跑（觸發時間 :57，窗口 :56～:02，僅 5 分鐘）
+    # 日報補跑（觸發時間 :57，窗口 :55～:12，共 15 分鐘）
     for trigger_h, (label, session) in {7: ("早報", "morning"), 14: ("午報", "afternoon"), 21: ("晚報", "evening")}.items():
         if not _was_triggered_today(f"daily_{session}") and _in_narrow_window(trigger_h, 57):
             ts = now.strftime("%H:%M")
             print(f"⚠️ 補跑：{label}（窗口內重啟偵測，現在 {ts}）", flush=True)
             threading.Thread(target=_run_daily_report, args=(session,), daemon=True).start()
 
-    # 策略 Agent：17:00，補跑窗口 5 分鐘（16:59～17:05）
+    # 策略 Agent：17:00，補跑窗口 15 分鐘（16:58～17:15）
     if not _was_triggered_today("strategy") and _in_narrow_window(17, 0):
         ts = now.strftime("%H:%M")
         print(f"⚠️ 補跑：策略 Agent（現在 {ts}）", flush=True)
         threading.Thread(target=_run_strategy_agent, daemon=True).start()
 
-    # 週回顧：週五 17:30，補跑窗口 5 分鐘
+    # 週回顧：週五 17:30，補跑窗口 15 分鐘
     if now.weekday() == 4 and not _was_triggered_today("weekly") and _in_narrow_window(17, 30):
         ts = now.strftime("%H:%M")
         print(f"⚠️ 補跑：週回顧報告（現在 {ts}）", flush=True)
@@ -1948,6 +1949,44 @@ async def cmd_自選股(interaction: discord.Interaction):
             await interaction.channel.send(f"❌ 自選股分析失敗：{str(e)[:100]}")
         except Exception:
             pass
+
+# ── /觸發日報 ────────────────────────────────────────────────────
+
+@tree.command(name="觸發日報", description="手動觸發日報（早報/午報/晚報），補跑遺漏的排程")
+@app_commands.describe(時段="選擇要發送的時段")
+@app_commands.choices(時段=[
+    app_commands.Choice(name="🌅 早報（08:00）", value="morning"),
+    app_commands.Choice(name="☀️ 午報（15:00）", value="afternoon"),
+    app_commands.Choice(name="🌙 晚報（22:00）", value="evening"),
+])
+async def cmd_觸發日報(interaction: discord.Interaction, 時段: app_commands.Choice[str]):
+    print(f"⚡ /觸發日報 收到：{時段.value}", flush=True)
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"❌ /觸發日報 defer 失敗：{e}", flush=True)
+        return
+
+    label_map = {"morning": "🌅 早報", "afternoon": "☀️ 午報", "evening": "🌙 晚報"}
+    label = label_map.get(時段.value, 時段.value)
+    await interaction.followup.send(
+        f"⏳ **{label}** 啟動中！約 **3~5 分鐘**後訊息會出現在各頻道。"
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _run_daily_report, 時段.value)
+        try:
+            await interaction.channel.send(f"✅ {label} 發送完成！")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"❌ /觸發日報 執行失敗：{e}", flush=True)
+        try:
+            await interaction.channel.send(f"❌ 日報發送失敗：{str(e)[:100]}")
+        except Exception:
+            pass
+
 
 # ── 個股期貨指令 ─────────────────────────────────────────────
 
