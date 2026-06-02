@@ -100,14 +100,25 @@ def send_discord(content: str, webhook_url: str = "") -> bool:
 
     success = True
     for chunk in chunks:
-        try:
-            r = requests.post(url, json={"content": chunk}, timeout=10)
-            if r.status_code not in (200, 204):
-                print(f"  ❌ Discord 發送失敗：HTTP {r.status_code}")
+        for attempt in range(3):   # 最多重試 3 次（處理 429）
+            try:
+                r = requests.post(url, json={"content": chunk}, timeout=10)
+                if r.status_code == 429:
+                    wait = float(r.json().get("retry_after", 5))
+                    print(f"  ⏳ 速率限制，等待 {wait:.1f}s 後重試...")
+                    time.sleep(wait + 0.5)
+                    continue
+                if r.status_code not in (200, 204):
+                    print(f"  ❌ Discord 發送失敗：HTTP {r.status_code}")
+                    success = False
+                else:
+                    print(f"  ✅ Discord 發送成功（{len(chunk)} 字）")
+                break
+            except Exception as e:
+                print(f"  ❌ Discord 發送例外：{e}")
                 success = False
-            time.sleep(0.5)   # 避免 rate limit
-        except Exception as e:
-            print(f"  ❌ Discord 發送例外：{e}")
+                break
+        time.sleep(1.5)   # 每段間隔加大
             success = False
     return success
 
@@ -460,11 +471,11 @@ def build_claude_report(
 2. ⭐⭐⭐的股票重點分析（指標面+籌碼面各一句）；⭐⭐簡短點評；⭐僅列名觀察
 3. 指出今日哪個策略/族群信號最集中
 4. 末尾加：「⚠️ 量化信號，非投資建議，請自行評估風險」
-5. 繁體中文，1800 字以內，可用 Emoji"""
+5. 繁體中文，**900字以內，必須完整輸出所有段落**，可用 Emoji"""
 
     print("  🤖 呼叫 Claude 生成明牌報告...")
     try:
-        return claude_call(prompt, max_tokens=1800)
+        return claude_call(prompt, max_tokens=1000)
     except Exception as e:
         print(f"  ❌ Claude 呼叫失敗：{e}")
         # 降級：直接組一個純文字版本
