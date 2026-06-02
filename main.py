@@ -148,17 +148,37 @@ def _run_daily_report(session: str) -> str:
     return "失敗：未知原因"
 
 
-# ── Strategy Agent（延遲載入，避免啟動時 DB 不存在）────────────
+# ── Strategy Agent + TaiwanQuantAgent（延遲載入）────────────────
 def _run_strategy_agent():
-    """執行策略 Agent，失敗自動重試一次，並通知 Discord"""
+    """
+    執行策略掃描 + 台股量化深度分析。
+    Step 1：StrategyAgent — 13指標 + 3籌碼掃描，Claude 明牌報告
+    Step 2：TaiwanQuantAgent — 起漲初期信號分層 + Claude 量化觀點
+    """
     for attempt in range(1, 3):
         try:
             from strategy_agent.runner import run as _strategy_run
             from strategy_agent.signal_db import init_db as _strategy_init
             _strategy_init()
-            _strategy_run(dry_run=False)
+
+            # Step 1：策略掃描（原有邏輯，發送策略明牌報告）
+            print("⚡ [Step 1] 策略掃描 + 明牌報告...", flush=True)
+            result = _strategy_run(dry_run=False)
+
+            # Step 2：台股量化 Agent（起漲初期分析）
+            try:
+                print("⚡ [Step 2] 台股量化深度分析...", flush=True)
+                from agents.taiwan_quant_agent import TaiwanQuantAgent
+                TaiwanQuantAgent().run(
+                    signals=result.get("signals", []),
+                    regime=result.get("regime", "unknown"),
+                    dry_run=False,
+                )
+            except Exception as eq:
+                print(f"  ⚠️ TaiwanQuantAgent 失敗（不影響主流程）：{eq}", flush=True)
+
             _save_trigger_log("strategy", "ok")
-            print("✅ 策略 Agent 完成", flush=True)
+            print("✅ 策略 Agent 完成（含量化分析）", flush=True)
             return
         except Exception as e:
             print(f"❌ 策略 Agent 第{attempt}次失敗：{e}", flush=True)
