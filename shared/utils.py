@@ -154,17 +154,25 @@ def send_discord_message(webhook_url: str, content: str) -> bool:
 
     success = True
     for chunk in chunks:
-        try:
-            r = requests.post(webhook_url, json={"content": chunk}, timeout=15)
-            if r.status_code not in [200, 204]:
-                print(f"❌ Discord 傳送失敗：{r.status_code} {r.text[:200]}")
+        for attempt in range(3):   # 最多重試 3 次（處理 429 速率限制）
+            try:
+                r = requests.post(webhook_url, json={"content": chunk}, timeout=15)
+                if r.status_code == 429:
+                    wait = float(r.json().get("retry_after", 5))
+                    print(f"⏳ Discord 速率限制，等待 {wait:.1f}s 後重試...")
+                    time.sleep(wait + 0.5)
+                    continue
+                if r.status_code not in [200, 204]:
+                    print(f"❌ Discord 傳送失敗：{r.status_code} {r.text[:200]}")
+                    success = False
+                else:
+                    print(f"✅ Discord 傳送成功（{len(chunk)} 字）")
+                break
+            except Exception as e:
+                print(f"❌ Discord 傳送錯誤：{e}")
                 success = False
-            else:
-                print(f"✅ Discord 傳送成功（{len(chunk)} 字）")
-        except Exception as e:
-            print(f"❌ Discord 傳送錯誤：{e}")
-            success = False
-        time.sleep(1.0)
+                break
+        time.sleep(1.5)   # 每段間隔加大，降低觸發速率限制機率
     return success
 
 def send_embed(webhook_url: str, embed: dict) -> bool:
