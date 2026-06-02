@@ -116,31 +116,36 @@ def _alert_task_failure(task_name: str, error_msg: str, attempt: int = 1) -> Non
 # ── 日報（直接在 Railway 執行，不透過 GitHub Actions）──────────
 _DAILY_LABEL = {"morning": "早報", "afternoon": "午報", "evening": "晚報"}
 
-def _run_daily_report(session: str) -> None:
+def _run_daily_report(session: str) -> str:
     """
-    直接在 Railway 跑 orchestrator.run_report()，和策略 Agent 同樣模式。
-    - 不再透過 GitHub Actions workflow_dispatch（消除排隊延遲問題）
-    - 設定 REPORT_SESSION 環境變數，確保時段正確（不靠執行時間自動偵測）
-    - 失敗自動重試一次，並發 Discord 警報
+    直接在 Railway 跑 orchestrator.run_report()。
+    回傳結果字串（供 /觸發日報 顯示）：'ok' 或錯誤訊息。
     """
     label = _DAILY_LABEL.get(session, session)
     for attempt in range(1, 3):
         try:
             import os as _os
-            _os.environ["REPORT_SESSION"] = session   # 強制指定時段
+            _os.environ["REPORT_SESSION"] = session
+            print(f"⏰ [{label}] 開始執行（attempt {attempt}）", flush=True)
+            t0 = time.time()
             from orchestrator import run_report as _orch_run
             _orch_run()
+            elapsed = time.time() - t0
             _save_trigger_log(f"daily_{session}", "ok")
-            print(f"✅ {label}完成", flush=True)
-            return
+            print(f"✅ [{label}] 完成，耗時 {elapsed:.0f} 秒", flush=True)
+            return "ok"
         except Exception as e:
-            print(f"❌ {label}第{attempt}次失敗：{e}", flush=True)
+            import traceback
+            tb = traceback.format_exc()
+            print(f"❌ [{label}] 第{attempt}次失敗：{e}\n{tb}", flush=True)
             if attempt < 2:
                 print("   1 分鐘後重試...", flush=True)
                 time.sleep(60)
             else:
                 _save_trigger_log(f"daily_{session}", f"failed:{e}")
                 _alert_task_failure(f"日報（{label}）", str(e), attempt)
+                return f"失敗：{str(e)[:200]}"
+    return "失敗：未知原因"
 
 
 # ── Strategy Agent（延遲載入，避免啟動時 DB 不存在）────────────
@@ -1996,17 +2001,24 @@ async def cmd_觸發日報(interaction: discord.Interaction, 時段: app_command
         f"⏳ **{label}** 啟動中！約 **3~5 分鐘**後訊息會出現在各頻道。"
     )
 
-    loop = asyncio.get_running_loop()
+    loop   = asyncio.get_running_loop()
+    t_start = time.time()
     try:
-        await loop.run_in_executor(None, _run_daily_report, 時段.value)
+        result  = await loop.run_in_executor(None, _run_daily_report, 時段.value)
+        elapsed = int(time.time() - t_start)
+        if result == "ok":
+            msg = f"✅ **{label}** 發送完成！（耗時 {elapsed} 秒）\n各報告已送至對應頻道（台股 / 美股 / 國際）。"
+        else:
+            msg = f"⚠️ **{label}** 執行異常（耗時 {elapsed} 秒）：\n```\n{result[:300]}\n```\n請至 Railway Deployments → View Logs 查看詳細錯誤。"
         try:
-            await interaction.channel.send(f"✅ {label} 發送完成！")
+            await interaction.channel.send(msg)
         except Exception:
             pass
     except Exception as e:
-        print(f"❌ /觸發日報 執行失敗：{e}", flush=True)
+        elapsed = int(time.time() - t_start)
+        print(f"❌ /觸發日報 例外（{elapsed}s）：{e}", flush=True)
         try:
-            await interaction.channel.send(f"❌ 日報發送失敗：{str(e)[:100]}")
+            await interaction.channel.send(f"❌ **{label}** 系統例外（{elapsed}s）：{str(e)[:150]}")
         except Exception:
             pass
 
