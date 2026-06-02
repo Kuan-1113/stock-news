@@ -1409,15 +1409,15 @@ def _update_warrant_prices_bg():
 
 def _daily_scheduler():
     """
-    定時排程主迴圈（30 秒輪詢）
+    定時排程主迴圈（15 秒輪詢）
     ─────────────────────────────────────────────────────────
-    日報：08:00 / 15:00 / 22:00  → 觸發 GitHub Actions（帶重試）
-    Podcast：09:00 / 21:00       → 觸發 GitHub Actions（帶重試）
+    日報：07:57 / 14:57 / 21:57 TW 啟動 → 08/15/22:00 到達
+    Podcast：08:57 / 20:57 TW 啟動
     收盤更新：16:30              → 本地執行（權證價格 + 生命週期）
     策略 Agent：17:00 週一～五   → 本地執行（帶重試 + 持久化紀錄）
     週回顧報告：17:30 週五       → 本地執行（帶重試 + 持久化紀錄）
 
-    防重複機制（雙層）：
+    防重複機制（全部雙層）：
       Layer 1（in-memory）：_triggered set — 同 process 內不重複
       Layer 2（persistent）：trigger_log.json — 跨重啟不重複、不遺漏
     ─────────────────────────────────────────────────────────
@@ -1428,18 +1428,17 @@ def _daily_scheduler():
     # 觸發時間「提前 3 分鐘」設計：
     #   日報任務執行需 3~5 分鐘（API 抓取 + Claude + 多頻道發送）
     #   07:57 啟動 → Discord 訊息約 08:00 準時到達
-    #   key 仍用 trigger_hour 避免與策略 Agent key 衝突
-    # ⚠️ GitHub Actions cron 已停用（延遲不可控），由 Railway 統一排程
+    # ⚠️ 所有 GitHub Actions cron 已停用，由 Railway bot 統一排程
     # ──────────────────────────────────────────────────────────────
     DAILY_HOURS   = {
         7:  ("早報", "morning"),    # 07:57 啟動 → 08:00 準時到達
         14: ("午報", "afternoon"),  # 14:57 啟動 → 15:00 準時到達
         21: ("晚報", "evening"),    # 21:57 啟動 → 22:00 準時到達
     }
-    PODCAST_HOURS = {8, 20}        # Podcast：08:57/20:57 啟動（原 09/21）
+    PODCAST_HOURS = {8, 20}        # Podcast：08:57/20:57 TW 啟動
 
     import random
-    time.sleep(random.uniform(0, 5))   # 啟動保護：縮短到 5 秒
+    time.sleep(random.uniform(0, 5))   # 啟動保護：避免多 process 同時觸發
 
     while True:
         try:
@@ -1447,6 +1446,8 @@ def _daily_scheduler():
             key = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
 
             # ── 日報 / Podcast（整點前 3 分鐘觸發，:57～:59）─────────
+            # Layer 1：key not in _triggered（in-memory）
+            # Layer 2：not _was_triggered_today（persistent，防跨重啟重複）
             if 57 <= now.minute and key not in _triggered:
                 last_ts  = _trigger_ts.get(key)
                 too_soon = last_ts and (now - last_ts).total_seconds() < 600
@@ -1454,13 +1455,17 @@ def _daily_scheduler():
                 if not too_soon:
                     if now.hour in DAILY_HOURS:
                         label, session = DAILY_HOURS[now.hour]
-                        # 直接在 Railway 執行，不透過 GitHub Actions（消除排隊延遲）
-                        _triggered.add(key)
-                        _trigger_ts[key] = now
-                        print(f"⏰ 啟動{label}（提前 3 分鐘，Railway 直接執行）", flush=True)
-                        threading.Thread(
-                            target=_run_daily_report, args=(session,), daemon=True
-                        ).start()
+                        # Layer 2 檢查：今日是否已成功觸發（防 Railway 重啟後重複）
+                        if _was_triggered_today(f"daily_{session}"):
+                            print(f"⏰ {label} 今日已完成，跳過", flush=True)
+                            _triggered.add(key)
+                        else:
+                            _triggered.add(key)
+                            _trigger_ts[key] = now
+                            print(f"⏰ 啟動{label}（提前 3 分鐘，Railway 直接執行）", flush=True)
+                            threading.Thread(
+                                target=_run_daily_report, args=(session,), daemon=True
+                            ).start()
 
                     elif now.hour in PODCAST_HOURS and GITHUB_PAT:
                         ok, err = _trigger_workflow_with_retry("podcast.yml", {})

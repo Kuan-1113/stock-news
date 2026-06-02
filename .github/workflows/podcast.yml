@@ -1,11 +1,10 @@
 name: 🎙️ Podcast 追蹤與分析
 
 on:
-  schedule:
-    # 台灣時間 09:00 → UTC 00:55（提前5min觸發，加 GitHub 排隊延遲約到 09:00±5min）
-    - cron: '55 0 * * *'
-    # 台灣時間 21:00 → UTC 12:55
-    - cron: '55 12 * * *'
+  # ⚠️ GHA cron 已停用：Railway bot 在 08:57/20:57 TW 直接觸發（不依賴 GHA 排隊延遲）
+  # schedule:
+  #   - cron: '55 0 * * *'   # TW 08:55（與 Railway bot 08:57 重複，停用）
+  #   - cron: '55 12 * * *'  # TW 20:55（與 Railway bot 20:57 重複，停用）
   workflow_dispatch:
 
 concurrency:
