@@ -74,12 +74,30 @@ DISCORD_STRATEGY = os.environ.get("DISCORD_STRATEGY", "") or os.environ.get("DIS
 
 
 def send_discord(content: str, webhook_url: str = "") -> bool:
-    """送出 Discord Webhook 訊息（自動分割 2000 字元）"""
+    """送出 Discord Webhook 訊息（按換行智慧分割，避免截斷句子）"""
     url = webhook_url or DISCORD_STRATEGY
     if not url:
         print("  ⚠️  未設定 DISCORD_STRATEGY / DISCORD_TW，跳過發送")
         return False
-    chunks = [content[i:i+1990] for i in range(0, len(content), 1990)]
+
+    # 按換行切，每段不超過 1900 字元（留 100 字元 buffer）
+    chunks: list[str] = []
+    current = ""
+    for line in content.split("\n"):
+        addition = (line + "\n")
+        if len(current) + len(addition) > 1900:
+            if current:
+                chunks.append(current.rstrip())
+            # 單行超長才硬切
+            while len(addition) > 1900:
+                chunks.append(addition[:1900])
+                addition = addition[1900:]
+            current = addition
+        else:
+            current += addition
+    if current.strip():
+        chunks.append(current.rstrip())
+
     success = True
     for chunk in chunks:
         try:
