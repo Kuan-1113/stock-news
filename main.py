@@ -2581,13 +2581,23 @@ async def cmd_診斷(interaction: discord.Interaction):
 
 @client.event
 async def on_ready():
+    # ── 全域同步（最多 1 小時生效）────────────────────────────────
     await tree.sync()
+    # ── 伺服器即時同步（秒生效，用 WATCHLIST_GUILD_ID）────────────
+    _guild_id = os.environ.get("WATCHLIST_GUILD_ID", "")
+    if _guild_id:
+        try:
+            _guild_obj = discord.Object(id=int(_guild_id))
+            tree.copy_global_to(guild=_guild_obj)
+            await tree.sync(guild=_guild_obj)
+            print(f"✅ 伺服器指令即時同步完成（Guild {_guild_id}）", flush=True)
+        except Exception as _e:
+            print(f"⚠️ 伺服器即時同步失敗（不影響全域）：{_e}", flush=True)
+
     cmds = [c.name for c in tree.get_commands()]
     print(f"✅ Bot 啟動：{client.user}（ID: {client.user.id}）", flush=True)
-    print(f"   指令：{cmds}", flush=True)
+    print(f"   指令（{len(cmds)}個）：{cmds}", flush=True)
     print(f"   ANTHROPIC_API_KEY：{'✅ 已設定' if ANTHROPIC_API_KEY else '❌ 未設定'}", flush=True)
-    print(f"   GITHUB_PAT：{'✅ 已設定' if GITHUB_PAT else '⚠️  未設定（舊版 /自選股 GitHub Actions 模式不可用，已改為 Railway 直接執行）'}", flush=True)
-    print(f"   指令：/查股 /新聞 /看板 /說明 /自選股新增 /自選股刪除 /自選股清單 /自選股分析 /自選股 /個股期 /期貨 /查權證 /分析權證 /明牌 /診斷", flush=True)
     warrant_db.init_db()     # 建立/確認權證資料庫表格
     watchlist_db.init_db()   # 建立/確認個人自選股資料庫表格
     # 策略 Agent DB 初始化（Railway Volume 路徑由 SIGNAL_DB_PATH 環境變數控制）
