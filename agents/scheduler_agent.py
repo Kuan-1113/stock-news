@@ -14,6 +14,21 @@ agents/scheduler_agent.py — 排程守衛 Agent
   17:00 TW → 策略選股（週一～五）
   17:30 TW → 週回顧報告（週五）
   21:57 TW → 晚報（22:00 到達）
+
+Bug 修正紀錄（2026-06-03）：
+  Bug 1：startup_recovery 補跑後未加入 _triggered
+          → _tick() 在同一時間窗口再次觸發 → 雙重發送
+          Fix：dispatch 前先 add(key)
+  Bug 2：_dispatch 無論成功失敗都寫 "ok" 到 trigger_log
+          → _run_daily_report 回傳錯誤訊息但 _dispatch 不檢查
+          Fix：檢查回傳值，失敗時寫 "failed" 並發 Discord 告警
+  Bug 3：date_h 變數計算後從未使用（dead code）
+          Fix：移除
+  Bug 4：get_schedule_status() 「下次觸發」不考慮週限制
+          → 週五查策略選股應顯示週一，卻顯示週六
+          Fix：跳過不適用的週次
+  Bug 5：10 分鐘去重複永遠被前面的 key-in-_triggered 攔截（dead code）
+          Fix：移除多餘檢查，改用統一的 key 防重複
 """
 
 from __future__ import annotations
@@ -140,10 +155,41 @@ def was_triggered_today(task: str) -> bool:
 
 # ── 健康狀態查詢 ───────────────────────────────────────────────────
 
+def _next_trigger_time(s: dict, now: datetime.datetime) -> datetime.datetime:
+    """
+    計算排程的下次觸發時間，正確處理週限制。
+    Bug 4 Fix：週五查策略選股應顯示週一，不是週六。
+    """
+    candidate = now.replace(
+        hour=s["trigger_hour"], minute=s["trigger_min"],
+        second=0, microsecond=0,
+    )
+    # 往後找最近符合條件的時間
+    for delta_days in range(8):   # 最多找 8 天（超出一週則有 bug）
+        t = candidate + datetime.timedelta(days=delta_days)
+        if t <= now:
+            continue
+        # 檢查週限制
+        if not _is_applicable(s, t):
+            continue
+        return t
+    # Fallback（不應到達）
+    return candidate + datetime.timedelta(days=1)
+
+
+def _is_applicable(s: dict, dt: datetime.datetime) -> bool:
+    """判斷某時間點是否符合排程的週限制"""
+    weekday = dt.weekday()
+    if s.get("weekdays_only") and weekday >= 5:
+        return False
+    if s.get("weekday") is not None and weekday != s["weekday"]:
+        return False
+    return True
+
+
 def get_schedule_status() -> list[dict]:
     """
     回傳今日所有排程的執行狀態，供 Discord /診斷 指令使用。
-    格式：[{"name": "早報", "done": True, "time": "08:02", "next": "明日 07:57"}]
     """
     now   = datetime.datetime.now(TW_TZ)
     today = now.date().isoformat()
@@ -153,17 +199,17 @@ def get_schedule_status() -> list[dict]:
     for s in SCHEDULES:
         entry  = log.get(s["name"], {})
         done   = isinstance(entry, dict) and entry.get("status") == "ok"
-        run_at = entry.get("time", "")[:16].replace("T", " ") if done else None
+        failed = isinstance(entry, dict) and entry.get("status", "").startswith("failed")
+        run_at = entry.get("time", "")[:16].replace("T", " ") if (done or failed) else None
 
-        # 計算下次觸發時間
-        trigger = now.replace(hour=s["trigger_hour"], minute=s["trigger_min"], second=0, microsecond=0)
-        if trigger <= now:
-            trigger += datetime.timedelta(days=1)
-        next_str = trigger.strftime("%m/%d %H:%M")
+        # Bug 4 Fix：下次觸發考慮週限制
+        next_dt  = _next_trigger_time(s, now)
+        next_str = next_dt.strftime("%m/%d %H:%M")
 
         result.append({
             "name":    s["label"],
             "done":    done,
+            "failed":  failed,
             "time":    run_at,
             "next":    next_str,
             "session": s.get("session"),
@@ -178,7 +224,12 @@ def format_status_for_discord() -> str:
     status = get_schedule_status()
     lines  = [f"📅 **排程健康狀態** — {now.strftime('%Y-%m-%d %H:%M')} TW\n"]
     for s in status:
-        icon  = "✅" if s["done"] else "⏳"
+        if s["done"]:
+            icon = "✅"
+        elif s["failed"]:
+            icon = "❌"
+        else:
+            icon = "⏳"
         time_ = f"（{s['time']}）" if s["time"] else ""
         lines.append(f"{icon} **{s['name']}** {time_} → 下次：{s['next']}")
     return "\n".join(lines)
@@ -200,55 +251,49 @@ class SchedulerAgent:
         trigger_podcast:   Callable[[], None] | None = None,
         notify_discord:    Callable[[str], None] | None = None,
     ) -> None:
-        """
-        Args:
-            run_daily_report : 執行日報，傳入 session（morning/afternoon/evening）
-            run_strategy     : 執行策略選股
-            run_weekly       : 執行週回顧報告
-            trigger_podcast  : 觸發 Podcast（可選）
-            notify_discord   : 發送 Discord 告警訊息（可選）
-        """
-        self._run_daily   = run_daily_report
+        self._run_daily    = run_daily_report
         self._run_strategy = run_strategy
-        self._run_weekly  = run_weekly
-        self._podcast     = trigger_podcast
-        self._notify      = notify_discord
+        self._run_weekly   = run_weekly
+        self._podcast      = trigger_podcast
+        self._notify       = notify_discord
 
-        self._triggered:  set[str]             = set()   # Layer 1 in-memory
-        self._trigger_ts: dict[str, datetime.datetime] = {}
+        self._triggered: set[str] = set()   # Layer 1 in-memory（key = name-date）
+        self._lock = threading.Lock()        # 保護 _triggered 的並發寫入
 
     # ── 補跑（開機時呼叫）────────────────────────────────────────
 
     def startup_recovery(self) -> None:
         """
         開機時掃描：只在觸發點「前 2 分 ~ 後 recovery_min 分」內補跑。
-        Railway 重啟若落在 18:xx → 窗口早過，完全不觸發。
+        Bug 1 Fix：補跑前先 add(key) 到 _triggered，防止 _tick() 在同一窗口重複觸發。
         """
         now = datetime.datetime.now(TW_TZ)
         print(f"🛡️ [SchedulerAgent] 開機補跑掃描 {now.strftime('%H:%M')} TW...", flush=True)
 
         for s in SCHEDULES:
-            if not self._is_applicable_today(s, now):
+            if not _is_applicable(s, now):
                 continue
             if was_triggered_today(s["name"]):
                 continue
             if self._in_recovery_window(s, now):
                 label = s["label"]
                 ts    = now.strftime("%H:%M")
-                print(f"⚠️ [SchedulerAgent] 補跑：{label}（重啟後偵測，現在 {ts}）", flush=True)
+                key   = self._make_key(s, now)
+
+                # Bug 1 Fix：先加入 _triggered，防止 _tick() 同窗口重複觸發
+                with self._lock:
+                    self._triggered.add(key)
+
+                print(f"⚠️ [SchedulerAgent] 補跑：{label}（{ts}）", flush=True)
                 self._notify_recovery(label, ts)
                 self._dispatch(s)
 
     # ── 主排程迴圈 ────────────────────────────────────────────────
 
     def run_scheduler_loop(self) -> None:
-        """
-        主排程迴圈（15 秒輪詢）。
-        在獨立 thread 執行，不阻塞主程式。
-        """
+        """主排程迴圈（15 秒輪詢）"""
         import random
         time.sleep(random.uniform(0, 5))   # 啟動保護
-
         print("⏰ [SchedulerAgent] 排程主迴圈啟動（15 秒輪詢）", flush=True)
 
         while True:
@@ -259,99 +304,111 @@ class SchedulerAgent:
             time.sleep(15)
 
     def start(self) -> None:
-        """在背景 thread 啟動排程主迴圈"""
-        threading.Thread(target=self.startup_recovery, daemon=True).start()
+        """在背景 thread 啟動補跑 + 主迴圈"""
+        threading.Thread(target=self.startup_recovery,  daemon=True).start()
         threading.Thread(target=self.run_scheduler_loop, daemon=True).start()
 
     # ── 內部邏輯 ─────────────────────────────────────────────────
 
-    def _tick(self) -> None:
-        now     = datetime.datetime.now(TW_TZ)
-        date_h  = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
+    @staticmethod
+    def _make_key(s: dict, now: datetime.datetime) -> str:
+        """生成防重複 key（任務名稱 + 台灣日期）"""
+        return f"{s['name']}-{now.strftime('%Y-%m-%d')}"
 
-        # 每天 00:00 清空 in-memory
-        if now.hour == 0 and now.minute < 1 and self._triggered:
-            self._triggered.clear()
-            self._trigger_ts.clear()
-            print("⏰ [SchedulerAgent] 每日 00:00 清空 in-memory 觸發記錄", flush=True)
+    def _tick(self) -> None:
+        now = datetime.datetime.now(TW_TZ)
+
+        # 每天 00:00 清空 in-memory（跨日重置）
+        if now.hour == 0 and now.minute < 1:
+            with self._lock:
+                if self._triggered:
+                    self._triggered.clear()
+                    print("⏰ [SchedulerAgent] 每日 00:00 清空 in-memory 觸發記錄", flush=True)
 
         for s in SCHEDULES:
-            if not self._is_applicable_today(s, now):
+            if not _is_applicable(s, now):
                 continue
 
-            key = f"{s['name']}-{now.strftime('%Y-%m-%d')}"
+            key = self._make_key(s, now)
 
-            # 是否在觸發分鐘（:trigger_min ~ :trigger_min+2）
+            # 是否在觸發分鐘（:trigger_min ~ :trigger_min+2，留 buffer）
             in_trigger = (
-                now.hour   == s["trigger_hour"] and
+                now.hour == s["trigger_hour"] and
                 s["trigger_min"] <= now.minute <= s["trigger_min"] + 2
             )
             if not in_trigger:
                 continue
-            if key in self._triggered:
-                continue
-            # Layer 2：今日是否已完成
-            if was_triggered_today(s["name"]):
-                print(f"⏰ [SchedulerAgent] {s['label']} 今日已完成，跳過", flush=True)
-                self._triggered.add(key)
-                continue
-            # 10 分鐘防重複
-            last_ts = self._trigger_ts.get(key)
-            if last_ts and (now - last_ts).total_seconds() < 600:
-                self._triggered.add(key)
-                continue
 
-            self._triggered.add(key)
-            self._trigger_ts[key] = now
+            # Layer 1：in-memory 防重複（含 startup_recovery 補跑的 key）
+            with self._lock:
+                if key in self._triggered:
+                    continue
+                # Bug 5 Fix：移除 dead code 的 10 分鐘檢查，統一用 key 防重複
+                # Layer 2：persistent 防重複（跨重啟）
+                if was_triggered_today(s["name"]):
+                    print(f"⏰ [SchedulerAgent] {s['label']} 今日已完成，跳過", flush=True)
+                    self._triggered.add(key)
+                    continue
+                # 標記後才 dispatch，防止並發重複
+                self._triggered.add(key)
+
             print(f"⏰ [SchedulerAgent] 啟動 {s['label']}（{now.strftime('%H:%M')} TW）", flush=True)
             self._dispatch(s)
 
         # Podcast（整點前 3 分鐘觸發，:57～:59）
         if self._podcast and 57 <= now.minute:
             pod_key = f"podcast-{now.strftime('%Y-%m-%d')}-{now.hour}"
-            if now.hour in PODCAST_HOURS and pod_key not in self._triggered:
-                self._triggered.add(pod_key)
-                print(f"⏰ [SchedulerAgent] 觸發 Podcast（{now.strftime('%H:%M')} TW）", flush=True)
-                threading.Thread(target=self._podcast, daemon=True).start()
+            if now.hour in PODCAST_HOURS:
+                with self._lock:
+                    if pod_key not in self._triggered:
+                        self._triggered.add(pod_key)
+                        print(f"⏰ [SchedulerAgent] 觸發 Podcast（{now.strftime('%H:%M')} TW）", flush=True)
+                        threading.Thread(target=self._podcast, daemon=True).start()
 
     def _dispatch(self, s: dict) -> None:
-        """根據排程類型派發任務（在背景 thread 執行）"""
+        """
+        根據排程類型派發任務（在背景 thread 執行）。
+        Bug 2 Fix：檢查 _run_daily 回傳值，失敗時寫 "failed" 並告警。
+        """
         session = s.get("session")
         name    = s["name"]
+        label   = s["label"]
 
-        def _run():
+        def _run() -> None:
             try:
-                if session:                         # 日報
-                    self._run_daily(session)
-                    save_trigger_log(name, "ok")
-                elif name == "strategy":            # 策略選股
+                if session:                       # 日報
+                    result = self._run_daily(session)
+                    # Bug 2 Fix：_run_daily_report 回傳 "ok" 或錯誤訊息，不拋例外
+                    if isinstance(result, str) and result == "ok":
+                        save_trigger_log(name, "ok")
+                    else:
+                        err = str(result)[:100] if result else "unknown"
+                        save_trigger_log(name, f"failed:{err}")
+                        print(f"❌ [SchedulerAgent] {label} 回報失敗：{err}", flush=True)
+                        if self._notify:
+                            self._notify(f"❌ **{label}** 執行異常：{err}")
+
+                elif name == "strategy":          # 策略選股（不回傳值）
                     self._run_strategy()
                     save_trigger_log(name, "ok")
-                elif name == "weekly":              # 週回顧
+
+                elif name == "weekly":            # 週回顧（不回傳值）
                     self._run_weekly()
                     save_trigger_log(name, "ok")
+
             except Exception as e:
                 save_trigger_log(name, f"failed:{e}")
-                print(f"❌ [SchedulerAgent] {s['label']} 執行失敗：{e}", flush=True)
+                print(f"❌ [SchedulerAgent] {label} 執行例外：{e}", flush=True)
                 if self._notify:
-                    self._notify(f"❌ **{s['label']}** 執行失敗：{str(e)[:100]}")
+                    self._notify(f"❌ **{label}** 執行例外：{str(e)[:100]}")
 
         threading.Thread(target=_run, daemon=True).start()
-
-    def _is_applicable_today(self, s: dict, now: datetime.datetime) -> bool:
-        """檢查今天是否應該執行此排程"""
-        weekday = now.weekday()
-        if s.get("weekdays_only") and weekday >= 5:
-            return False
-        if s.get("weekday") is not None and weekday != s["weekday"]:
-            return False
-        return True
 
     def _in_recovery_window(self, s: dict, now: datetime.datetime) -> bool:
         """檢查是否在補跑窗口內（觸發點前 2 分 ~ 後 recovery_min 分）"""
         trigger = now.replace(
             hour=s["trigger_hour"], minute=s["trigger_min"],
-            second=0, microsecond=0
+            second=0, microsecond=0,
         )
         start = trigger - datetime.timedelta(minutes=2)
         end   = trigger + datetime.timedelta(minutes=s.get("recovery_min", 15))
