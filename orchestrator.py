@@ -179,16 +179,27 @@ def _run_ai_pick(session_info: dict) -> None:
     time.sleep(1.2)
 
     # 逐支深度分析
+    # 每支股票分析最多等 90 秒，超時直接跳過（避免 Claude 慢拖延整體）
+    _STOCK_TIMEOUT = 90
+
     for pick in ai_picks:
         symbol = pick["symbol"]
         name   = pick["name"]
-        print(f"  分析 {name}（{symbol}）...")
+        print(f"  分析 {name}（{symbol}）...", flush=True)
         try:
-            quote    = fetch_yahoo_extended(symbol, name)
-            news_ctx = _fetch_stock_news(symbol, name)
-            time.sleep(0.5)
-            analysis = _analyze_single_stock(symbol, name, quote, news_ctx)
-            time.sleep(1)
+            def _analyse_one(p=pick, s=symbol, n=name):
+                quote    = fetch_yahoo_extended(s, n)
+                news_ctx = _fetch_stock_news(s, n)
+                analysis = _analyze_single_stock(s, n, quote, news_ctx)
+                return quote, analysis
+
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_analyse_one)
+                try:
+                    quote, analysis = _fut.result(timeout=_STOCK_TIMEOUT)
+                except Exception as te:
+                    print(f"  ⏱️ {name} 分析超時或失敗（{te}），跳過", flush=True)
+                    continue
 
             reason_lines = [l for l in pick.get("ai_reason", "").split("\n") if l.strip()]
             ai_tag = (
@@ -202,17 +213,10 @@ def _run_ai_pick(session_info: dict) -> None:
                 f"{quote.get('price', 'N/A')} ({quote.get('pct', 'N/A')}){stale_tag}{ai_tag}\n\n{analysis}"
             )
         except Exception as e:
-            print(f"  ❌ {name}（{symbol}）AI 精選分析失敗：{e}")
-            try:
-                send_discord_message(
-                    DISCORD_WATCHLIST,
-                    f"⚠️ **{name}（{symbol}）** — AI 精選分析暫時失敗，已跳過。"
-                )
-            except Exception:
-                pass
+            print(f"  ❌ {name}（{symbol}）AI 精選分析失敗：{e}", flush=True)
         time.sleep(1.5)
 
-    print("  ✅ AI 精選完成")
+    print("  ✅ AI 精選完成", flush=True)
 
 
 # ── 自選股工具（僅 22:00 盤後使用）────────────────────────────────
@@ -309,17 +313,26 @@ def _run_watchlist_report(session_info: dict) -> None:
     })
     time.sleep(1.2)
 
+    _STOCK_TIMEOUT = 90   # 每支最多 90 秒，超時跳過
+
     for stock in stocks:
         symbol = stock["symbol"]
         name   = stock["name"]
-        print(f"  分析 {name}（{symbol}）...")
+        print(f"  分析 {name}（{symbol}）...", flush=True)
         try:
-            quote    = fetch_yahoo_extended(symbol, name)   # 含技術指標
-            news_ctx = _fetch_stock_news(symbol, name)
-            time.sleep(0.5)
+            def _analyse_watchlist(s=symbol, n=name):
+                q = fetch_yahoo_extended(s, n)
+                ctx = _fetch_stock_news(s, n)
+                ana = _analyze_single_stock(s, n, q, ctx)
+                return q, ana
 
-            analysis = _analyze_single_stock(symbol, name, quote, news_ctx)
-            time.sleep(1)
+            with ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_analyse_watchlist)
+                try:
+                    quote, analysis = _fut.result(timeout=_STOCK_TIMEOUT)
+                except Exception as te:
+                    print(f"  ⏱️ {name} 超時或失敗（{te}），跳過", flush=True)
+                    continue
 
             stale_tag = " 📅上一交易日" if quote.get("stale") else ""
             send_discord_message(
@@ -329,13 +342,6 @@ def _run_watchlist_report(session_info: dict) -> None:
             )
         except Exception as e:
             print(f"  ❌ {name}（{symbol}）分析失敗，跳過：{e}", flush=True)
-            try:
-                send_discord_message(
-                    DISCORD_WATCHLIST,
-                    f"⚠️ **{name}（{symbol}）** — 分析暫時失敗（{str(e)[:80]}），已跳過。"
-                )
-            except Exception:
-                pass
         time.sleep(1.5)
 
     # ── AI 精選（00981A 每日成分股，附於自選股分析之後）───────────
