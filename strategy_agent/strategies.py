@@ -194,6 +194,11 @@ def get_market_regime(ohlcv: list, threshold: float = 25.0) -> str:
 # 籌碼派策略不受市場狀態限制（外資/投信連買在任何市況均有效）。
 
 TREND_STRATEGIES: frozenset = frozenset({
+    # 起漲初期（趨勢市 + 震盪盤皆適用，但放在趨勢市優先）
+    "volume_buildup",       # 底部量縮後放量突破
+    "ma5_cross_fresh",      # MA5 剛突破 MA20
+    "flat_base_breakout",   # 低檔平台突破
+    # 動量確認（趨勢市）
     "momentum",             # 動量突破（創 N 日新高）
     "ma_crossover",         # 均線黃金交叉
     "volume_surge",         # 爆量強勢收紅
@@ -339,7 +344,7 @@ def strategy_weekly_momentum(ohlcv: list) -> tuple[bool, str]:
 def strategy_bollinger_breakout(ohlcv: list) -> tuple[bool, str]:
     """
     收盤突破布林上軌（MA20 + 2σ），且成交量 ≥ 1.5x 20 日均量。
-    突破布林上軌 + 放量 = 強烈突破信號，趨勢市有效。
+    ⚠️ 加入「已漲過濾」：近 20 日漲幅 > 20% 的跳過（避免追高）。
     """
     if len(ohlcv) < 22:
         return False, ""
@@ -347,6 +352,12 @@ def strategy_bollinger_breakout(ohlcv: list) -> tuple[bool, str]:
     closes = [r["close"] for r in ohlcv]
     ma20   = _ma(closes, 20)
     if ma20 is None:
+        return False, ""
+
+    # 已漲過濾：近 20 天從最低點漲超過 20% → 已飆股，跳過
+    low_20  = min(r["low"] for r in ohlcv[-20:])
+    recent_gain = (closes[-1] - low_20) / low_20 if low_20 > 0 else 0
+    if recent_gain > 0.20:
         return False, ""
 
     # 標準差（用近 20 日）
@@ -364,7 +375,7 @@ def strategy_bollinger_breakout(ohlcv: list) -> tuple[bool, str]:
     if today["close"] > upper and vol_ratio >= 1.5:
         return True, (
             f"收盤 {today['close']:.1f} 突破布林上軌 {upper:.1f}"
-            f"（MA20={ma20:.1f} ±{std20:.1f}），放量 {vol_ratio:.1f}x"
+            f"（MA20={ma20:.1f} ±{std20:.1f}），放量 {vol_ratio:.1f}x，近20日漲{recent_gain:.1%}"
         )
     return False, ""
 
@@ -444,19 +455,198 @@ def strategy_52w_high(ohlcv: list) -> tuple[bool, str]:
     return False, ""
 
 
+# ── 策略 11：底部量縮整理後放量突破（起漲初期）────────────────────
+
+def strategy_volume_buildup(ohlcv: list) -> tuple[bool, str]:
+    """
+    量縮整理後放量突破 — 捕捉「起漲第一天」。
+
+    邏輯：股票先縮量整理（賣盤消化），今日突然放量且收紅突破 MA5。
+    關鍵過濾：
+      1. 近 5 天量能低於 10 日均量（確認有整理縮量）
+      2. 今日量 ≥ 10 日均量 1.5x（放量突破）
+      3. 今日收盤 > MA5（多方站穩）
+      4. RSI 在 35-60 之間（未超買，說明漲幅還很小）
+      5. 近 15 天最大漲幅 < 12%（未飆過）
+    """
+    if len(ohlcv) < 22:
+        return False, ""
+
+    closes  = [r["close"] for r in ohlcv]
+    vols    = [r.get("volume", 0) for r in ohlcv]
+    today   = ohlcv[-1]
+
+    # 近 10 日均量（不含今日）
+    avg_vol10 = sum(vols[-11:-1]) / 10 if sum(vols[-11:-1]) > 0 else 0
+    if avg_vol10 == 0:
+        return False, ""
+
+    # 近 5 日均量（不含今日）→ 是否呈縮量
+    avg_vol5 = sum(vols[-6:-1]) / 5
+    vol_contracting = avg_vol5 < avg_vol10 * 0.9   # 近 5 日量比前 10 日少 10%
+
+    # 今日放量
+    vol_today   = vols[-1]
+    vol_ratio   = vol_today / avg_vol10 if avg_vol10 > 0 else 0
+
+    # MA5
+    ma5 = _ma(closes, 5)
+    if ma5 is None:
+        return False, ""
+
+    # RSI
+    rsi = _rsi(closes)
+    if rsi is None:
+        return False, ""
+
+    # 近 15 天最大漲幅（從最低點計算）
+    low_15      = min(r["low"] for r in ohlcv[-15:])
+    recent_gain = (closes[-1] - low_15) / low_15 if low_15 > 0 else 1
+
+    # 今日收紅
+    price_up = today["close"] > today["open"]
+
+    if (vol_contracting
+            and vol_ratio >= 1.5
+            and today["close"] > ma5
+            and 35 <= rsi <= 62
+            and recent_gain < 0.12
+            and price_up):
+        return True, (
+            f"底部縮量後放量突破 MA5（量比 {vol_ratio:.1f}x，RSI={rsi:.0f}，"
+            f"近15日漲幅僅 {recent_gain:.1%}）"
+        )
+    return False, ""
+
+
+# ── 策略 12：MA5 剛突破 MA20（均線多頭排列剛形成）──────────────────
+
+def strategy_ma5_cross_ma20_fresh(ohlcv: list) -> tuple[bool, str]:
+    """
+    MA5 剛穿越 MA20（今日站上，昨日在下）— 趨勢剛翻多的第一天。
+
+    與 strategy_ma_crossover 的差別：
+      - ma_crossover 用 MA5/MA20（今日金叉即觸發，包含已漲一段後的金叉）
+      - 本策略額外要求：
+        1. 近 20 天漲幅 < 15%（剛起漲，不是金叉後已漲很多）
+        2. 成交量有放大（確認突破有效）
+        3. MA20 本身也是上升趨勢（確保方向正確）
+    """
+    if len(ohlcv) < 25:
+        return False, ""
+
+    closes = [r["close"] for r in ohlcv]
+    vols   = [r.get("volume", 0) for r in ohlcv]
+
+    ma5_t  = _ma(closes, 5)          # 今日 MA5
+    ma5_y  = _ma(closes, 5, offset=1) # 昨日 MA5
+    ma20_t = _ma(closes, 20)
+    ma20_y = _ma(closes, 20, offset=1)
+
+    if any(v is None for v in (ma5_t, ma5_y, ma20_t, ma20_y)):
+        return False, ""
+
+    # 今日 MA5 剛穿越 MA20（昨日在下，今日在上）
+    fresh_cross = ma5_y <= ma20_y and ma5_t > ma20_t
+    if not fresh_cross:
+        return False, ""
+
+    # MA20 本身呈上升趨勢（今日 MA20 > 5 天前 MA20）
+    ma20_5d_ago = _ma(closes, 20, offset=5)
+    ma20_rising = ma20_5d_ago is None or ma20_t >= ma20_5d_ago
+
+    # 成交量放大（今日 > 10 日均量的 1.1x）
+    avg_vol10 = sum(vols[-11:-1]) / 10 if sum(vols[-11:-1]) > 0 else 0
+    vol_ok    = avg_vol10 > 0 and vols[-1] >= avg_vol10 * 1.1
+
+    # 近 20 天漲幅限制（防止金叉後已大漲）
+    low_20      = min(r["low"] for r in ohlcv[-20:])
+    recent_gain = (closes[-1] - low_20) / low_20 if low_20 > 0 else 1
+
+    if ma20_rising and vol_ok and recent_gain < 0.15:
+        return True, (
+            f"MA5（{ma5_t:.1f}）剛突破 MA20（{ma20_t:.1f}）均線金叉初期，"
+            f"近20日漲幅 {recent_gain:.1%}（尚未追高）"
+        )
+    return False, ""
+
+
+# ── 策略 13：低檔整理平台突破（缺口或平台上緣突破）────────────────
+
+def strategy_flat_base_breakout(ohlcv: list) -> tuple[bool, str]:
+    """
+    低檔橫盤整理後突破平台上緣 — 機構在悄悄累積，突破才露臉。
+
+    判斷邏輯：
+      1. 近 15 天高低差 < 8%（平台整理，沒有大波動）
+      2. 今日突破 15 天高點
+      3. 成交量放大（突破有效）
+      4. 整理前沒有大漲（近 30 天漲幅 < 20%）
+      5. 股價仍在合理位置（RSI < 65）
+    """
+    if len(ohlcv) < 32:
+        return False, ""
+
+    closes = [r["close"] for r in ohlcv]
+    vols   = [r.get("volume", 0) for r in ohlcv]
+
+    # 近 15 天（不含今日）的整理範圍
+    base_window = ohlcv[-16:-1]
+    base_high   = max(r["high"]  for r in base_window)
+    base_low    = min(r["low"]   for r in base_window)
+    base_range  = (base_high - base_low) / base_low if base_low > 0 else 1
+
+    # 必須是平台整理（高低差 < 8%）
+    if base_range >= 0.08:
+        return False, ""
+
+    today = ohlcv[-1]
+
+    # 今日突破平台高點
+    if today["close"] <= base_high:
+        return False, ""
+
+    # 成交量放大
+    avg_vol10 = sum(vols[-11:-1]) / 10 if sum(vols[-11:-1]) > 0 else 0
+    vol_ratio = vols[-1] / avg_vol10 if avg_vol10 > 0 else 0
+    if vol_ratio < 1.3:
+        return False, ""
+
+    # 近 30 天漲幅限制
+    low_30      = min(r["low"] for r in ohlcv[-30:])
+    recent_gain = (closes[-1] - low_30) / low_30 if low_30 > 0 else 1
+    if recent_gain > 0.20:
+        return False, ""
+
+    # RSI 不過熱
+    rsi = _rsi(closes)
+    if rsi and rsi > 65:
+        return False, ""
+
+    return True, (
+        f"低檔平台（{base_range:.1%}震幅）突破上緣 {base_high:.1f}，"
+        f"放量 {vol_ratio:.1f}x，近30日漲幅 {recent_gain:.1%}"
+    )
+
+
 # ── 策略字典（順序決定報告呈現順序）────────────────────────────────
 
 ALL_STRATEGIES: dict[str, tuple[str, callable]] = {
-    "momentum":             ("📈 動量突破（N日新高）",   strategy_momentum),
-    "ma_crossover":         ("⚡ 均線黃金交叉",           strategy_ma_crossover),
-    "rsi_oversold":         ("🔄 RSI超賣反彈",            strategy_rsi_oversold),
-    "volume_surge":         ("💥 爆量強勢收紅",           strategy_volume_surge),
-    "pullback_ma20":        ("💪 強勢回檔 MA20 支撐",     strategy_pullback_ma20),
-    "weekly_momentum":      ("📊 週線強勢量縮收紅",       strategy_weekly_momentum),
-    "bollinger_breakout":   ("🎯 布林通道突破",           strategy_bollinger_breakout),
-    "macd_golden":          ("📉 MACD 金叉",              strategy_macd_golden),
-    "kd_oversold":          ("🌀 KD 超賣金叉",            strategy_kd_oversold),
-    "52w_high":             ("🏔️ 52週新高突破",           strategy_52w_high),
+    # ── 起漲初期策略（新增，捕捉尚未大漲的股票）─────────────────
+    "volume_buildup":       ("🌱 底部放量突破（起漲初期）", strategy_volume_buildup),
+    "ma5_cross_fresh":      ("🚦 MA5剛突破MA20（趨勢翻多）", strategy_ma5_cross_ma20_fresh),
+    "flat_base_breakout":   ("📦 低檔平台整理突破",         strategy_flat_base_breakout),
+    # ── 動量確認策略（已有漲勢，確認趨勢延續）───────────────────
+    "momentum":             ("📈 動量突破（N日新高）",       strategy_momentum),
+    "ma_crossover":         ("⚡ 均線黃金交叉",               strategy_ma_crossover),
+    "rsi_oversold":         ("🔄 RSI超賣反彈",               strategy_rsi_oversold),
+    "volume_surge":         ("💥 爆量強勢收紅",               strategy_volume_surge),
+    "pullback_ma20":        ("💪 強勢回檔 MA20 支撐",         strategy_pullback_ma20),
+    "weekly_momentum":      ("📊 週線強勢量縮收紅",           strategy_weekly_momentum),
+    "bollinger_breakout":   ("🎯 布林突破（已漲濾除）",       strategy_bollinger_breakout),
+    "macd_golden":          ("📉 MACD 金叉",                  strategy_macd_golden),
+    "kd_oversold":          ("🌀 KD 超賣金叉",                strategy_kd_oversold),
+    "52w_high":             ("🏔️ 52週新高突破",               strategy_52w_high),
 }
 
 
