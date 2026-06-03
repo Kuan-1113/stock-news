@@ -180,7 +180,7 @@ def _run_ai_pick(session_info: dict) -> None:
 
     # 逐支深度分析
     # 每支股票分析最多等 90 秒，超時直接跳過（避免 Claude 慢拖延整體）
-    _STOCK_TIMEOUT = 90
+    _STOCK_TIMEOUT = 150
 
     for pick in ai_picks:
         symbol = pick["symbol"]
@@ -198,7 +198,13 @@ def _run_ai_pick(session_info: dict) -> None:
                 try:
                     quote, analysis = _fut.result(timeout=_STOCK_TIMEOUT)
                 except Exception as te:
-                    print(f"  ⏱️ {name} 分析超時或失敗（{te}），跳過", flush=True)
+                    print(f"  ⏱️ {name} 分析超時或失敗（{te}），發送提示", flush=True)
+                    send_discord_message(
+                        DISCORD_WATCHLIST,
+                        f"## 🤖 **{name}（{symbol}）**\n"
+                        f"⏳ AI 分析超時（>{_STOCK_TIMEOUT}s），本次略過。\n"
+                        f"可使用 `/查股 {symbol}` 手動查詢。"
+                    )
                     continue
 
             reason_lines = [l for l in pick.get("ai_reason", "").split("\n") if l.strip()]
@@ -313,7 +319,7 @@ def _run_watchlist_report(session_info: dict) -> None:
     })
     time.sleep(1.2)
 
-    _STOCK_TIMEOUT = 90   # 每支最多 90 秒，超時跳過
+    _STOCK_TIMEOUT = 150   # 每支最多 150 秒，超時發提示
 
     for stock in stocks:
         symbol = stock["symbol"]
@@ -331,7 +337,13 @@ def _run_watchlist_report(session_info: dict) -> None:
                 try:
                     quote, analysis = _fut.result(timeout=_STOCK_TIMEOUT)
                 except Exception as te:
-                    print(f"  ⏱️ {name} 超時或失敗（{te}），跳過", flush=True)
+                    print(f"  ⏱️ {name} 超時或失敗（{te}），發送提示", flush=True)
+                    send_discord_message(
+                        DISCORD_WATCHLIST,
+                        f"## 📊 **{name}（{symbol}）**\n"
+                        f"⏳ AI 分析超時（>{_STOCK_TIMEOUT}s），本次略過。\n"
+                        f"可使用 `/查股 {symbol}` 手動查詢。"
+                    )
                     continue
 
             stale_tag = " 📅上一交易日" if quote.get("stale") else ""
