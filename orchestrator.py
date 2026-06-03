@@ -190,7 +190,9 @@ def _run_ai_pick(session_info: dict) -> None:
             def _analyse_one(p=pick, s=symbol, n=name):
                 quote    = fetch_yahoo_extended(s, n)
                 news_ctx = _fetch_stock_news(s, n)
-                analysis = _analyze_single_stock(s, n, quote, news_ctx)
+                fund     = _fetch_fundamentals(s)
+                chip     = _fetch_chip(s)
+                analysis = _analyze_single_stock(s, n, quote, news_ctx, fund, chip)
                 return quote, analysis
 
             with ThreadPoolExecutor(max_workers=1) as _ex:
@@ -227,6 +229,141 @@ def _run_ai_pick(session_info: dict) -> None:
 
 # ── 自選股工具（僅 22:00 盤後使用）────────────────────────────────
 
+# TWSE 基本面快取（每次 bot 啟動後 4 小時有效，避免重複打 API）
+_TWSE_FUND_CACHE: dict = {}
+_TWSE_FUND_TS: float = 0.0
+_TWSE_FUND_TTL: float = 4 * 3600
+
+
+def _fetch_twse_fund_map() -> dict:
+    """批次取得 TWSE 全市場 PE/PB/殖利率，含快取"""
+    global _TWSE_FUND_CACHE, _TWSE_FUND_TS
+    import time as _t
+    now = _t.time()
+    if _TWSE_FUND_CACHE and now - _TWSE_FUND_TS < _TWSE_FUND_TTL:
+        return _TWSE_FUND_CACHE
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code != 200:
+            return _TWSE_FUND_CACHE
+        data = {}
+        for item in r.json():
+            code = str(item.get("Code", "")).strip()
+            if not code:
+                continue
+            try:
+                data[code] = {
+                    "pe":    float(item["PEratio"])       if item.get("PEratio")       else None,
+                    "pb":    float(item["PBratio"])       if item.get("PBratio")       else None,
+                    "yield": float(item["DividendYield"]) if item.get("DividendYield") else None,
+                }
+            except (ValueError, KeyError):
+                pass
+        _TWSE_FUND_CACHE = data
+        _TWSE_FUND_TS    = now
+        return data
+    except Exception as e:
+        print(f"  ⚠️ TWSE 基本面 API 失敗：{e}", flush=True)
+        return _TWSE_FUND_CACHE
+
+
+def _fetch_fundamentals(symbol: str) -> dict:
+    """取得台股基本面（PE/PB/殖利率）+ Yahoo 52週高低 + EPS/ROE"""
+    result: dict = {}
+    is_tw = symbol.upper().endswith(".TW")
+    tw_code = symbol.upper().removesuffix(".TW") if is_tw else ""
+
+    # TWSE OpenAPI（PE/PB/殖利率）
+    if tw_code:
+        fund_map = _fetch_twse_fund_map()
+        f = fund_map.get(tw_code, {})
+        result.update({k: v for k, v in f.items() if v is not None})
+
+    # Yahoo Finance summary（EPS / ROE / 52週高低）
+    try:
+        r = requests.get(
+            f"https://query1.finance.yahoo.com/v11/finance/quoteSummary/{symbol}",
+            params={"modules": "defaultKeyStatistics,financialData"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=8,
+        )
+        if r.status_code == 200:
+            s = r.json().get("quoteSummary", {}).get("result", [{}])[0]
+            ks = s.get("defaultKeyStatistics", {})
+            fd = s.get("financialData", {})
+            if ks.get("trailingEps",  {}).get("raw"): result["eps"] = round(ks["trailingEps"]["raw"], 2)
+            if fd.get("returnOnEquity", {}).get("raw"): result["roe"] = round(fd["returnOnEquity"]["raw"] * 100, 1)
+            if fd.get("revenueGrowth", {}).get("raw"):  result["rev_yoy"] = round(fd["revenueGrowth"]["raw"] * 100, 1)
+    except Exception:
+        pass
+
+    return result
+
+
+def _fetch_chip(symbol: str) -> dict:
+    """取得台股三大法人當日買賣超（TWSE OpenAPI）"""
+    if not symbol.upper().endswith(".TW"):
+        return {}
+    tw_code = symbol.upper().removesuffix(".TW")
+    try:
+        import datetime as _dt
+        today = _dt.date.today().strftime("%Y%m%d")
+        r = requests.get(
+            "https://www.twse.com.tw/rwd/zh/fund/T86",
+            params={"response": "json", "date": today, "selectType": "ALLBUT0999"},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
+        )
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        rows = data.get("data", [])
+        for row in rows:
+            if str(row[0]).strip() == tw_code:
+                # row: [代號, 名稱, 外資買, 外資賣, 外資淨, 投信買, 投信賣, 投信淨, 自營買, 自營賣, 自營淨, 三大合計]
+                def _parse(v):
+                    try: return int(str(v).replace(",", ""))
+                    except: return None
+                return {
+                    "foreign_net": _parse(row[4]),
+                    "trust_net":   _parse(row[7]),
+                    "dealer_net":  _parse(row[10]),
+                    "total_net":   _parse(row[11]),
+                }
+    except Exception as e:
+        print(f"  ⚠️ 籌碼面 API 失敗 {symbol}：{e}", flush=True)
+    return {}
+
+
+def _fmt_fund(fund: dict) -> str:
+    """格式化基本面為單行文字"""
+    parts = []
+    if fund.get("pe")      is not None: parts.append(f"本益比 {fund['pe']:.1f}x")
+    if fund.get("pb")      is not None: parts.append(f"PBR {fund['pb']:.2f}x")
+    if fund.get("yield")   is not None: parts.append(f"殖利率 {fund['yield']:.2f}%")
+    if fund.get("eps")     is not None: parts.append(f"EPS {fund['eps']}")
+    if fund.get("roe")     is not None: parts.append(f"ROE {fund['roe']}%")
+    if fund.get("rev_yoy") is not None: parts.append(f"營收YoY {fund['rev_yoy']:+.1f}%")
+    return "  ".join(parts) if parts else "（無資料）"
+
+
+def _fmt_chip(chip: dict) -> str:
+    """格式化籌碼面為單行文字"""
+    if not chip:
+        return "（無資料）"
+    parts = []
+    def _k(v): return f"{v/1000:.1f}千" if v is not None and abs(v) >= 1000 else (str(v) if v is not None else "?")
+    parts.append(f"外資 {_k(chip.get('foreign_net'))}")
+    parts.append(f"投信 {_k(chip.get('trust_net'))}")
+    parts.append(f"自營 {_k(chip.get('dealer_net'))}")
+    total = chip.get("total_net")
+    if total is not None:
+        direction = "買超" if total > 0 else "賣超"
+        parts.append(f"合計 {_k(total)}（{direction}）")
+    return "  ".join(parts)
+
+
 def _fetch_stock_news(symbol: str, name: str) -> str:
     """抓取單一股票相關新聞標題"""
     query = f"{name} 台股 股票" if ".TW" in symbol else f"{name} {symbol} stock"
@@ -241,44 +378,58 @@ def _fetch_stock_news(symbol: str, name: str) -> str:
     except Exception:
         return ""
 
-def _analyze_single_stock(symbol: str, name: str, quote: dict, news_ctx: str = "") -> str:
-    """Claude 分析單一股票（含技術指標）"""
+def _analyze_single_stock(
+    symbol: str, name: str, quote: dict,
+    news_ctx: str = "", fund: dict = None, chip: dict = None
+) -> str:
+    """Claude 分析單一股票（技術面 + 籌碼面 + 基本面 + 消息面）"""
     stale_note = "⚠️ 注意：今日為週末，以下為上次交易日收盤數據。\n" if quote.get("stale") else ""
 
-    # 取技術指標（fetch_yahoo_extended 已算好，掛在 quote["tech"]）
+    # 技術指標（fetch_yahoo_extended 已算好，掛在 quote["tech"]）
     tech = quote.get("tech", {})
     tech_text = format_tech_for_prompt(tech)
+
+    # 基本面 / 籌碼面格式化
+    fund_text = _fmt_fund(fund) if fund else "（無資料）"
+    chip_text = _fmt_chip(chip) if chip else "（無資料）"
 
     prompt = f"""你是一位資深股票分析師。請針對以下股票進行深度分析與預測。
 
 {stale_note}【股票資訊】
 - 名稱：{name}（{symbol}）
-- 最新價格：{quote.get('price', 'N/A')}
-- 漲跌幅：{quote.get('pct', 'N/A')}
-- 漲跌點：{quote.get('change', 'N/A')}
+- 最新價格：{quote.get('price', 'N/A')}　漲跌：{quote.get('change', 'N/A')}（{quote.get('pct', 'N/A')}）
 
 【技術指標】
 {tech_text}
 
-【相關新聞背景】
+【籌碼面（三大法人今日買賣超，千股）】
+{chip_text}
+
+【基本面】
+{fund_text}
+
+【消息面（近期新聞）】
 {news_ctx if news_ctx else '（暫無相關新聞）'}
 
-請以繁體中文撰寫分析報告（禁 Markdown 表格，全程 bullet（•），**600字以內，確保完整輸出**）：
+請以繁體中文撰寫分析報告（禁 Markdown 表格，全程 bullet（•），**800字以內，務必完整輸出所有段落**）：
 
 1. **近期走勢**（均線 + 動能，2句）
 2. **技術訊號**
    • 均線結構（MA5/20/60）→ 偏多/偏空
    • MACD / RSI / KDJ → 強弱訊號
    • 量比 → 量能配合度
-3. **支撐與壓力**（關鍵價位）
-4. **短期預測**（1-2週目標價區間 + 主要假設）
-5. **操作建議**
+3. **籌碼與基本面**
+   • 三大法人方向 → 意涵（買超/賣超 → 機構態度）
+   • 基本面評估（本益比合理性 / ROE / 營收動能）
+4. **消息面影響**（若有重要新聞則說明影響方向，否則一句帶過）
+5. **支撐與壓力**（關鍵價位，帶具體數字）
+6. **操作建議**
    • 多方：進場條件 → 目標 → 停損
    • 空方：觸發條件 → 目標 → 停損
    • 風險提示（1句）
 
 > ⚠️ AI 生成分析，不構成投資建議。"""
-    return claude_call(prompt, max_tokens=800)
+    return claude_call(prompt, max_tokens=1200)
 
 def _run_watchlist_report(session_info: dict) -> None:
     """自選股日報（每日 22:00 盤後執行）"""
@@ -327,9 +478,11 @@ def _run_watchlist_report(session_info: dict) -> None:
         print(f"  分析 {name}（{symbol}）...", flush=True)
         try:
             def _analyse_watchlist(s=symbol, n=name):
-                q = fetch_yahoo_extended(s, n)
-                ctx = _fetch_stock_news(s, n)
-                ana = _analyze_single_stock(s, n, q, ctx)
+                q    = fetch_yahoo_extended(s, n)
+                ctx  = _fetch_stock_news(s, n)
+                fund = _fetch_fundamentals(s)
+                chip = _fetch_chip(s)
+                ana  = _analyze_single_stock(s, n, q, ctx, fund, chip)
                 return q, ana
 
             with ThreadPoolExecutor(max_workers=1) as _ex:
