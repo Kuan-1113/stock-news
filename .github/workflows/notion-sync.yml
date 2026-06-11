@@ -1,0 +1,46 @@
+name: Notion 程式碼同步
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  sync-to-notion:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: 取得異動檔案清單
+        id: changed
+        run: |
+          FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git show --name-only --format="" HEAD)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "異動檔案："
+          echo "$FILES"
+
+      - name: 取得 commit 訊息
+        id: commit
+        run: echo "message=$(git log -1 --pretty=%s)" >> $GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝依賴
+        run: pip install requests
+
+      - name: 同步到 Notion
+        env:
+          NOTION_TOKEN:    ${{ secrets.NOTION_TOKEN }}
+          COMMIT_MESSAGE:  ${{ steps.commit.outputs.message }}
+          CHANGED_FILES:   ${{ steps.changed.outputs.files }}
+          GITHUB_SHA:      ${{ github.sha }}
+          GITHUB_ACTOR:    ${{ github.actor }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python notion_code_update.py

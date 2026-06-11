@@ -32,6 +32,11 @@ import schedule
 import pytz
 import io
 
+try:
+    from notion_daily_sync import sync_report as _notion_sync
+except ImportError:
+    def _notion_sync(*a, **k): pass
+
 # ─────────────────────────────────────────────────────────────
 # 台灣標準時間（NTP stdtime.gov.tw → HTTP → 系統備用）
 # ─────────────────────────────────────────────────────────────
@@ -1760,6 +1765,7 @@ def run_report():
     time.sleep(1.2)
     send_discord_message(DISCORD_TW, f"## 🤖 Claude AI 台股分析 — {session_tag}\n\n" + tw_analysis)
     time.sleep(1.2)
+    _notion_sync("tw", None, tw_analysis)
     send_embed(DISCORD_TW, {
         "title":  f"📰 台股新聞連結 | {ts}",
         "color":  0x27AE60,
@@ -1784,6 +1790,7 @@ def run_report():
     time.sleep(1.2)
     send_discord_message(DISCORD_US, f"## 🤖 Claude AI 美股分析 — {session_tag}\n\n" + us_analysis)
     time.sleep(1.2)
+    _notion_sync("us", None, us_analysis)
     send_embed(DISCORD_US, {
         "title":  f"📰 美股新聞連結 | {ts}",
         "color":  0x2980B9,
@@ -1814,6 +1821,7 @@ def run_report():
     time.sleep(1.2)
     send_discord_message(DISCORD_GLOBAL, f"## 🤖 Claude AI 國際分析 — {session_tag}\n\n" + global_analysis)
     time.sleep(1.2)
+    _notion_sync("global", None, global_analysis)
     send_embed(DISCORD_GLOBAL, {
         "title":  f"📰 國際新聞連結 | {ts}",
         "color":  0x8E44AD,
