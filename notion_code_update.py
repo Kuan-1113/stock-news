@@ -64,7 +64,7 @@ def callout(page_id: str, text: str, emoji: str = "📝"):
     append_block(page_id, {
         "type": "callout",
         "callout": {
-            "icon": {"emoji": emoji},
+            "icon": {"type": "emoji", "emoji": emoji},
             "rich_text": [{"type": "text", "text": {"content": text}}]
         }
     })

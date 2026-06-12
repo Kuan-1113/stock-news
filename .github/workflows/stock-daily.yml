@@ -80,6 +80,7 @@ jobs:
           # 跨 run 復用 Agent/Environment（不設定則每次建立新的）
           MANAGED_AGENT_ID_STOCK_ANALYST: ${{ secrets.MANAGED_AGENT_ID_STOCK_ANALYST }}
           MANAGED_ENV_ID_STOCK_ANALYSIS:  ${{ secrets.MANAGED_ENV_ID_STOCK_ANALYSIS }}
+          NOTION_TOKEN:        ${{ secrets.NOTION_TOKEN }}
           PYTHONUTF8: "1"
           TZ: Asia/Taipei
         run: |
