@@ -56,6 +56,14 @@ SHOWS = [
         "name": "科技浪",
         "rss":  "https://feed.firstory.me/rss/user/cm3o5681s06e801v3fxpjehwb",
     },
+    {
+        "name": "雷老闆－董事長聊投資",
+        "rss":  "https://feeds.soundon.fm/podcasts/0020063b-4d2b-4b3c-af16-f53b8a9f2951.xml",
+    },
+    {
+        "name": "KEN的盤勢分享",
+        "rss":  "https://spotifeed.timdorr.com/033xET0sCByVLgvy53KY3r",
+    },
 ]
 
 # ─────────────────────────────────────────────────────────────
