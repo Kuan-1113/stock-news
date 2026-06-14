@@ -593,6 +593,29 @@ def run_report() -> None:
         except Exception as e:
             print(f"  ⚠️ EarningsAgent 失敗（不影響其他功能）：{e}")
 
+    # ── Phase 3.6：Notion 日報同步 ────────────────────────────────────
+    _notion_token = _os.environ.get("NOTION_TOKEN", "")
+    if _notion_token:
+        print("⚡ Phase 3.6：同步 Notion 日報...")
+        try:
+            import importlib.util as _ilib
+            _nds_path = _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)),
+                "股市日報", "notion_daily_sync.py",
+            )
+            _nds_spec = _ilib.spec_from_file_location("notion_daily_sync", _nds_path)
+            _nds_mod  = _ilib.module_from_spec(_nds_spec)
+            _nds_spec.loader.exec_module(_nds_mod)
+            _rpt_session = _os.environ.get("REPORT_SESSION")  # None → auto-detect
+            _nds_mod.sync_report("tw",     _rpt_session, analysis.get("tw",     ""))
+            _nds_mod.sync_report("us",     _rpt_session, analysis.get("us",     ""))
+            _nds_mod.sync_report("global", _rpt_session, analysis.get("global", ""))
+            print("✅ Notion 同步完成", flush=True)
+        except Exception as _ne:
+            print(f"  ⚠️ Notion 同步失敗（不影響主流程）：{_ne}", flush=True)
+    else:
+        print("ℹ️ NOTION_TOKEN 未設定，跳過 Notion 同步", flush=True)
+
     # ── Phase 4：自選股（僅 22:00 盤後）─────────────────────────────
     if session_info["label"] == "盤後晚報":
         time.sleep(2)
